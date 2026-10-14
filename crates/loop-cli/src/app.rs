@@ -711,7 +711,7 @@ async fn run_loop(
                 .count();
             let queued = message_queue.len();
             // Alternate every ~1.2s between the current step and "Working…".
-            let show_step = !turn_step.is_empty() && (spinner_frame / 15) % 2 == 0;
+            let show_step = !turn_step.is_empty() && (spinner_frame / 15).is_multiple_of(2);
             let mut parts = vec![if show_step {
                 turn_step.clone()
             } else {

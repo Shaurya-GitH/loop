@@ -11,6 +11,7 @@ members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/extend/loop-acp",
     "crates/loop-desktop"
 ]
 
@@ -25,6 +26,7 @@ default-members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/extend/loop-acp",
 ]
 
 [workspace.package]
@@ -32,7 +34,7 @@ version = "0.3.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/soketlabs/loop"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 loop-ai = { path = "crates/loop-ai" }
@@ -44,6 +46,8 @@ loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }
 loop-protocol = { path = "crates/core/loop-protocol" }
+loop-acp = { path = "crates/extend/loop-acp" }
+agent-client-protocol-schema = { version = "1.11", default-features = false }
 sha2 = "0.10"
 semver = "1"
 self-replace = "1.5"

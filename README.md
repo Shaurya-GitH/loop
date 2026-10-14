@@ -25,6 +25,8 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-agent** | [`crates/loop-agent`](crates/loop-agent) | Agent loop, AgentHarness, tools, sessions, sandbox, skills |
 | **loop-cli** | [`crates/loop-cli`](crates/loop-cli) | Interactive `loop` TUI (ratatui) |
 | **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
+| **loop-protocol** | [`crates/core/loop-protocol`](crates/core/loop-protocol) | Versioned event model and backend interface shared by every agent and surface |
+| **loop-acp** | [`crates/extend/loop-acp`](crates/extend/loop-acp) | Run any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 
 ## Quick start
 
