@@ -7,7 +7,7 @@ use loop_agent::{
 };
 use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
 use loop_ai::Models;
-use loop_cli::print_mode::{traced_print, TraceArgs, ROOT_SPAN_NAME};
+use loop_cli::print_mode::{final_text, traced_print, TraceArgs, ROOT_SPAN_NAME};
 use loop_telemetry::obs::keys;
 use loop_telemetry::{CredentialSource, TelemetryHandle};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData};
@@ -51,7 +51,7 @@ fn attr(span: &SpanData, key: &str) -> Option<String> {
         .map(|kv| kv.value.as_str().into_owned())
 }
 
-async fn agent_run(response: FauxResponse) -> anyhow::Result<AgentMessage> {
+async fn agent_run(response: FauxResponse) -> anyhow::Result<String> {
     let script = FauxScript::new();
     script.push(response);
     let models = Models::new();
@@ -66,7 +66,7 @@ async fn agent_run(response: FauxResponse) -> anyhow::Result<AgentMessage> {
         Some(stream_fn_from_models(Arc::new(models))),
     )
     .await?;
-    Ok(messages.last().cloned().unwrap())
+    final_text(&messages.last().cloned().unwrap())
 }
 
 #[tokio::test]

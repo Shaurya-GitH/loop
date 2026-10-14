@@ -18,13 +18,19 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, AgentHarnessPhase, KrunSandbox, Sandbox, SandboxMode,
-    SessionForkPoint, SessionForkSelection,
+    format_prompt_template_invocation, KrunSandbox, Sandbox, SandboxMode, SessionForkPoint,
+    SessionForkSelection,
 };
-use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
+use loop_agent::types::AgentThinkingLevel;
 use loop_ai::providers::SOKET_BASE_URL;
-use loop_ai::{calculate_context_tokens, Message, ModelsRefreshOptions, ToolResultContent, Usage};
-use loop_protocol::{AgentBackend, SessionSpec};
+use loop_ai::{calculate_context_tokens, ModelsRefreshOptions, Usage};
+use loop_app_core::interaction::{
+    approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
+};
+use loop_protocol::{
+    ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role, SessionSpec,
+    SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
+};
 
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
@@ -40,29 +46,26 @@ use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
     auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
-    ApprovalPolicy, ApprovalPrompt, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
+    ApprovalPolicy, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
 };
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
 #[cfg(feature = "orchestration")]
 use crate::tui::find_workflow_task_index;
 use crate::tui::{
-    assistant_error_item, chat_items_from_agent_messages, consume_frozen_lines, filter_files,
-    find_at_mention, find_tool_index, footer_live_height, format_item_lines, format_live_lines,
-    format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
-    FileEntry, FooterOpts, InputBuffer, McpServerListing, PickerRow, PickerView, FOOTER_HEIGHT,
+    consume_frozen_lines, filter_files, find_at_mention, find_tool_index, footer_live_height,
+    format_item_lines, format_live_lines, format_token_usage_line, insert_text, item_is_committed,
+    list_files, live_overflow_count, render_lines_to_buffer, tool_args_summary, welcome_lines,
+    CardStatus, ChatItem, CommandHistory, FileEntry, FooterOpts, InputBuffer, McpServerListing,
+    PickerRow, PickerView, FOOTER_HEIGHT,
 };
 use crate::{build_tools, CliRuntime};
 
-#[allow(
-    clippy::large_enum_variant,
-    reason = "short-lived channel message wrapping AgentEvent"
-)]
 enum UiEvent {
     UpdateAvailable(String),
-    Agent(AgentEvent),
-    /// Background `prompt()` finished with an error (no AgentEnd emitted).
+    /// An update from the agent backend.
+    Update(Box<UpdateEnvelope>),
+    /// The backend refused to start a turn (no update was emitted for it).
     TurnFailed(String),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
@@ -135,27 +138,52 @@ struct ActiveApproval {
     selected: usize,
     reason: String,
     reason_focused: bool,
-    response_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
+    reply: ApprovalReply,
 }
 
 impl ActiveApproval {
-    fn from_prompt(prompt: ApprovalPrompt) -> Self {
-        Self {
-            kind: prompt.kind,
-            tool_name: prompt.tool_name,
-            summary: prompt.summary,
+    /// The approval picker for a permission request. Other interaction kinds
+    /// are answered right away: the terminal cannot present them yet.
+    fn from_interaction(pending: PendingInteraction) -> Option<Self> {
+        let PendingInteraction { request, respond } = pending;
+        let InteractionRequest::Permission {
+            tool_call, options, ..
+        } = request
+        else {
+            let _ = respond.send(InteractionOutcome::Rejected {
+                reason: "this request type is not supported in the terminal yet".into(),
+            });
+            return None;
+        };
+        let kind = approval_kind(tool_call.as_ref().and_then(|c| c.kind));
+        let tool_name = tool_call
+            .as_ref()
+            .and_then(|c| c.name.clone())
+            .unwrap_or_else(|| kind.label().into());
+        let summary = tool_call
+            .as_ref()
+            .and_then(|c| c.title.clone())
+            .unwrap_or_default();
+        Some(Self {
+            kind,
+            tool_name,
+            summary,
             selected: 0,
             reason: String::new(),
             reason_focused: false,
-            response_tx: prompt.response_tx,
-        }
+            reply: ApprovalReply::new(&options, respond),
+        })
     }
 
     fn to_picker(&self) -> PickerView {
         PickerView::FileReview {
             path: format!("{} · {}", self.tool_name, self.summary),
             selected: self.selected,
-            accept_all_label: self.kind.accept_all_label().into(),
+            accept_all_label: if self.reply.offers_accept_session() {
+                self.kind.accept_all_label().into()
+            } else {
+                "Accept (this agent offers no session-wide choice)".into()
+            },
             reason: self.reason.clone(),
             reason_focused: self.reason_focused,
         }
@@ -235,16 +263,15 @@ impl TokenBarState {
         }
     }
 
-    fn apply_message(&mut self, message: &AgentMessage) {
-        match message {
-            AgentMessage::Llm(Message::Assistant(a)) => self.apply_usage(&a.usage),
-            AgentMessage::Llm(Message::ToolResult(t)) => {
-                if let Some(usage) = &t.usage {
-                    self.apply_usage(usage);
-                }
-            }
-            _ => {}
-        }
+    fn apply_protocol_usage(&mut self, usage: &loop_protocol::Usage) {
+        self.apply_usage(&Usage {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cached_input_tokens.unwrap_or(0),
+            cache_write: usage.cache_write_tokens.unwrap_or(0),
+            total_tokens: usage.total_tokens,
+            ..Usage::default()
+        });
     }
 
     fn usage_line(&self) -> String {
@@ -331,30 +358,11 @@ async fn run_loop(
             }
         });
     }
-    let tx_agent = tx.clone();
-    let debug_log = runtime.debug_log_path.clone();
-    runtime.harness.subscribe(move |ev| {
-        let tx = tx_agent.clone();
-        let debug_log = debug_log.clone();
-        async move {
-            if let Some(path) = &debug_log {
-                let detail = match &ev {
-                    AgentEvent::Progress { message } => format!("progress: {message}"),
-                    AgentEvent::ToolExecutionStart { tool_name, .. } => {
-                        format!("tool_start: {tool_name}")
-                    }
-                    AgentEvent::ToolExecutionEnd {
-                        tool_name,
-                        is_error,
-                        ..
-                    } => format!("tool_end: {tool_name} error={is_error}"),
-                    other => other.type_name().to_string(),
-                };
-                crate::debug_log::append_note(path, &format!("event {detail}"));
-            }
-            let _ = tx.send(UiEvent::Agent(ev));
-        }
-    });
+    forward_updates(
+        runtime.backend.subscribe(),
+        tx.clone(),
+        runtime.debug_log_path.clone(),
+    );
 
     let review_policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
     let policy_active = review_policy.asks_for_session(!runtime.resumed);
@@ -366,14 +374,15 @@ async fn run_loop(
             Default::default()
         }
     };
-    let (bridge, mut review_rx) = ToolApprovalBridge::new(
+    let (host, mut review_rx) = InteractionQueue::new();
+    let bridge = Arc::new(ToolApprovalBridge::with_host(
         tool_env,
         runtime.settings.diff_editor.clone(),
         policy_active,
         permissions_from_settings(&runtime.settings.tool_permissions),
         session_grants,
-    );
-    let bridge = Arc::new(bridge);
+        Arc::new(host),
+    ));
     {
         let harness = Arc::clone(&runtime.harness);
         bridge.set_persist(Arc::new(move |label| {
@@ -393,9 +402,8 @@ async fn run_loop(
         .set_after_tool_call(Some(bridge.after_tool_hook()));
     runtime.tool_approval = Some(Arc::clone(&bridge));
 
-    let mut chat: Vec<ChatItem> = match runtime.harness.session_context().await {
-        Ok(ctx) if !ctx.messages.is_empty() => chat_items_from_agent_messages(&ctx.messages),
-        Ok(_) => Vec::new(),
+    let mut chat: Vec<ChatItem> = match runtime.backend.transcript(&runtime.session_ref()).await {
+        Ok(updates) => chat_from_transcript(updates),
         Err(e) => {
             tracing::warn!("failed to restore session transcript: {e}");
             Vec::new()
@@ -910,7 +918,7 @@ async fn run_loop(
             while rx.try_recv().is_ok() {}
             while review_rx.try_recv().is_ok() {}
             if let Some(r) = active_approval.take() {
-                let _ = r.response_tx.send(ApprovalDecision::Reject {
+                r.reply.send(ApprovalDecision::Reject {
                     reason: Some("session reset".into()),
                 });
             }
@@ -1284,7 +1292,7 @@ fn truncate_status(s: &str, max: usize) -> String {
 async fn drain_ui_events(
     runtime: &mut CliRuntime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
-    review_rx: &mut mpsc::UnboundedReceiver<ApprovalPrompt>,
+    review_rx: &mut mpsc::UnboundedReceiver<PendingInteraction>,
     active_approval: &mut Option<ActiveApproval>,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
@@ -1302,9 +1310,16 @@ async fn drain_ui_events(
             UiEvent::UpdateAvailable(message) => {
                 push_before_queued(chat, sys(message));
             }
-            UiEvent::Agent(ev) => {
-                handle_agent_event(
-                    ev,
+            UiEvent::Update(envelope) => {
+                // Updates for another session (for example one just left with
+                // /new or a fork) must not leak into this transcript.
+                if envelope.session.as_str() != runtime.session_id {
+                    continue;
+                }
+                let UpdateEnvelope { update, origin, .. } = *envelope;
+                handle_update(
+                    update,
+                    origin,
                     chat,
                     status,
                     turn_step,
@@ -1476,12 +1491,14 @@ async fn drain_ui_events(
     }
     while let Ok(prompt) = review_rx.try_recv() {
         if let Some(prev) = active_approval.take() {
-            let _ = prev.response_tx.send(ApprovalDecision::Reject {
+            prev.reply.send(ApprovalDecision::Reject {
                 reason: Some("superseded by another review".into()),
             });
         }
-        *status = format!("review · {} · {}", prompt.kind.label(), prompt.summary);
-        *active_approval = Some(ActiveApproval::from_prompt(prompt));
+        if let Some(review) = ActiveApproval::from_interaction(prompt) {
+            *status = format!("review · {} · {}", review.kind.label(), review.summary);
+            *active_approval = Some(review);
+        }
     }
     try_drain_message_queue(
         runtime,
@@ -1496,8 +1513,55 @@ async fn drain_ui_events(
     );
 }
 
+/// Forward the backend's updates into the UI loop, logging each when debug
+/// logging is on. Ends when the backend or the UI goes away.
+fn forward_updates(
+    mut updates: tokio::sync::broadcast::Receiver<UpdateEnvelope>,
+    tx: mpsc::UnboundedSender<UiEvent>,
+    debug_log: Option<std::path::PathBuf>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    tokio::spawn(async move {
+        loop {
+            match updates.recv().await {
+                Ok(envelope) => {
+                    if let Some(path) = &debug_log {
+                        crate::debug_log::append_note(
+                            path,
+                            &format!("event {}", update_note(&envelope.update)),
+                        );
+                    }
+                    if tx.send(UiEvent::Update(Box::new(envelope))).is_err() {
+                        return;
+                    }
+                }
+                Err(RecvError::Lagged(missed)) => {
+                    tracing::warn!(
+                        missed,
+                        "UI fell behind the agent; some updates were dropped"
+                    );
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    });
+}
+
+fn update_note(update: &SessionUpdate) -> String {
+    match update {
+        SessionUpdate::Notice { text, .. } => format!("notice: {text}"),
+        SessionUpdate::ToolCall(call) => format!("tool_call: {}", call.title),
+        SessionUpdate::ToolCallUpdate(u) => format!("tool_update: {} {:?}", u.id, u.status),
+        SessionUpdate::TurnEnded { stop, .. } => format!("turn_ended: {stop:?}"),
+        other => serde_json::to_value(other)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "update".into()),
+    }
+}
+
 fn agent_is_busy(runtime: &CliRuntime, working: bool) -> bool {
-    working || runtime.harness.phase() != AgentHarnessPhase::Idle
+    working || runtime.backend.is_busy(&runtime.session_ref())
 }
 
 fn enqueue_user_message(
@@ -1569,15 +1633,29 @@ fn start_user_turn(
         }
     }
     *status = "Working…".into();
-    let harness = Arc::clone(&runtime.harness);
+    let backend = Arc::clone(&runtime.backend);
+    let session = runtime.session_ref();
     let tx = tx.clone();
     if let Some(path) = &runtime.debug_log_path {
         crate::debug_log::append_note(path, "turn: prompt submitted");
     }
     tokio::spawn(async move {
-        if let Err(e) = harness.prompt(prompt).await {
-            tracing::error!(error = %e, "prompt failed");
-            let _ = tx.send(UiEvent::TurnFailed(e.to_string()));
+        match backend
+            .prompt(&session, vec![ContentBlock::text(prompt)])
+            .await
+        {
+            // The update stream reports the turn, including failures.
+            Ok(turn) => {
+                if turn.outcome().await == TurnOutcome::Uncertain {
+                    let _ = tx.send(UiEvent::TurnFailed(
+                        "lost contact with the agent; the turn may be incomplete".into(),
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "prompt failed");
+                let _ = tx.send(UiEvent::TurnFailed(e.to_string()));
+            }
         }
     });
 }
@@ -1599,7 +1677,7 @@ fn try_drain_message_queue(
 ) {
     // Wait until the harness is fully idle. AgentEnd clears `working` slightly
     // before phase flips, and Esc must be able to flush the queue in between.
-    if *working || runtime.harness.phase() != AgentHarnessPhase::Idle || message_queue.is_empty() {
+    if *working || runtime.backend.is_busy(&runtime.session_ref()) || message_queue.is_empty() {
         return;
     }
     let Some(item) = message_queue.pop_front() else {
@@ -1900,9 +1978,7 @@ async fn handle_key(
                 if review.reason_focused {
                     review.reason_focused = false;
                 } else if let Some(r) = active_approval.take() {
-                    let _ = r
-                        .response_tx
-                        .send(ApprovalDecision::Reject { reason: None });
+                    r.reply.send(ApprovalDecision::Reject { reason: None });
                     chat.push(sys(format!("rejected {} · {}", r.kind.label(), r.summary)));
                     *status = "rejected · continuing".into();
                 }
@@ -1963,7 +2039,7 @@ async fn handle_key(
                             *status = "rejected · continuing".into();
                         }
                     }
-                    let _ = r.response_tx.send(decision);
+                    r.reply.send(decision);
                 }
             }
             KeyCode::Backspace if review.reason_focused => {
@@ -2340,7 +2416,7 @@ async fn handle_key(
                 let had_work = agent_is_busy(runtime, *working);
                 let had_queue = !message_queue.is_empty();
                 if had_work {
-                    runtime.harness.abort();
+                    runtime.backend.cancel(&runtime.session_ref());
                 }
                 if had_queue {
                     flush_message_queue(chat, message_queue);
@@ -3145,11 +3221,11 @@ async fn adopt_forked_session(
         .await
     {
         Ok(id) => {
-            runtime.backend.adopt_session(&id);
+            runtime.native.adopt_session(&id);
             runtime.session_id = id.clone();
             runtime.active_skills.clear();
-            *chat = match runtime.harness.session_context().await {
-                Ok(ctx) => chat_items_from_agent_messages(&ctx.messages),
+            *chat = match runtime.backend.transcript(&runtime.session_ref()).await {
+                Ok(updates) => chat_from_transcript(updates),
                 Err(e) => {
                     tracing::warn!("failed to load forked session transcript: {e}");
                     Vec::new()
@@ -3187,12 +3263,18 @@ fn endpoint_for(runtime: &CliRuntime) -> String {
         .unwrap_or_else(|| SOKET_BASE_URL.to_string())
 }
 
+/// Apply one protocol update to the transcript.
+///
+/// Live updates also drive the status line and the token bar. Replayed
+/// history (`Origin::Replay`) only rebuilds the transcript; it also carries
+/// the user's own messages, which live turns show as soon as they are sent.
 #[allow(
     clippy::too_many_arguments,
     reason = "pre-existing signature; refactor tracked separately"
 )]
-fn handle_agent_event(
-    ev: AgentEvent,
+fn handle_update(
+    update: SessionUpdate,
+    origin: Origin,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
@@ -3202,99 +3284,94 @@ fn handle_agent_event(
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
 ) {
-    match ev {
-        AgentEvent::Progress { message } => {
-            *turn_step = message;
-            *working = true;
-        }
-        AgentEvent::AgentStart => {
-            *working = true;
-            if turn_step.is_empty() {
-                *turn_step = "thinking…".into();
+    let live = origin == Origin::Live;
+    match update {
+        SessionUpdate::Notice { level, text } => match level {
+            NoticeLevel::Error => {
+                push_before_queued(chat, error_item(format!("error: {text}")));
             }
-        }
-        AgentEvent::AgentEnd { messages } => {
-            *working = false;
-            turn_step.clear();
-            let failed = messages
-                .iter()
-                .rev()
-                .find_map(AgentMessage::as_assistant)
-                .and_then(assistant_error_item)
-                .is_some();
-            *status = if failed {
-                "error · see above".into()
-            } else {
-                "ready".into()
-            };
-            *streaming_assistant = None;
-            if let Some(idx) = streaming_thinking.take() {
-                if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
-                    *done = true;
+            _ if live => {
+                *turn_step = text;
+                *working = true;
+            }
+            _ => {
+                push_before_queued(chat, ChatItem::System { text });
+            }
+        },
+        SessionUpdate::TurnStarted { .. } => {
+            if live {
+                *working = true;
+                if turn_step.is_empty() {
+                    *turn_step = "thinking…".into();
                 }
             }
-            // Ensure any content that landed after queued bubbles can flush.
-            settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
-            *refresh_token_bar = true;
         }
-        AgentEvent::TurnStart => {
-            *turn_step = "thinking…".into();
-        }
-        AgentEvent::MessageStart { message } => {
-            // Assistant items are created lazily on the first text delta so that
-            // thinking / tool items land in true stream order.
-            if message.role() == "assistant" {
+        SessionUpdate::MessageStarted { role, .. } => {
+            // Agent items are created lazily on the first chunk so that
+            // thinking and tool items land in true stream order.
+            if role == Role::Agent {
                 *streaming_assistant = None;
-                *turn_step = "waiting for model…".into();
-            }
-        }
-        AgentEvent::MessageEnd { message } => {
-            if let Some(item) = message.as_assistant().and_then(assistant_error_item) {
-                push_before_queued(chat, item);
-            }
-            token_bar.apply_message(&message);
-            *streaming_assistant = None;
-            if let Some(idx) = streaming_thinking.take() {
-                if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
-                    *done = true;
+                if live {
+                    *turn_step = "waiting for model…".into();
                 }
             }
-            settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
         }
-        AgentEvent::MessageUpdate {
-            assistant_message_event,
+        SessionUpdate::MessageChunk {
+            role: Role::User,
+            content,
             ..
         } => {
-            use loop_ai::AssistantMessageEvent;
-            match assistant_message_event {
-                AssistantMessageEvent::TextDelta { delta, .. } => {
-                    *turn_step = "streaming…".into();
-                    let idx = match *streaming_assistant {
-                        Some(idx) => idx,
-                        None => {
-                            let idx = push_before_queued(
-                                chat,
-                                ChatItem::Assistant {
-                                    text: String::new(),
-                                },
-                            );
-                            bump_stream_index(streaming_thinking, idx);
-                            *streaming_assistant = Some(idx);
-                            idx
-                        }
-                    };
-                    if let Some(ChatItem::Assistant { text }) = chat.get_mut(idx) {
-                        text.push_str(&delta);
-                    }
+            if let (false, Some(text)) = (live, content.as_text()) {
+                push_before_queued(
+                    chat,
+                    ChatItem::User {
+                        text: text.to_owned(),
+                    },
+                );
+            }
+        }
+        SessionUpdate::MessageChunk {
+            role: Role::Agent,
+            content,
+            ..
+        } => {
+            let Some(delta) = content.as_text() else {
+                return;
+            };
+            if live {
+                *turn_step = "streaming…".into();
+            }
+            finish_thinking(chat, streaming_thinking);
+            let idx = match *streaming_assistant {
+                Some(idx) => idx,
+                None => {
+                    let idx = push_before_queued(
+                        chat,
+                        ChatItem::Assistant {
+                            text: String::new(),
+                        },
+                    );
+                    bump_stream_index(streaming_thinking, idx);
+                    *streaming_assistant = Some(idx);
+                    idx
                 }
-                AssistantMessageEvent::TextEnd { .. } => {
-                    // Close the segment; any later text starts a new item after
-                    // whatever thinking/tool items streamed in between.
-                    *streaming_assistant = None;
-                }
-                AssistantMessageEvent::ThinkingStart { .. } => {
-                    *turn_step = "thinking…".into();
-                    *streaming_assistant = None;
+            };
+            if let Some(ChatItem::Assistant { text }) = chat.get_mut(idx) {
+                text.push_str(delta);
+            }
+        }
+        SessionUpdate::ThoughtChunk { content, .. } => {
+            let Some(delta) = content.as_text() else {
+                return;
+            };
+            if live {
+                *turn_step = "thinking…".into();
+            }
+            // Later text starts a new item after this thinking block.
+            *streaming_assistant = None;
+            let idx = match *streaming_thinking {
+                Some(idx) => idx,
+                None => {
                     let idx = push_before_queued(
                         chat,
                         ChatItem::Thinking {
@@ -3302,155 +3379,224 @@ fn handle_agent_event(
                             done: false,
                         },
                     );
-                    bump_stream_index(streaming_thinking, idx);
                     *streaming_thinking = Some(idx);
+                    idx
                 }
-                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                    *turn_step = "thinking…".into();
-                    if let Some(idx) = *streaming_thinking {
-                        if let Some(ChatItem::Thinking { text, .. }) = chat.get_mut(idx) {
-                            text.push_str(&delta);
-                        }
-                    }
-                }
-                AssistantMessageEvent::ThinkingEnd { .. } => {
-                    if let Some(idx) = streaming_thinking.take() {
-                        if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
-                            *done = true;
-                        }
-                    }
-                }
-                AssistantMessageEvent::ToolcallEnd { tool_call, .. } => {
-                    *turn_step = format!("tool · {}", tool_call.name);
-                    *streaming_assistant = None;
-                    let detail =
-                        serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_default();
-                    let summary = tool_args_summary(&tool_call.name, &tool_call.arguments);
-                    upsert_tool(
-                        chat,
-                        streaming_assistant,
-                        streaming_thinking,
-                        &tool_call.id,
-                        &tool_call.name,
-                        summary,
-                        detail,
-                        CardStatus::Pending,
-                    );
-                }
-                _ => {}
+            };
+            if let Some(ChatItem::Thinking { text, .. }) = chat.get_mut(idx) {
+                text.push_str(delta);
             }
         }
-        AgentEvent::ToolExecutionStart {
-            tool_call_id,
-            tool_name,
-            args,
-            ..
-        } => {
-            *turn_step = format!("tool · {tool_name}");
-            let summary = tool_args_summary(&tool_name, &args);
-            let detail = serde_json::to_string_pretty(&args).unwrap_or_default();
+        SessionUpdate::MessageEnded { .. } => {
+            *streaming_assistant = None;
+            finish_thinking(chat, streaming_thinking);
+            if live {
+                settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
+            }
+        }
+        SessionUpdate::ToolCall(call) => {
+            let name = call.name.clone().unwrap_or_else(|| call.title.clone());
+            if live {
+                *turn_step = format!("tool · {name}");
+            }
+            *streaming_assistant = None;
+            finish_thinking(chat, streaming_thinking);
+            let summary = match (&call.name, &call.raw_input) {
+                (Some(tool), Some(input)) => tool_args_summary(tool, input),
+                _ => call.title.clone(),
+            };
+            let output = tool_text(&call.content);
+            let detail = if output.is_empty() {
+                call.raw_input
+                    .as_ref()
+                    .map(|input| serde_json::to_string_pretty(input).unwrap_or_default())
+                    .unwrap_or_default()
+            } else {
+                output
+            };
             upsert_tool(
                 chat,
                 streaming_assistant,
                 streaming_thinking,
-                &tool_call_id,
-                &tool_name,
+                call.id.as_str(),
+                &name,
                 summary,
                 detail,
-                CardStatus::Pending,
+                card_status(call.status),
             );
         }
-        AgentEvent::ToolExecutionUpdate {
-            tool_call_id,
-            tool_name,
-            partial_result,
-            ..
-        } => {
-            *turn_step = format!("tool · {tool_name}");
-            if let Some(idx) = find_tool_index(chat, &tool_call_id) {
-                if let Some(ChatItem::Tool { detail, status, .. }) = chat.get_mut(idx) {
-                    *status = CardStatus::Pending;
-                    if detail.is_empty() {
-                        *detail = format!(
-                            "(partial) {}",
-                            serde_json::to_string(&partial_result.details).unwrap_or_default()
-                        );
-                    }
-                }
+        SessionUpdate::ToolCallUpdate(update) => {
+            apply_tool_update(update, live, chat, turn_step);
+        }
+        SessionUpdate::Usage(usage) => {
+            if live {
+                token_bar.apply_protocol_usage(&usage);
             }
         }
-        AgentEvent::ToolExecutionEnd {
-            tool_call_id,
-            tool_name,
-            result,
-            is_error,
-            ..
-        } => {
-            *turn_step = if is_error {
-                format!("tool · {tool_name} failed")
-            } else {
-                "thinking…".into()
-            };
-            let result_text = result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    ToolResultContent::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let st = if is_error {
-                CardStatus::Error
-            } else {
-                CardStatus::Success
-            };
-            if let Some(idx) = find_tool_index(chat, &tool_call_id) {
-                if let Some(ChatItem::Tool {
-                    name,
-                    detail,
-                    status,
-                    summary,
-                    ..
-                }) = chat.get_mut(idx)
-                {
-                    *name = tool_name;
-                    *status = st;
-                    if !result_text.is_empty() {
-                        if detail.is_empty() {
-                            *detail = result_text;
-                        } else {
-                            detail.push_str("\n---\n");
-                            detail.push_str(&result_text);
-                        }
-                    }
-                    if summary.is_empty() {
-                        *summary = if is_error {
-                            "error".into()
-                        } else {
-                            "done".into()
-                        };
-                    }
-                }
-            } else {
-                push_before_queued(
-                    chat,
-                    ChatItem::Tool {
-                        id: tool_call_id,
-                        name: tool_name,
-                        summary: if is_error {
-                            "error".into()
-                        } else {
-                            "done".into()
-                        },
-                        detail: result_text,
-                        status: st,
-                    },
-                );
+        SessionUpdate::TurnEnded { stop, error, .. } => {
+            if let Some(error) = error {
+                push_before_queued(chat, error_item(format!("error: {}", error.message)));
+            }
+            *streaming_assistant = None;
+            finish_thinking(chat, streaming_thinking);
+            if live {
+                *working = false;
+                turn_step.clear();
+                *status = if stop == StopReason::Error {
+                    "error · see above".into()
+                } else {
+                    "ready".into()
+                };
+                // Ensure any content that landed after queued bubbles can flush.
+                settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
+                *refresh_token_bar = true;
             }
         }
-        _ => {}
+        // Approvals arrive through HostServices, not the update stream; plans
+        // are not shown yet; unknown updates come from newer backends.
+        SessionUpdate::InteractionRequested { .. }
+        | SessionUpdate::InteractionResolved { .. }
+        | SessionUpdate::Plan { .. }
+        | SessionUpdate::Unknown(_) => {}
     }
+}
+
+fn apply_tool_update(
+    update: loop_protocol::ToolCallUpdate,
+    live: bool,
+    chat: &mut Vec<ChatItem>,
+    turn_step: &mut String,
+) {
+    let id = update.id.as_str().to_owned();
+    let output = update.content.as_deref().map(tool_text).unwrap_or_default();
+    let finished = match update.status {
+        Some(ToolCallStatus::Completed) => Some(false),
+        Some(ToolCallStatus::Failed) => Some(true),
+        _ => None,
+    };
+    let Some(is_error) = finished else {
+        // Still running: show partial output until the result arrives.
+        if live {
+            if let Some(name) = &update.name {
+                *turn_step = format!("tool · {name}");
+            }
+        }
+        if let Some(idx) = find_tool_index(chat, &id) {
+            if let Some(ChatItem::Tool { detail, status, .. }) = chat.get_mut(idx) {
+                *status = CardStatus::Pending;
+                if detail.is_empty() && !output.is_empty() {
+                    *detail = format!("(partial) {output}");
+                }
+            }
+        }
+        return;
+    };
+    if live {
+        *turn_step = if is_error {
+            format!("tool · {} failed", update.name.as_deref().unwrap_or("tool"))
+        } else {
+            "thinking…".into()
+        };
+    }
+    let card = if is_error {
+        CardStatus::Error
+    } else {
+        CardStatus::Success
+    };
+    let fallback_summary = if is_error { "error" } else { "done" };
+    if let Some(idx) = find_tool_index(chat, &id) {
+        if let Some(ChatItem::Tool {
+            name,
+            detail,
+            status,
+            summary,
+            ..
+        }) = chat.get_mut(idx)
+        {
+            if let Some(new_name) = update.name {
+                *name = new_name;
+            }
+            *status = card;
+            if !output.is_empty() {
+                if detail.is_empty() {
+                    *detail = output;
+                } else {
+                    detail.push_str("\n---\n");
+                    detail.push_str(&output);
+                }
+            }
+            if summary.is_empty() {
+                *summary = fallback_summary.into();
+            }
+        }
+    } else {
+        push_before_queued(
+            chat,
+            ChatItem::Tool {
+                id,
+                name: update.name.unwrap_or_else(|| "tool".into()),
+                summary: fallback_summary.into(),
+                detail: output,
+                status: card,
+            },
+        );
+    }
+}
+
+/// Text of tool output, one block per line. Diffs and other non-text content
+/// are left to dedicated views.
+fn tool_text(content: &[ToolContent]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            ToolContent::Content { content } => content.as_text(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn card_status(status: ToolCallStatus) -> CardStatus {
+    match status {
+        ToolCallStatus::Completed => CardStatus::Success,
+        ToolCallStatus::Failed => CardStatus::Error,
+        ToolCallStatus::Pending | ToolCallStatus::InProgress => CardStatus::Pending,
+    }
+}
+
+fn finish_thinking(chat: &mut [ChatItem], streaming_thinking: &mut Option<usize>) {
+    if let Some(idx) = streaming_thinking.take() {
+        if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
+            *done = true;
+        }
+    }
+}
+
+/// Rebuild a transcript from a backend's history.
+pub(crate) fn chat_from_transcript(updates: Vec<SessionUpdate>) -> Vec<ChatItem> {
+    let mut chat = Vec::new();
+    let (mut status, mut step) = (String::new(), String::new());
+    let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, false, false);
+    let mut token_bar = TokenBarState {
+        total_tokens: 0,
+        context_tokens: None,
+        context_window: 0,
+    };
+    for update in updates {
+        handle_update(
+            update,
+            Origin::Replay,
+            &mut chat,
+            &mut status,
+            &mut step,
+            &mut assistant,
+            &mut thinking,
+            &mut working,
+            &mut token_bar,
+            &mut refresh,
+        );
+    }
+    chat
 }
 
 #[allow(
@@ -4564,14 +4710,17 @@ fn parse_response_header_timeout(raw: &str) -> Result<u64, String> {
 mod tests {
     use std::sync::Arc;
 
+    use loop_agent::protocol_events::NativeEventMapper;
+    use loop_agent::types::{AgentEvent, AgentMessage};
     use loop_agent::{run_agent_loop, stream_fn_from_models, AgentContext, AgentLoopConfig};
     use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
 
     use super::*;
 
-    /// Run one prompt through the real agent loop with a scripted provider and replay
-    /// its events into the TUI's handler, as the app loop does.
-    async fn replay(response: FauxResponse) -> (Vec<ChatItem>, String) {
+    /// Run one prompt through the real agent loop with a scripted provider,
+    /// translate its events as NativeBackend does, and feed the updates to
+    /// the TUI's handler as the app loop does.
+    async fn run_turn(response: FauxResponse) -> (Vec<ChatItem>, String) {
         let script = FauxScript::new();
         script.push(response);
         let models = loop_ai::Models::new();
@@ -4601,9 +4750,12 @@ mod tests {
             context_window: 0,
         };
         let mut refresh = false;
-        for ev in events.lock().drain(..) {
-            handle_agent_event(
-                ev,
+        let mut mapper = NativeEventMapper::new();
+        let updates: Vec<_> = events.lock().iter().flat_map(|e| mapper.map(e)).collect();
+        for update in updates {
+            handle_update(
+                update,
+                Origin::Live,
                 &mut chat,
                 &mut status,
                 &mut step,
@@ -4628,14 +4780,14 @@ mod tests {
 
     #[tokio::test]
     async fn failed_model_call_shows_an_error_and_keeps_error_status() {
-        let (chat, status) = replay(FauxResponse::Error("HTTP 502 Bad Gateway".into())).await;
+        let (chat, status) = run_turn(FauxResponse::Error("HTTP 502 Bad Gateway".into())).await;
         assert_eq!(errors(&chat), ["error: HTTP 502 Bad Gateway"]);
         assert_eq!(status, "error · see above");
     }
 
     #[tokio::test]
     async fn successful_turn_shows_no_error() {
-        let (chat, status) = replay(FauxResponse::Text("hello".into())).await;
+        let (chat, status) = run_turn(FauxResponse::Text("hello".into())).await;
         assert!(errors(&chat).is_empty());
         assert_eq!(status, "ready");
         assert!(chat

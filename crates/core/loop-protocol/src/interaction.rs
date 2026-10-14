@@ -123,6 +123,9 @@ pub enum InteractionOutcome {
     Selected {
         /// The chosen native id.
         native_id: String,
+        /// Optional note from the user, such as why they rejected a call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// A free-text or form answer.
     Answered {

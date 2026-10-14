@@ -48,9 +48,12 @@ pub struct Runtime {
     pub credentials: Arc<FileCredentialStore>,
     /// Harness.
     pub harness: Arc<AgentHarness>,
-    /// The harness behind the [`loop_protocol::AgentBackend`] interface. Callers
-    /// move here from `harness` one area at a time (docs/design/backend-inventory.md).
-    pub backend: Arc<loop_agent::native_backend::NativeBackend>,
+    /// The agent prompts go to. Surfaces talk to it only through
+    /// [`loop_protocol::AgentBackend`].
+    pub backend: Arc<dyn loop_protocol::AgentBackend>,
+    /// Loop's own agent, for native-only features (sandbox, skills, MCP,
+    /// forking, workflows). Same harness as `harness`.
+    pub native: Arc<loop_agent::native_backend::NativeBackend>,
     /// Theme.
     pub theme: Theme,
     /// Resources.
@@ -86,7 +89,7 @@ impl Runtime {
     /// The active session as the backend interface names it.
     pub fn session_ref(&self) -> loop_protocol::SessionRef {
         loop_protocol::SessionRef {
-            instance: loop_protocol::AgentBackend::instance(self.backend.as_ref()).clone(),
+            instance: self.backend.instance().clone(),
             key: loop_protocol::SessionKey(self.session_id.clone()),
             native_id: self.session_id.clone(),
         }
@@ -768,7 +771,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;
 
-    let backend = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+    let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+    let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
 
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
@@ -818,6 +822,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         credentials,
         harness,
         backend,
+        native,
         theme,
         resources,
         project_trusted,

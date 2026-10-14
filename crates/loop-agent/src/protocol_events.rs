@@ -51,6 +51,31 @@ impl NativeEventMapper {
         self.turn.as_ref()
     }
 
+    /// How many turns have started so far.
+    pub fn turns_started(&self) -> u64 {
+        self.next_turn
+    }
+
+    /// Start a turn without an agent event, for a run that fails before the
+    /// agent loop starts. Pair with [`NativeEventMapper::end_turn_with_error`].
+    pub fn begin_turn(&mut self) -> TurnId {
+        self.open_turn()
+    }
+
+    /// End the turn in progress as failed, closing any open message first.
+    pub fn end_turn_with_error(&mut self, error: ErrorInfo) -> Vec<SessionUpdate> {
+        let mut updates = self.close_open_message();
+        if let Some(turn_id) = self.turn.take() {
+            updates.push(SessionUpdate::TurnEnded {
+                turn_id,
+                stop: StopReason::Error,
+                error: Some(error),
+            });
+        }
+        self.last_assistant = None;
+        updates
+    }
+
     /// Updates for one agent event, in order. Many events produce none.
     pub fn map(&mut self, event: &AgentEvent) -> Vec<SessionUpdate> {
         match event {
@@ -99,12 +124,18 @@ impl NativeEventMapper {
     }
 
     fn start_turn(&mut self) -> Vec<SessionUpdate> {
+        vec![SessionUpdate::TurnStarted {
+            turn_id: self.open_turn(),
+        }]
+    }
+
+    fn open_turn(&mut self) -> TurnId {
         self.next_turn += 1;
         let turn_id = TurnId(format!("turn-{}", self.next_turn));
         self.turn = Some(turn_id.clone());
         self.message = None;
         self.last_assistant = None;
-        vec![SessionUpdate::TurnStarted { turn_id }]
+        turn_id
     }
 
     fn end_turn(&mut self, messages: &[AgentMessage]) -> Vec<SessionUpdate> {
@@ -256,6 +287,136 @@ impl NativeEventMapper {
     }
 }
 
+/// Updates that rebuild a stored transcript, to be sent as
+/// [`loop_protocol::Origin::Replay`].
+///
+/// Each user message becomes one text chunk. An assistant failure becomes an
+/// error notice; summaries and other harness messages become info notices.
+pub fn replay(messages: &[AgentMessage]) -> Vec<SessionUpdate> {
+    use crate::types::CustomAgentMessage;
+
+    let mut updates = Vec::new();
+    let mut next_id = 0u64;
+    let mut message_id = || {
+        next_id += 1;
+        MessageId(format!("replay-{next_id}"))
+    };
+    for (index, message) in messages.iter().enumerate() {
+        match message {
+            AgentMessage::Llm(Message::User(user)) => {
+                let text: String = user_content(&user.content)
+                    .iter()
+                    .filter_map(ContentBlock::as_text)
+                    .collect();
+                if text.is_empty() {
+                    continue;
+                }
+                let id = message_id();
+                updates.push(SessionUpdate::MessageStarted {
+                    message_id: id.clone(),
+                    role: Role::User,
+                });
+                updates.push(SessionUpdate::MessageChunk {
+                    message_id: id.clone(),
+                    role: Role::User,
+                    content: ContentBlock::text(text),
+                });
+                updates.push(SessionUpdate::MessageEnded { message_id: id });
+            }
+            AgentMessage::Llm(Message::Assistant(assistant)) => {
+                let id = message_id();
+                updates.push(SessionUpdate::MessageStarted {
+                    message_id: id.clone(),
+                    role: Role::Agent,
+                });
+                for block in &assistant.content {
+                    match block {
+                        AssistantContent::Thinking(t) if !t.thinking.is_empty() => {
+                            updates.push(SessionUpdate::ThoughtChunk {
+                                message_id: id.clone(),
+                                content: ContentBlock::text(t.thinking.clone()),
+                            });
+                        }
+                        AssistantContent::Text(t) if !t.text.is_empty() => {
+                            updates.push(SessionUpdate::MessageChunk {
+                                message_id: id.clone(),
+                                role: Role::Agent,
+                                content: ContentBlock::text(t.text.clone()),
+                            });
+                        }
+                        AssistantContent::ToolCall(call) => {
+                            let mut call = tool_call(&call.id, &call.name, &call.arguments);
+                            call.status = ToolCallStatus::Pending;
+                            updates.push(SessionUpdate::ToolCall(call));
+                        }
+                        _ => {}
+                    }
+                }
+                updates.push(SessionUpdate::MessageEnded { message_id: id });
+                if assistant.stop_reason == AiStopReason::Error {
+                    if let Some(error) = assistant.failure() {
+                        updates.push(SessionUpdate::Notice {
+                            level: NoticeLevel::Error,
+                            text: error,
+                        });
+                    }
+                }
+            }
+            AgentMessage::Llm(Message::ToolResult(result)) => {
+                let mut update =
+                    ToolCallUpdate::new(ToolCallId::from(result.tool_call_id.as_str()));
+                update.name = Some(result.tool_name.clone());
+                update.status = Some(if result.is_error {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                });
+                update.content = Some(text_content(&result.content));
+                updates.push(SessionUpdate::ToolCallUpdate(update));
+            }
+            AgentMessage::Custom(custom) => updates.push(match custom {
+                CustomAgentMessage::CompactionSummary { summary, .. } => {
+                    info(format!("compaction summary\n{summary}"))
+                }
+                CustomAgentMessage::BranchSummary { summary, .. } => {
+                    info(format!("branch summary\n{summary}"))
+                }
+                CustomAgentMessage::Custom {
+                    custom_type,
+                    content,
+                    ..
+                } => info(format!("{custom_type}: {content}")),
+                CustomAgentMessage::BashExecution {
+                    command,
+                    output,
+                    exit_code,
+                    ..
+                } => SessionUpdate::ToolCall(ToolCall {
+                    id: ToolCallId(format!("bash-exec-{index}")),
+                    name: Some("bash".into()),
+                    title: shorten_command(command),
+                    kind: ToolKind::Execute,
+                    status: match exit_code {
+                        Some(0) | None => ToolCallStatus::Completed,
+                        Some(_) => ToolCallStatus::Failed,
+                    },
+                    content: vec![ToolContent::text(format!("$ {command}\n{output}"))],
+                    locations: Vec::new(),
+                    raw_input: Some(serde_json::json!({ "command": command })),
+                }),
+            }),
+        }
+    }
+    updates
+}
+
+fn info(text: String) -> SessionUpdate {
+    SessionUpdate::Notice {
+        level: NoticeLevel::Info,
+        text,
+    }
+}
+
 /// The protocol kind for one of Loop's tools.
 pub fn tool_kind(tool_name: &str) -> ToolKind {
     match tool_name {
@@ -281,6 +442,7 @@ fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
     };
     ToolCall {
         id: ToolCallId::from(id),
+        name: Some(name.to_owned()),
         title,
         kind: tool_kind(name),
         status: ToolCallStatus::InProgress,
@@ -362,6 +524,7 @@ fn usage(message: &AssistantMessage) -> Option<Usage> {
         input_tokens: u.input,
         output_tokens: u.output,
         cached_input_tokens: (u.cache_read > 0).then_some(u.cache_read),
+        cache_write_tokens: (u.cache_write > 0).then_some(u.cache_write),
         reasoning_tokens: u.reasoning,
         total_tokens: u.total_tokens,
         context_window: None,

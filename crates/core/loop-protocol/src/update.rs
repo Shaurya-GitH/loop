@@ -186,6 +186,9 @@ pub enum StopReason {
 pub struct ToolCall {
     /// Tool call id.
     pub id: ToolCallId,
+    /// The tool's own name, when the backend reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Short description to show, such as `edit src/main.rs`.
     pub title: String,
     /// What kind of action the tool performs.
@@ -208,6 +211,9 @@ pub struct ToolCall {
 pub struct ToolCallUpdate {
     /// Tool call id.
     pub id: ToolCallId,
+    /// The tool's own name, when the backend reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// New title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -233,6 +239,7 @@ impl ToolCallUpdate {
     pub fn new(id: ToolCallId) -> Self {
         Self {
             id,
+            name: None,
             title: None,
             kind: None,
             status: None,
@@ -371,6 +378,9 @@ pub struct Usage {
     /// Prompt tokens served from cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
+    /// Prompt tokens written to cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
     /// Reasoning tokens, when reported separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,

@@ -16,7 +16,8 @@ use crate::capabilities::Capabilities;
 use crate::content::ContentBlock;
 use crate::error::{ErrorCategory, ErrorInfo};
 use crate::ids::{BackendInstanceId, SessionKey};
-use crate::update::{StopReason, UpdateEnvelope};
+use crate::interaction::{InteractionOutcome, InteractionRequest};
+use crate::update::{SessionUpdate, StopReason, UpdateEnvelope};
 
 /// Result of a backend operation.
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -135,6 +136,14 @@ pub trait AgentBackend: Send + Sync {
         spec: SessionSpec,
     ) -> BackendResult<SessionRef>;
 
+    /// The session's history as updates, oldest first, for rebuilding a
+    /// display. Backends that can only replay history while reopening a
+    /// session return [`BackendError::Unsupported`].
+    async fn transcript(&self, session: &SessionRef) -> BackendResult<Vec<SessionUpdate>> {
+        let _ = session;
+        Err(BackendError::Unsupported("reading the transcript".into()))
+    }
+
     /// Start a turn. Updates arrive on the stream; the handle resolves once.
     async fn prompt(
         &self,
@@ -166,6 +175,16 @@ pub trait AgentBackend: Send + Sync {
     fn local_shell(&self) -> Option<&dyn LocalShell> {
         None
     }
+}
+
+/// What Loop provides to every backend. Implemented once by the host
+/// application; backends call it instead of talking to a surface directly.
+#[async_trait]
+pub trait HostServices: Send + Sync {
+    /// Ask the user and wait for the answer. A host that cannot present the
+    /// request returns [`InteractionOutcome::Rejected`]. Callers that can be
+    /// cancelled race this against their cancellation and drop it.
+    async fn interact(&self, request: InteractionRequest) -> InteractionOutcome;
 }
 
 /// Result of compacting a conversation.

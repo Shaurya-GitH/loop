@@ -9,17 +9,17 @@ Line numbers are as of this commit.
 
 ## AgentBackend (every backend)
 
-| Call | Call sites | Becomes |
-|---|---|---|
-| `prompt` | `loop-cli/src/app.rs:1574`, `loop-cli/src/print_mode.rs:153`, `loop-desktop/src/controller.rs:602,639` | `prompt` → `TurnHandle` |
-| `abort` | `loop-cli/src/app.rs:2341`, `loop-desktop/src/controller.rs:792` | `cancel` (fire-and-forget) |
-| `phase` | `loop-cli/src/app.rs:1496,1598`, `loop-desktop/src/controller.rs:568,645,946` | turn in progress, from the update stream |
-| `subscribe` | `loop-cli/src/app.rs:332`, `loop-desktop/src/controller.rs:270` | `subscribe` → `UpdateEnvelope` stream |
-| `wait_for_idle` | `loop-desktop/src/controller.rs:604,797` | await the `TurnHandle` |
-| `request_shutdown` | `loop-cli/src/app.rs:958` | `shutdown` |
-| `session_context` | `loop-cli/src/app.rs:392,3148` | transcript rebuild from stored updates (2c) |
-| `start_new_session` | `loop-cli/src/app.rs:3842`, `loop-desktop/src/controller.rs:535` | `new_session` |
-| `switch_session` | `loop-desktop/src/controller.rs:506` | `load_session` |
+| Call | Call sites | Becomes | Status |
+|---|---|---|---|
+| `prompt` | `loop-cli/src/app.rs:1574`, `loop-cli/src/print_mode.rs:153`, `loop-desktop/src/controller.rs:602,639` | `prompt` → `TurnHandle` | TUI and `--print` moved in 2c |
+| `abort` | `loop-cli/src/app.rs:2341`, `loop-desktop/src/controller.rs:792` | `cancel` (fire-and-forget) | TUI moved in 2c |
+| `phase` | `loop-cli/src/app.rs:1496,1598`, `loop-desktop/src/controller.rs:568,645,946` | `is_busy` | TUI moved in 2c |
+| `subscribe` | `loop-cli/src/app.rs:332`, `loop-desktop/src/controller.rs:270` | `subscribe` → `UpdateEnvelope` stream | TUI moved in 2c |
+| `wait_for_idle` | `loop-desktop/src/controller.rs:604,797` | await the `TurnHandle` | desktop later |
+| `request_shutdown` | `loop-cli/src/app.rs:958` | `shutdown` | stays native: it runs on the native harness at exit |
+| `session_context` | `loop-cli/src/app.rs:392,3148` | `transcript` → updates replayed through the live renderer | TUI moved in 2c |
+| `start_new_session` | `loop-cli/src/app.rs:3842`, `loop-desktop/src/controller.rs:535` | `new_session` | TUI moved in 2b |
+| `switch_session` | `loop-desktop/src/controller.rs:506` | `load_session` | desktop later |
 
 ## Typed services (backend opts in)
 
@@ -52,11 +52,18 @@ Forking works on Loop's own session tree, so it stays native. After a fork
 the TUI calls `NativeBackend::adopt_session` so updates carry the new
 session key.
 
-## Approvals (move behind `HostServices`, step 2c)
+## Approvals (behind `HostServices`, step 2c)
+
+The TUI builds `ToolApprovalBridge::with_host(InteractionQueue)`: Loop's own
+approvals become `InteractionRequest::Permission`s with the native options
+`accept`, `accept_session` and `reject`, and the TUI's picker answers any
+backend's permission request through `ApprovalReply`, which maps its three
+choices onto the request's options by kind. Desktop keeps the original
+`ApprovalPrompt` channel (`ToolApprovalBridge::new`) for now.
 
 | Calls | Call sites | Notes |
 |---|---|---|
-| `set_before_tool_call`, `set_after_tool_call` | `loop-cli/src/app.rs:386,389`, `loop-desktop/src/controller.rs:183,186` | `ToolApprovalBridge` hooks become `HostServices::interact` |
+| `set_before_tool_call`, `set_after_tool_call` | `loop-cli/src/app.rs:386,389`, `loop-desktop/src/controller.rs:183,186` | still install the bridge's hooks on the native harness |
 | `tool_env` | `loop-cli/src/app.rs:357`, `loop-desktop/src/controller.rs:167` | approval bridge reverts rejected edits through it |
 | `read_session_entries`, `append_label` | `loop-cli/src/app.rs:358,378` | "accept all" grants stored as session labels |
 
