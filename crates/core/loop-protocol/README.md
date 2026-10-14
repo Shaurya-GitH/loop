@@ -31,7 +31,15 @@ Readers are lenient: an update, content block or tool content with an unknown
 unknown enum values such as a new tool kind become `Other`. A newer producer
 therefore never breaks an older reader.
 
-This crate depends only on `serde` and `serde_json`. It does not depend on any
-runtime, agent or surface crate.
+## Backend interface
+
+`backend::AgentBackend` is what every backend implements: sessions, `prompt`
+(returning a `TurnHandle` that resolves exactly once), fire-and-forget
+`cancel`, and one update stream for all sessions. Operations not every
+backend has (`Compaction`, `SessionStats`, `LocalShell`) are separate traits
+reached through accessors that return `None` by default.
+
+This crate depends on `serde`, `serde_json`, `async-trait` and `tokio`'s
+sync primitives. It does not depend on any runtime, agent or surface crate.
 
 See [External agents](../../../docs/design/external-agents.md) for the design.

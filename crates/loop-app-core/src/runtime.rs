@@ -48,6 +48,9 @@ pub struct Runtime {
     pub credentials: Arc<FileCredentialStore>,
     /// Harness.
     pub harness: Arc<AgentHarness>,
+    /// The harness behind the [`loop_protocol::AgentBackend`] interface. Callers
+    /// move here from `harness` one area at a time (docs/design/backend-inventory.md).
+    pub backend: Arc<loop_agent::native_backend::NativeBackend>,
     /// Theme.
     pub theme: Theme,
     /// Resources.
@@ -80,6 +83,15 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// The active session as the backend interface names it.
+    pub fn session_ref(&self) -> loop_protocol::SessionRef {
+        loop_protocol::SessionRef {
+            instance: loop_protocol::AgentBackend::instance(self.backend.as_ref()).clone(),
+            key: loop_protocol::SessionKey(self.session_id.clone()),
+            native_id: self.session_id.clone(),
+        }
+    }
+
     /// Persist the current settings to the global settings file.
     pub fn save_settings(&self) -> anyhow::Result<()> {
         self.settings.save_file(&settings_path(&self.agent_dir))
@@ -756,6 +768,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;
 
+    let backend = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
@@ -803,6 +817,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         models,
         credentials,
         harness,
+        backend,
         theme,
         resources,
         project_trusted,

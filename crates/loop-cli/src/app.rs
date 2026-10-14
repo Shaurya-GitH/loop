@@ -24,6 +24,7 @@ use loop_agent::harness::{
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, Message, ModelsRefreshOptions, ToolResultContent, Usage};
+use loop_protocol::{AgentBackend, SessionSpec};
 
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
@@ -199,11 +200,14 @@ impl TokenBarState {
 
     async fn refresh(&mut self, runtime: &CliRuntime) {
         self.sync_window(runtime);
-        if let Ok(stats) = runtime.harness.session_stats().await {
-            self.total_tokens = stats.tokens.total_tokens();
-            if let Some(ctx) = stats.context_usage {
-                self.context_tokens = ctx.tokens;
-                self.context_window = ctx.context_window;
+        let Some(service) = runtime.backend.session_stats() else {
+            return;
+        };
+        if let Ok(stats) = service.stats(&runtime.session_ref()).await {
+            self.total_tokens = stats.total_tokens;
+            if let Some(window) = stats.context_window {
+                self.context_tokens = stats.context_tokens;
+                self.context_window = window;
             }
         }
     }
@@ -1683,19 +1687,17 @@ async fn run_bang_command(
     }
 
     *status = format!("running · !{command}");
-    let env = match runtime.harness.tool_env().await {
-        Ok(env) => env,
-        Err(e) => {
-            let idx = push_before_queued(chat, sys(format!("shell error: {e}")));
-            bump_stream_index(streaming_assistant, idx);
-            bump_stream_index(streaming_thinking, idx);
-            *status = "shell failed".into();
-            return;
-        }
+    let Some(shell) = runtime.backend.local_shell() else {
+        let idx = push_before_queued(
+            chat,
+            sys("shell commands are not available with this agent"),
+        );
+        bump_stream_index(streaming_assistant, idx);
+        bump_stream_index(streaming_thinking, idx);
+        *status = "shell unavailable".into();
+        return;
     };
-
-    let options = loop_agent::harness::types::ShellExecOptions::default();
-    let item = match env.exec(command, options).await {
+    let item = match shell.run(&runtime.session_ref(), command).await {
         Ok(out) => {
             let combined = if out.stderr.is_empty() {
                 out.stdout
@@ -3143,6 +3145,7 @@ async fn adopt_forked_session(
         .await
     {
         Ok(id) => {
+            runtime.backend.adopt_session(&id);
             runtime.session_id = id.clone();
             runtime.active_skills.clear();
             *chat = match runtime.harness.session_context().await {
@@ -3837,13 +3840,13 @@ async fn apply_effect(
             *streaming_assistant = None;
             *streaming_thinking = None;
             *working = false;
-            match runtime
-                .harness
-                .start_new_session(Some(runtime.cwd.to_string_lossy().into_owned()), None)
-                .await
-            {
-                Ok(id) => {
-                    runtime.session_id = id;
+            let spec = SessionSpec {
+                cwd: Some(runtime.cwd.clone()),
+                name: None,
+            };
+            match runtime.backend.new_session(spec).await {
+                Ok(session) => {
+                    runtime.session_id = session.native_id;
                     runtime.resumed = false;
                     runtime.active_skills.clear();
                     chat.clear();
@@ -3962,18 +3965,30 @@ async fn apply_effect(
             },
         },
         CommandEffect::Compact(instructions) => {
-            let harness = Arc::clone(&runtime.harness);
+            if runtime.backend.compaction().is_none() {
+                chat.push(sys(
+                    "this agent compacts its own context; /compact is not available",
+                ));
+                return Ok(false);
+            }
+            let backend = Arc::clone(&runtime.backend);
+            let session = runtime.session_ref();
             let tx = tx.clone();
             *working = true;
             chat.push(sys(" "));
             chat.push(sys("compacting…"));
             tokio::spawn(async move {
-                let result = match harness.compact(instructions.as_deref()).await {
-                    Ok(r) => Ok(format!(
-                        "compacted · ~{} tokens before · {}",
-                        r.tokens_before,
-                        truncate_status(&r.summary, 80)
-                    )),
+                let Some(compaction) = backend.compaction() else {
+                    return;
+                };
+                let result = match compaction.compact(&session, instructions.as_deref()).await {
+                    Ok(r) => Ok(match r.tokens_before {
+                        Some(tokens) => format!(
+                            "compacted · ~{tokens} tokens before · {}",
+                            truncate_status(&r.summary, 80)
+                        ),
+                        None => format!("compacted · {}", truncate_status(&r.summary, 80)),
+                    }),
                     Err(e) => Err(e.to_string()),
                 };
                 let _ = tx.send(UiEvent::CompactDone(result));
@@ -3993,9 +4008,16 @@ async fn apply_effect(
             chat.push(sys(commands::help_text(&extra)));
         }
         CommandEffect::SessionInfo => {
-            match runtime.harness.session_stats().await {
+            let stats = match runtime.backend.session_stats() {
+                Some(service) => service
+                    .stats(&runtime.session_ref())
+                    .await
+                    .map_err(|e| e.to_string()),
+                None => Err("this agent does not report session statistics".into()),
+            };
+            match stats {
                 Ok(stats) => {
-                    let mut report = loop_agent::harness::format_session_stats(&stats);
+                    let mut report = stats.report;
                     report.push_str(&format!(
                         "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Model: {}\n",
                         runtime.sessions_db.display(),

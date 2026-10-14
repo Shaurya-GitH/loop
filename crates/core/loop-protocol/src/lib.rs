@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+pub mod backend;
 mod capabilities;
 mod content;
 mod error;
@@ -13,6 +14,10 @@ mod ids;
 mod interaction;
 mod update;
 
+pub use backend::{
+    AgentBackend, BackendError, BackendResult, Compaction, CompactionReport, LocalShell,
+    SessionRef, SessionSpec, SessionStats, ShellResult, StatsSummary, TurnHandle, TurnOutcome,
+};
 pub use capabilities::Capabilities;
 pub use content::ContentBlock;
 pub use error::{ErrorCategory, ErrorInfo};

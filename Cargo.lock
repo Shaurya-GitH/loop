@@ -4448,6 +4448,7 @@ dependencies = [
  "loop-agent",
  "loop-ai",
  "loop-mcp",
+ "loop-protocol",
  "loop-telemetry",
  "parking_lot",
  "ratatui",
@@ -4484,6 +4485,7 @@ dependencies = [
  "loop-app-core",
  "loop-mcp",
  "loop-orchestration",
+ "loop-protocol",
  "loop-telemetry",
  "loop-test-support",
  "loop-update",
@@ -4578,8 +4580,10 @@ dependencies = [
 name = "loop-protocol"
 version = "0.3.5"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

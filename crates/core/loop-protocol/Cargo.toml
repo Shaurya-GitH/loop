@@ -8,5 +8,10 @@ description = "Versioned event model shared by every Loop agent backend and surf
 readme = "README.md"
 
 [dependencies]
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -23,13 +23,15 @@ Line numbers are as of this commit.
 
 ## Typed services (backend opts in)
 
-| Service | Calls | Call sites |
-|---|---|---|
-| `ModelControl` | `set_model`, `clear_model`, `set_thinking_level` | `loop-app-core/src/runtime.rs:277,294`, `loop-cli/src/app.rs:4478`, `loop-desktop/src/controller.rs:390,415` |
-| `Compaction` | `compact` | `loop-cli/src/app.rs:3971` |
-| `Forking` | `fork_points`, `fork_session` | `loop-cli/src/app.rs:3098,3142` |
-| `SessionStats` | `session_stats` | `loop-cli/src/app.rs:202,3996`, `loop-desktop/src/state/stats.rs:32` |
-| `LocalShell` | `tool_env` for `!bang` commands | `loop-cli/src/app.rs:1686`, `loop-desktop/src/controller.rs:716` |
+| Service | Calls | Call sites | Status |
+|---|---|---|---|
+| `Compaction` | `compact` | `loop-cli/src/app.rs:3971` | TUI moved in 2b |
+| `SessionStats` | `session_stats` | `loop-cli/src/app.rs:202,3996`, `loop-desktop/src/state/stats.rs:32` | TUI moved in 2b |
+| `LocalShell` | `tool_env` for `!bang` commands | `loop-cli/src/app.rs:1686`, `loop-desktop/src/controller.rs:716` | TUI moved in 2b |
+| `ModelControl` | `set_model`, `clear_model`, `set_thinking_level` | `loop-app-core/src/runtime.rs:277,294`, `loop-cli/src/app.rs:4478`, `loop-desktop/src/controller.rs:390,415` | Defined with external agents (PR 4). Loop's own model selection keeps going through `Runtime::select_model`, which also checks credentials. |
+
+`/new` now goes through `AgentBackend::new_session` (2b). Desktop keeps
+calling the harness until it moves to the backend interface.
 
 ## Native-only (stay on `NativeBackend`)
 
@@ -44,6 +46,11 @@ agent. Callers reach them through the native backend's own services.
 | Tools and MCP | `get_tools`, `tools_snapshot` | `loop-app-core/src/runtime.rs:790`, `loop-cli/src/mcp_serve.rs:87` |
 | JSON hooks | `on` | `loop-app-core/src/hooks_load.rs:64` |
 | Workflows | `start_workflow_from_goal` | `loop-cli/src/app.rs:4394` |
+| Forking | `fork_points`, `fork_session` | `loop-cli/src/app.rs:3098,3142` |
+
+Forking works on Loop's own session tree, so it stays native. After a fork
+the TUI calls `NativeBackend::adopt_session` so updates carry the new
+session key.
 
 ## Approvals (move behind `HostServices`, step 2c)
 

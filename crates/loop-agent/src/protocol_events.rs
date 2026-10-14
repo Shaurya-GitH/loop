@@ -369,7 +369,8 @@ fn usage(message: &AssistantMessage) -> Option<Usage> {
     })
 }
 
-fn turn_outcome(message: &AssistantMessage) -> (StopReason, Option<ErrorInfo>) {
+/// Why a run ended, from its final assistant message.
+pub fn turn_outcome(message: &AssistantMessage) -> (StopReason, Option<ErrorInfo>) {
     match message.stop_reason {
         AiStopReason::Stop | AiStopReason::ToolUse | AiStopReason::Pending => {
             (StopReason::EndTurn, None)
