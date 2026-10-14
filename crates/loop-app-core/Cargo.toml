@@ -16,6 +16,7 @@ telemetry = ["loop-agent/telemetry", "dep:loop-telemetry"]
 loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp", "sqlite"] }
 loop-protocol = { workspace = true }
+loop-acp = { workspace = true }
 loop-mcp = { workspace = true }
 loop-telemetry = { workspace = true, optional = true }
 serde = { workspace = true }

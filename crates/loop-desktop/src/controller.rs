@@ -130,6 +130,7 @@ impl DesktopController {
                 no_context_files: false,
                 interactive: false,
                 session_id: None,
+                agent: None,
             })
             .await?,
         );

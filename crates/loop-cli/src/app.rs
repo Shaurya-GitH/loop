@@ -28,13 +28,14 @@ use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
 use loop_protocol::{
-    ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role, SessionSpec,
+    AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role,
     SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
 };
 
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
 use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, SkillsCommand};
+use crate::commands::{parse_agent, AgentCommand};
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
 use crate::keybindings::{
@@ -59,7 +60,7 @@ use crate::tui::{
     CardStatus, ChatItem, CommandHistory, FileEntry, FooterOpts, InputBuffer, McpServerListing,
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
-use crate::{build_tools, CliRuntime};
+use crate::{build_tools, CliRuntime, PendingAgent};
 
 enum UiEvent {
     UpdateAvailable(String),
@@ -67,6 +68,13 @@ enum UiEvent {
     Update(Box<UpdateEnvelope>),
     /// The backend refused to start a turn (no update was emitted for it).
     TurnFailed(String),
+    /// An external agent started (or failed to) for `/agent` or `--agent`.
+    AgentReady {
+        id: String,
+        result: Result<(Arc<dyn AgentBackend>, loop_protocol::SessionRef), String>,
+    },
+    /// A message from background agent work (sign-in, method lists).
+    AgentNote(Result<String, String>),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
     /// `/sandbox` enable/disable finished.
@@ -358,11 +366,7 @@ async fn run_loop(
             }
         });
     }
-    forward_updates(
-        runtime.backend.subscribe(),
-        tx.clone(),
-        runtime.debug_log_path.clone(),
-    );
+    ensure_forwarding(runtime, runtime.backend.as_ref(), &tx);
 
     let review_policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
     let policy_active = review_policy.asks_for_session(!runtime.resumed);
@@ -375,6 +379,9 @@ async fn run_loop(
         }
     };
     let (host, mut review_rx) = InteractionQueue::new();
+    // External agents ask the user through the same queue as Loop's own
+    // approvals.
+    runtime.agents.set_host(Arc::new(host.clone()));
     let bridge = Arc::new(ToolApprovalBridge::with_host(
         tool_env,
         runtime.settings.diff_editor.clone(),
@@ -409,6 +416,9 @@ async fn run_loop(
             Vec::new()
         }
     };
+    if let Some(pending) = runtime.pending_agent.take() {
+        chat.push(sys(start_agent(runtime, pending, &tx)));
+    }
     let mut flushed = 0usize;
     // Visual lines of `chat[flushed..]` already pushed into native scrollback.
     let mut live_frozen = 0usize;
@@ -510,9 +520,10 @@ async fn run_loop(
             redraw_request = true;
         }
 
-        let model_line = match runtime.selected_model_spec() {
-            Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
-            None => NO_MODEL_LABEL.to_string(),
+        let model_line = match (&runtime.active_agent, runtime.selected_model_spec()) {
+            (Some(agent), _) => format!("agent {agent} · /agent off for Loop's own"),
+            (None, Some(spec)) => format!("{spec} · {}", runtime.settings.default_thinking_level),
+            (None, None) => NO_MODEL_LABEL.to_string(),
         };
 
         let ac_entries = if input.as_str().starts_with('/')
@@ -1330,6 +1341,35 @@ async fn drain_ui_events(
                     refresh_token_bar,
                 );
             }
+            UiEvent::AgentReady { id, result } => match result {
+                Ok((backend, session)) => {
+                    let resumed = runtime.session_id == session.native_id;
+                    runtime.adopt_agent(&id, backend, session);
+                    *status = format!("ready · agent {id}");
+                    if !resumed {
+                        push_before_queued(
+                            chat,
+                            sys(format!("{id} is ready · new session · /agent off returns to Loop's own agent")),
+                        );
+                    }
+                }
+                Err(err) => {
+                    // A failed resume pointed the transcript at the agent's
+                    // session; return to Loop's own.
+                    if runtime.is_native() {
+                        runtime.use_native().await;
+                    }
+                    push_before_queued(chat, error_item(format!("{id}: {err}")));
+                    *status = "agent failed to start".into();
+                }
+            },
+            UiEvent::AgentNote(note) => {
+                let item = match note {
+                    Ok(text) => sys(text),
+                    Err(err) => error_item(err),
+                };
+                push_before_queued(chat, item);
+            }
             UiEvent::TurnFailed(err) => {
                 *working = false;
                 turn_step.clear();
@@ -1511,6 +1551,184 @@ async fn drain_ui_events(
         message_queue,
         tx,
     );
+}
+
+/// Forward `backend`'s updates to the UI once per backend instance.
+fn ensure_forwarding(
+    runtime: &CliRuntime,
+    backend: &dyn AgentBackend,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    let fresh = runtime
+        .forwarded
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(backend.instance().to_string());
+    if fresh {
+        forward_updates(
+            backend.subscribe(),
+            tx.clone(),
+            runtime.debug_log_path.clone(),
+        );
+    }
+}
+
+/// Start an external agent in the background; `UiEvent::AgentReady` reports
+/// the result. Returns a line to show meanwhile.
+fn start_agent(
+    runtime: &mut CliRuntime,
+    pending: PendingAgent,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) -> String {
+    let id = match &pending {
+        PendingAgent::New(id) => id.clone(),
+        PendingAgent::Resume(record) => {
+            // Replayed history must route to this session as it arrives.
+            runtime.session_id = record.id.clone();
+            record.agent.clone()
+        }
+    };
+    let agents = Arc::clone(&runtime.agents);
+    let forwarded = Arc::clone(&runtime.forwarded);
+    let debug_log = runtime.debug_log_path.clone();
+    let tx = tx.clone();
+    let task_id = id.clone();
+    tokio::spawn(async move {
+        let result = async {
+            // Subscribe before the session opens, so no update is missed.
+            let backend = agents.backend(&task_id).await?;
+            if forwarded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(task_id.clone())
+            {
+                forward_updates(backend.subscribe(), tx.clone(), debug_log);
+            }
+            match pending {
+                PendingAgent::New(_) => agents.new_session(&task_id).await,
+                PendingAgent::Resume(record) => agents.resume(&record).await,
+            }
+        }
+        .await
+        .map(|(backend, session)| (backend as Arc<dyn AgentBackend>, session))
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(UiEvent::AgentReady {
+            id: task_id,
+            result,
+        });
+    });
+    format!("starting {id}… (the first start can take a while)")
+}
+
+/// `/agent …`
+async fn handle_agent_command(
+    runtime: &mut CliRuntime,
+    args: &str,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    let command = match parse_agent(args, |id| runtime.agents.entry(id).is_some()) {
+        Ok(command) => command,
+        Err(usage) => {
+            chat.push(sys(usage));
+            return;
+        }
+    };
+    match command {
+        AgentCommand::List => {
+            let mark = |active: bool| if active { "●" } else { " " };
+            let mut lines = vec![format!(
+                "{} loop — Loop's own agent ({})",
+                mark(runtime.is_native()),
+                runtime
+                    .selected_model_spec()
+                    .unwrap_or_else(|| "no model".into())
+            )];
+            for entry in runtime.agents.entries() {
+                let active = runtime.active_agent.as_deref() == Some(entry.id.as_str());
+                lines.push(format!(
+                    "{} {} — {} · {} {}",
+                    mark(active),
+                    entry.id,
+                    entry.display_name(),
+                    entry.command,
+                    entry.args.join(" ")
+                ));
+            }
+            lines.push("Switch: /agent <id> · sign in: /agent login · back: /agent off".into());
+            chat.push(sys(lines.join(
+                "
+",
+            )));
+        }
+        AgentCommand::Off => {
+            if runtime.is_native() {
+                chat.push(sys("already using Loop's own agent"));
+            } else {
+                runtime.use_native().await;
+                chat.push(sys("back to Loop's own agent"));
+                *status = "ready".into();
+            }
+        }
+        AgentCommand::Use(id) => {
+            if runtime.agents.entry(&id).is_none() {
+                chat.push(error_item(format!("no agent named `{id}` (see /agent)")));
+            } else if runtime.active_agent.as_deref() == Some(id.as_str()) {
+                chat.push(sys(format!(
+                    "{id} is already active · /new starts a fresh session"
+                )));
+            } else {
+                *status = format!("starting {id}…");
+                chat.push(sys(start_agent(runtime, PendingAgent::New(id), tx)));
+            }
+        }
+        AgentCommand::Login { agent, method } => {
+            let Some(id) = agent.or_else(|| runtime.active_agent.clone()) else {
+                chat.push(sys("Which agent? /agent login <id>   (see /agent)"));
+                return;
+            };
+            let agents = Arc::clone(&runtime.agents);
+            let tx = tx.clone();
+            chat.push(sys(format!("asking {id}…")));
+            tokio::spawn(async move {
+                let note = match method {
+                    None => agents.auth_methods(&id).await.map(|methods| {
+                        if methods.is_empty() {
+                            return format!("{id} needs no sign-in, or manages it itself");
+                        }
+                        let mut lines = vec![format!("{id} sign-in methods:")];
+                        for m in methods {
+                            let how = if m.in_terminal {
+                                " (runs in a terminal)"
+                            } else {
+                                ""
+                            };
+                            lines.push(format!("  {} — {}{how}", m.id, m.name));
+                        }
+                        lines.push(format!("Sign in: /agent login {id} <method>"));
+                        lines.join(
+                            "
+",
+                        )
+                    }),
+                    Some(method) => {
+                        agents
+                            .authenticate(&id, &method)
+                            .await
+                            .map(|terminal| match terminal {
+                                None => format!("signed in to {id}"),
+                                Some(command) => format!(
+                                    "run this in a terminal, then /agent {id} again:
+  {command}"
+                                ),
+                            })
+                    }
+                };
+                let _ = tx.send(UiEvent::AgentNote(note.map_err(|e| format!("{id}: {e:#}"))));
+            });
+        }
+    }
 }
 
 /// Forward the backend's updates into the UI loop, logging each when debug
@@ -1713,7 +1931,7 @@ fn submit_user_text(
     text: String,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
-    if runtime.selected_model.is_none() {
+    if runtime.is_native() && runtime.selected_model.is_none() {
         // Nothing can answer; don't queue or record the message.
         chat.push(error_item(
             loop_agent::harness::AgentHarnessError::NoModelSelected.to_string(),
@@ -3173,6 +3391,14 @@ async fn open_fork_picker(
     status: &mut String,
 ) {
     *model_picker = None;
+    if !runtime.is_native() {
+        *fork_picker = None;
+        chat.push(sys(
+            "forking works with Loop's own agent · /agent off first",
+        ));
+        *status = "ready".into();
+        return;
+    }
     match runtime.harness.fork_points().await {
         Ok(points) if points.is_empty() => {
             *fork_picker = None;
@@ -3986,13 +4212,8 @@ async fn apply_effect(
             *streaming_assistant = None;
             *streaming_thinking = None;
             *working = false;
-            let spec = SessionSpec {
-                cwd: Some(runtime.cwd.clone()),
-                name: None,
-            };
-            match runtime.backend.new_session(spec).await {
-                Ok(session) => {
-                    runtime.session_id = session.native_id;
+            match runtime.new_session().await {
+                Ok(()) => {
                     runtime.resumed = false;
                     runtime.active_skills.clear();
                     chat.clear();
@@ -4362,6 +4583,9 @@ async fn apply_effect(
             )
             .await;
         }
+        CommandEffect::Agent(args) => {
+            handle_agent_command(runtime, &args, chat, status, tx).await;
+        }
         CommandEffect::Mcp(McpCommand::Enable(name)) => {
             set_mcp_enabled(runtime, &name, true, chat, status).await;
             if runtime.settings.mcp_servers.contains_key(&name)
@@ -4614,6 +4838,10 @@ async fn choose_model(
 ) {
     match runtime.select_model(provider, id).await {
         Ok(model) => {
+            if !runtime.is_native() {
+                runtime.use_native().await;
+                chat.push(sys("back to Loop's own agent"));
+            }
             token_bar.sync_window(runtime);
             chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
         }

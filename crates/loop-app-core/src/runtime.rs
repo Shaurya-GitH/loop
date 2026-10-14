@@ -54,6 +54,10 @@ pub struct Runtime {
     /// Loop's own agent, for native-only features (sandbox, skills, MCP,
     /// forking, workflows). Same harness as `harness`.
     pub native: Arc<loop_agent::native_backend::NativeBackend>,
+    /// External ACP agents Loop can switch to.
+    pub agents: Arc<crate::agents::AgentManager>,
+    /// The external agent prompts go to, or `None` for Loop's own agent.
+    pub active_agent: Option<String>,
     /// Theme.
     pub theme: Theme,
     /// Resources.
@@ -86,6 +90,74 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Whether prompts go to Loop's own agent.
+    pub fn is_native(&self) -> bool {
+        self.active_agent.is_none()
+    }
+
+    /// Make `backend`'s `session` the active one, with external agent `id`.
+    pub fn adopt_agent(
+        &mut self,
+        id: &str,
+        backend: Arc<dyn loop_protocol::AgentBackend>,
+        session: loop_protocol::SessionRef,
+    ) {
+        self.backend = backend;
+        self.session_id = session.native_id;
+        self.active_agent = Some(id.to_owned());
+    }
+
+    /// Start a new session with external agent `id` and make it active.
+    pub async fn use_agent(&mut self, id: &str) -> anyhow::Result<()> {
+        let (backend, session) = self.agents.new_session(id).await?;
+        self.adopt_agent(id, backend, session);
+        Ok(())
+    }
+
+    /// Reopen a recorded external-agent session and make it active. The
+    /// session id is set first, so replayed history routes to it.
+    pub async fn resume_agent(
+        &mut self,
+        record: &crate::agents::AgentSessionRecord,
+    ) -> anyhow::Result<()> {
+        let previous = std::mem::replace(&mut self.session_id, record.id.clone());
+        match self.agents.resume(record).await {
+            Ok((backend, session)) => {
+                self.adopt_agent(&record.agent, backend, session);
+                Ok(())
+            }
+            Err(e) => {
+                self.session_id = previous;
+                Err(e)
+            }
+        }
+    }
+
+    /// Switch prompts back to Loop's own agent and its current session.
+    pub async fn use_native(&mut self) {
+        self.backend = self.native.clone();
+        self.session_id = self.harness.session_id().await;
+        self.active_agent = None;
+    }
+
+    /// Start a new session with the active agent.
+    pub async fn new_session(&mut self) -> anyhow::Result<()> {
+        match self.active_agent.clone() {
+            Some(id) => self.use_agent(&id).await,
+            None => {
+                let session = self
+                    .backend
+                    .new_session(loop_protocol::SessionSpec {
+                        cwd: Some(self.cwd.clone()),
+                        name: None,
+                    })
+                    .await?;
+                self.session_id = session.native_id;
+                Ok(())
+            }
+        }
+    }
+
     /// The active session as the backend interface names it.
     pub fn session_ref(&self) -> loop_protocol::SessionRef {
         loop_protocol::SessionRef {
@@ -416,6 +488,8 @@ pub struct BootstrapOpts {
     pub interactive: bool,
     /// Resume session id.
     pub session_id: Option<String>,
+    /// Start with this external agent. Loop's own provider is then optional.
+    pub agent: Option<String>,
 }
 
 /// Build the standard tool set bound to an execution environment.
@@ -605,8 +679,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     }
 
     let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
-    let needs_provider_setup =
-        ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
+    // An external agent brings its own model access.
+    let needs_provider_setup = opts.agent.is_none()
+        && ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
 
     let models = build_models(&agent_dir, Arc::clone(&credentials), &settings.providers)?;
     // Hydrate every provider from models-store.json before resolving a model. Without
@@ -773,6 +848,11 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
+    let agents = Arc::new(crate::agents::AgentManager::new(
+        crate::agents::agent_entries(&settings.agents),
+        opts.cwd.clone(),
+        crate::agents::index_path(&agent_dir),
+    ));
 
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
@@ -823,6 +903,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         harness,
         backend,
         native,
+        agents,
+        active_agent: None,
         theme,
         resources,
         project_trusted,

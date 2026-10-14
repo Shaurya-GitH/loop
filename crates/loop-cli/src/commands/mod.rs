@@ -148,6 +148,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[list|enable <name>|disable <name>]"),
         },
         SlashCommand {
+            name: "agent",
+            description: "Run an external agent (Codex, Claude, Gemini, …) or Loop's own",
+            args_hint: Some("[<id>|off|login [<id>] [<method>]]"),
+        },
+        SlashCommand {
             name: "mcp",
             description: "Enable, disable, or authorize MCP server connections",
             args_hint: Some(
@@ -368,6 +373,9 @@ pub enum CommandEffect {
     CloneSession,
     /// MCP sub-command.
     Mcp(McpCommand),
+    /// External agent control; the arguments are parsed with
+    /// [`parse_agent`] once the agent registry is at hand.
+    Agent(String),
     /// Multi-agent workflow from a goal string.
     #[cfg(feature = "orchestration")]
     Workflow {
@@ -441,6 +449,54 @@ pub enum McpCommand {
     Login(String),
     /// Delete saved OAuth tokens for a remote server.
     Logout(String),
+}
+
+/// `/agent` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCommand {
+    /// List agents and show which is active.
+    List,
+    /// Switch to an external agent (new session).
+    Use(String),
+    /// Switch back to Loop's own agent.
+    Off,
+    /// Show an agent's sign-in methods, or sign in with one.
+    Login {
+        /// Agent id; `None` means the active agent.
+        agent: Option<String>,
+        /// Method id; `None` lists the methods.
+        method: Option<String>,
+    },
+}
+
+const AGENT_USAGE: &str = "Usage: /agent [<id>|off|login [<id>] [<method>]] — no args lists agents";
+
+/// Parse `/agent` arguments; `Err` carries the usage text. `is_agent` tells
+/// agent ids from sign-in method ids after `login`.
+pub fn parse_agent(args: &str, is_agent: impl Fn(&str) -> bool) -> Result<AgentCommand, String> {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    match words.as_slice() {
+        [] | ["list"] => Ok(AgentCommand::List),
+        ["off"] | ["loop"] => Ok(AgentCommand::Off),
+        ["login"] => Ok(AgentCommand::Login {
+            agent: None,
+            method: None,
+        }),
+        ["login", one] if is_agent(one) => Ok(AgentCommand::Login {
+            agent: Some((*one).to_owned()),
+            method: None,
+        }),
+        ["login", method] => Ok(AgentCommand::Login {
+            agent: None,
+            method: Some((*method).to_owned()),
+        }),
+        ["login", agent, method] => Ok(AgentCommand::Login {
+            agent: Some((*agent).to_owned()),
+            method: Some((*method).to_owned()),
+        }),
+        [id] => Ok(AgentCommand::Use((*id).to_owned())),
+        _ => Err(AGENT_USAGE.into()),
+    }
 }
 
 const MCP_USAGE: &str = "Usage: /mcp [list|reload|login <name>|logout <name>|enable <name>|disable <name>] — no args opens a picker";
@@ -586,6 +642,7 @@ pub fn dispatch(
         "scoped-models" => CommandEffect::ScopedModels,
         "fork" => CommandEffect::Fork,
         "clone" => CommandEffect::CloneSession,
+        "agent" => CommandEffect::Agent(cmd.args.clone()),
         "mcp" => match parse_mcp(&cmd.args) {
             Ok(command) => CommandEffect::Mcp(command),
             Err(usage) => CommandEffect::Status(usage),
@@ -692,5 +749,50 @@ mod tests {
         assert!(parse_mcp("enable").is_err());
         assert!(parse_mcp("login").is_err());
         assert!(parse_mcp("nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod agent_command_tests {
+    use super::*;
+
+    fn parse(args: &str) -> Result<AgentCommand, String> {
+        parse_agent(args, |id| ["codex", "gemini"].contains(&id))
+    }
+
+    #[test]
+    fn agent_subcommands() {
+        assert_eq!(parse(""), Ok(AgentCommand::List));
+        assert_eq!(parse("off"), Ok(AgentCommand::Off));
+        assert_eq!(parse("codex"), Ok(AgentCommand::Use("codex".into())));
+        assert_eq!(
+            parse("login"),
+            Ok(AgentCommand::Login {
+                agent: None,
+                method: None
+            })
+        );
+        assert_eq!(
+            parse("login gemini"),
+            Ok(AgentCommand::Login {
+                agent: Some("gemini".into()),
+                method: None
+            })
+        );
+        assert_eq!(
+            parse("login chatgpt"),
+            Ok(AgentCommand::Login {
+                agent: None,
+                method: Some("chatgpt".into())
+            })
+        );
+        assert_eq!(
+            parse("login codex chatgpt"),
+            Ok(AgentCommand::Login {
+                agent: Some("codex".into()),
+                method: Some("chatgpt".into())
+            })
+        );
+        assert!(parse("a b c d").is_err());
     }
 }

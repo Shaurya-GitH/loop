@@ -50,6 +50,15 @@ pub struct AcpBackend {
     link: tokio::sync::Mutex<Option<Live>>,
 }
 
+impl std::fmt::Debug for AcpBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpBackend")
+            .field("agent", &self.config.id)
+            .field("command", &self.config.command)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The current agent process and connection.
 struct Live {
     conn: Arc<Connection>,

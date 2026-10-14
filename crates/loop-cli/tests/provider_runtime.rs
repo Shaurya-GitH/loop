@@ -26,6 +26,7 @@ async fn boot(cwd: &std::path::Path) -> CliRuntime {
         no_context_files: true,
         interactive: false,
         session_id: None,
+        agent: None,
     })
     .await
     .unwrap()

@@ -34,6 +34,7 @@ async fn tracing_commands_persist_to_settings_and_auth() {
         no_context_files: true,
         interactive: false,
         session_id: None,
+        agent: None,
     })
     .await
     .unwrap();
@@ -84,6 +85,7 @@ async fn tracing_commands_persist_to_settings_and_auth() {
         no_context_files: true,
         interactive: false,
         session_id: None,
+        agent: None,
     })
     .await
     .unwrap();

@@ -32,6 +32,19 @@ pub struct CliRuntime {
     pub debug: bool,
     /// Path to the active debug log file, if any.
     pub debug_log_path: Option<std::path::PathBuf>,
+    /// External agent to start once the surface is ready.
+    pub pending_agent: Option<PendingAgent>,
+    /// Backend instances whose updates are already forwarded to the surface.
+    pub forwarded: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// An external agent to start when the surface is ready.
+#[derive(Debug, Clone)]
+pub enum PendingAgent {
+    /// Open a new session with this agent id.
+    New(String),
+    /// Reopen this recorded session.
+    Resume(loop_app_core::agents::AgentSessionRecord),
 }
 
 impl std::ops::Deref for CliRuntime {
@@ -58,5 +71,7 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         keybindings,
         debug: false,
         debug_log_path: None,
+        pending_agent: None,
+        forwarded: Default::default(),
     })
 }

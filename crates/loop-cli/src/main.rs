@@ -42,9 +42,13 @@ struct Cli {
     #[arg(long, short = 'c', global = true)]
     no_context_files: bool,
 
-    /// Resume a session by id.
+    /// Resume a session by id (Loop's own or an external agent's).
     #[arg(long, global = true)]
     resume: Option<String>,
+
+    /// Use an external agent (see `/agent`), e.g. `codex`, `claude`, `gemini`.
+    #[arg(long, global = true)]
+    agent: Option<String>,
 
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
@@ -226,6 +230,18 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let interactive = cli.print.is_none() && !cli.serve_mcp;
+    // `--resume` may name a session Loop opened with an external agent.
+    let agent_resume = cli.resume.as_deref().and_then(|id| {
+        loop_app_core::agents::find_recorded_session(&config::paths::get_agent_dir(), id)
+    });
+    let pending_agent = match (&agent_resume, &cli.agent) {
+        (Some(record), _) => Some(loop_cli::PendingAgent::Resume(record.clone())),
+        (None, Some(id)) => Some(loop_cli::PendingAgent::New(id.clone())),
+        (None, None) => None,
+    };
+    if cli.serve_mcp && pending_agent.is_some() {
+        anyhow::bail!("--serve-mcp serves Loop's own tools; it cannot run with an external agent");
+    }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider: cli.provider,
@@ -235,9 +251,18 @@ async fn real_main() -> anyhow::Result<()> {
         append_system_prompt: cli.append_system_prompt,
         no_context_files: cli.no_context_files,
         interactive,
-        session_id: cli.resume,
+        session_id: if agent_resume.is_some() {
+            None
+        } else {
+            cli.resume
+        },
+        agent: pending_agent.as_ref().map(|pending| match pending {
+            loop_cli::PendingAgent::New(id) => id.clone(),
+            loop_cli::PendingAgent::Resume(record) => record.agent.clone(),
+        }),
     })
     .await?;
+    runtime.pending_agent = pending_agent;
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
     #[cfg(feature = "telemetry")]
@@ -254,7 +279,9 @@ async fn real_main() -> anyhow::Result<()> {
         )
         .await
     } else if let Some(prompt) = cli.print {
-        print_mode::run_print(&runtime, prompt, &cli.trace).await
+        let result = print_mode::run_print(&mut runtime, prompt, &cli.trace).await;
+        runtime.agents.shutdown().await;
+        result
     } else {
         loop_cli::app::run(runtime).await
     };

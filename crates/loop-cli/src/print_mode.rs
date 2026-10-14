@@ -16,7 +16,7 @@ use tokio::sync::broadcast::error::RecvError;
 #[cfg(feature = "telemetry")]
 use tracing::Instrument;
 
-use crate::CliRuntime;
+use crate::{CliRuntime, PendingAgent};
 
 /// Name of the root observation of a print-mode trace.
 #[cfg(feature = "telemetry")]
@@ -144,10 +144,17 @@ where
 
 /// `loop --print`: run one prompt, print the answer, report the trace id on stderr.
 pub async fn run_print(
-    runtime: &CliRuntime,
+    runtime: &mut CliRuntime,
     prompt: String,
     trace: &TraceArgs,
 ) -> anyhow::Result<()> {
+    // No one can approve anything here: external agents get the default
+    // host, which rejects every request, so they decline the action.
+    match runtime.pending_agent.take() {
+        Some(PendingAgent::New(id)) => runtime.use_agent(&id).await?,
+        Some(PendingAgent::Resume(record)) => runtime.resume_agent(&record).await?,
+        None => {}
+    }
     let backend = runtime.backend.clone();
     let session = runtime.session_ref();
     let input = prompt.clone();

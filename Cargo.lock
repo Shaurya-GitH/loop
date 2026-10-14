@@ -4589,6 +4589,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "ignore",
+ "loop-acp",
  "loop-agent",
  "loop-ai",
  "loop-mcp",
