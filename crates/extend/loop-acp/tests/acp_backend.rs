@@ -10,9 +10,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use loop_acp::{AcpBackend, AgentConfig, AgentLink, Connector};
 use loop_protocol::{
-    AgentBackend, BackendResult, ContentBlock, ErrorCategory, HostFileSystem, HostServices,
-    InteractionOutcome, InteractionRequest, Origin, PermissionKind, Role, SessionRef, SessionSpec,
-    SessionUpdate, StopReason, ToolContent, TurnOutcome, UpdateEnvelope,
+    AgentBackend, BackendError, BackendResult, ContentBlock, ErrorCategory, HostFileSystem,
+    HostServices, InteractionOutcome, InteractionRequest, Origin, PermissionKind, Role, SessionRef,
+    SessionSpec, SessionUpdate, StopReason, ToolContent, TurnOutcome, UpdateEnvelope,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -910,4 +910,53 @@ async fn reasoning_effort_comes_from_the_session_config_and_can_be_switched() {
     assert_eq!(sent["params"]["value"], "high");
 
     assert!(control.set_effort(&session, "ultra").await.is_err());
+}
+
+#[tokio::test]
+async fn sessions_of_another_backend_are_refused() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let ours = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    // Same native id, but another agent's instance.
+    let theirs = SessionRef {
+        instance: loop_protocol::BackendInstanceId::from("other-agent"),
+        ..ours.clone()
+    };
+    let control = fx.backend.model_control().unwrap();
+
+    assert!(matches!(
+        fx.backend
+            .prompt(&theirs, vec![ContentBlock::text("hello")])
+            .await,
+        Err(BackendError::SessionNotFound(_))
+    ));
+    assert!(matches!(
+        control.models(&theirs).await,
+        Err(BackendError::SessionNotFound(_))
+    ));
+    assert!(matches!(
+        control.set_effort(&theirs, "high").await,
+        Err(BackendError::SessionNotFound(_))
+    ));
+    fx.backend.cancel(&theirs);
+    assert!(!fx.backend.is_busy(&theirs));
+    let methods: Vec<_> = fx
+        .world
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["method"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        !methods.iter().any(|m| m == "session/prompt"
+            || m == "session/cancel"
+            || m == "session/set_config_option"),
+        "nothing reached the agent: {methods:?}"
+    );
+    // Our own session still works.
+    assert!(control.models(&ours).await.is_ok());
 }
