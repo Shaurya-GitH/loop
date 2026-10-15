@@ -185,11 +185,17 @@ async fn handle(agent: &Agent, world: &World, method: &str, params: Value) -> Re
         "authenticate" => Ok(json!({})),
         "session/new" => {
             let n = world.sessions.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(json!({"sessionId": format!("s{n}"), "configOptions": [model_option("gpt-a")]}))
+            Ok(
+                json!({"sessionId": format!("s{n}"), "configOptions": config_options("gpt-a", "low")}),
+            )
         }
         "session/set_config_option" => {
-            let value = params["value"].as_str().unwrap_or_default().to_owned();
-            Ok(json!({"configOptions": [model_option(&value)]}))
+            let value = params["value"].as_str().unwrap_or_default();
+            let options = match params["configId"].as_str() {
+                Some("effort") => config_options("gpt-a", value),
+                _ => config_options(value, "low"),
+            };
+            Ok(json!({"configOptions": options}))
         }
         "session/load" => {
             let session = params["sessionId"].as_str().unwrap_or_default().to_owned();
@@ -213,10 +219,15 @@ async fn handle(agent: &Agent, world: &World, method: &str, params: Value) -> Re
     }
 }
 
-fn model_option(current: &str) -> Value {
-    json!({"id": "model", "name": "Model", "category": "model", "type": "select",
-        "currentValue": current,
-        "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B", "description": "faster"}]})
+fn config_options(model: &str, effort: &str) -> Value {
+    json!([
+        {"id": "model", "name": "Model", "category": "model", "type": "select",
+        "currentValue": model,
+        "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B", "description": "faster"}]},
+        {"id": "effort", "name": "Reasoning", "category": "thought_level", "type": "select",
+        "currentValue": effort,
+        "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
+    ])
 }
 
 async fn prompt(agent: &Agent, world: &World, session: &str, text: &str) -> Result<Value, Value> {
@@ -864,4 +875,39 @@ async fn models_come_from_the_session_config_and_can_be_switched() {
     assert_eq!(sent["params"]["value"], "gpt-b");
 
     assert!(control.set_model(&session, "gpt-z").await.is_err());
+}
+
+#[tokio::test]
+async fn reasoning_effort_comes_from_the_session_config_and_can_be_switched() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    let control = fx.backend.model_control().unwrap();
+
+    let efforts = control.efforts(&session).await.unwrap();
+    assert_eq!(efforts.current.as_deref(), Some("low"));
+    let ids: Vec<_> = efforts.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["low", "high"]);
+
+    control.set_effort(&session, "high").await.unwrap();
+    assert_eq!(
+        control.efforts(&session).await.unwrap().current.as_deref(),
+        Some("high")
+    );
+    let sent = fx
+        .world
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|m| m["method"] == "session/set_config_option")
+        .cloned()
+        .unwrap();
+    assert_eq!(sent["params"]["configId"], "effort");
+    assert_eq!(sent["params"]["value"], "high");
+
+    assert!(control.set_effort(&session, "ultra").await.is_err());
 }

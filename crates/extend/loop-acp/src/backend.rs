@@ -1053,16 +1053,38 @@ impl AgentBackend for AcpBackend {
     }
 }
 
-/// The session's model option: its id and select value, when the agent has one.
-fn model_option(
+/// What a session select option sets, for lookups and error messages.
+#[derive(Clone, Copy)]
+enum Setting {
+    Model,
+    Effort,
+}
+
+impl Setting {
+    fn category(self) -> acp::SessionConfigOptionCategory {
+        match self {
+            Self::Model => acp::SessionConfigOptionCategory::Model,
+            Self::Effort => acp::SessionConfigOptionCategory::ThoughtLevel,
+        }
+    }
+
+    fn unsupported(self) -> BackendError {
+        BackendError::Unsupported(match self {
+            Self::Model => "choosing a model".into(),
+            Self::Effort => "choosing a reasoning effort".into(),
+        })
+    }
+}
+
+/// The session's select option for `setting`: its id and select value, when
+/// the agent has one.
+fn select_option(
     options: &[acp::SessionConfigOption],
+    setting: Setting,
 ) -> Option<(String, &acp::SessionConfigSelect)> {
     options.iter().find_map(|option| {
-        let is_model = matches!(
-            option.category,
-            Some(acp::SessionConfigOptionCategory::Model)
-        );
-        match (&option.kind, is_model) {
+        let matches = option.category.as_ref() == Some(&setting.category());
+        match (&option.kind, matches) {
             (acp::SessionConfigKind::Select(select), true) => {
                 Some((option.id.0.to_string(), select))
             }
@@ -1091,30 +1113,34 @@ fn model_choices(select: &acp::SessionConfigSelect) -> ModelChoices {
     }
 }
 
-#[async_trait]
-impl ModelControl for AcpBackend {
-    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+impl AcpBackend {
+    fn choices(&self, session: &SessionRef, setting: Setting) -> BackendResult<ModelChoices> {
         let state = self.lock_state();
         let known = state
             .sessions
             .get(&session.native_id)
             .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))?;
-        model_option(&known.config_options)
+        select_option(&known.config_options, setting)
             .map(|(_, select)| model_choices(select))
-            .ok_or_else(|| BackendError::Unsupported("choosing a model".into()))
+            .ok_or_else(|| setting.unsupported())
     }
 
-    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()> {
+    async fn choose(
+        &self,
+        session: &SessionRef,
+        setting: Setting,
+        value: &str,
+    ) -> BackendResult<()> {
         let config_id = {
             let state = self.lock_state();
             let known = state
                 .sessions
                 .get(&session.native_id)
                 .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))?;
-            let (config_id, select) = model_option(&known.config_options)
-                .ok_or_else(|| BackendError::Unsupported("choosing a model".into()))?;
-            if !model_choices(select).models.iter().any(|m| m.id == model) {
-                return Err(BackendError::Unsupported(format!("the model `{model}`")));
+            let (config_id, select) = select_option(&known.config_options, setting)
+                .ok_or_else(|| setting.unsupported())?;
+            if !model_choices(select).models.iter().any(|m| m.id == value) {
+                return Err(BackendError::Unsupported(format!("`{value}`")));
             }
             config_id
         };
@@ -1122,7 +1148,7 @@ impl ModelControl for AcpBackend {
         let response = conn
             .request(
                 "session/set_config_option",
-                json!({"sessionId": session.native_id, "configId": config_id, "value": model}),
+                json!({"sessionId": session.native_id, "configId": config_id, "value": value}),
             )
             .await
             .map_err(rpc_failure)?;
@@ -1134,5 +1160,24 @@ impl ModelControl for AcpBackend {
             }
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ModelControl for AcpBackend {
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.choices(session, Setting::Model)
+    }
+
+    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()> {
+        self.choose(session, Setting::Model, model).await
+    }
+
+    async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.choices(session, Setting::Effort)
+    }
+
+    async fn set_effort(&self, session: &SessionRef, effort: &str) -> BackendResult<()> {
+        self.choose(session, Setting::Effort, effort).await
     }
 }
