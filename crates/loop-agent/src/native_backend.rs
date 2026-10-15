@@ -5,6 +5,7 @@
 //! Agent events are translated by [`NativeEventMapper`] and published as
 //! [`UpdateEnvelope`]s on a broadcast stream.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,6 +37,18 @@ pub struct NativeBackend {
     harness: Arc<AgentHarness>,
     updates: broadcast::Sender<UpdateEnvelope>,
     stream: Arc<Mutex<StreamState>>,
+    /// Set while a prompt sent through this backend runs, so two callers
+    /// cannot both start one.
+    prompting: Arc<AtomicBool>,
+}
+
+/// Clears [`NativeBackend::prompting`] when the prompt is over.
+struct PromptSlot(Arc<AtomicBool>);
+
+impl Drop for PromptSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Translation state, shared with the harness subscription.
@@ -63,6 +76,7 @@ impl NativeBackend {
             harness: Arc::clone(&harness),
             updates: updates.clone(),
             stream: Arc::clone(&stream),
+            prompting: Arc::new(AtomicBool::new(false)),
         });
         let instance = backend.instance.clone();
         harness.subscribe(move |event: AgentEvent| {
@@ -143,8 +157,30 @@ fn translate(
     envelopes
 }
 
+/// An error notice outside any turn.
+fn error_notice(
+    instance: &BackendInstanceId,
+    stream: &Mutex<StreamState>,
+    info: &ErrorInfo,
+) -> UpdateEnvelope {
+    let mut state = stream.lock();
+    state.seq += 1;
+    UpdateEnvelope::live(
+        instance.clone(),
+        0,
+        state.session.clone(),
+        None,
+        state.seq,
+        SessionUpdate::Notice {
+            level: NoticeLevel::Error,
+            text: info.message.clone(),
+        },
+    )
+}
+
 /// Keep the stream complete when the harness fails outside a normal run, so
-/// every prompt produces exactly one `TurnEnded`:
+/// every prompt that ran produces exactly one `TurnEnded` (a prompt rejected
+/// as busy gets only an [`error_notice`]):
 /// - the run's turn is still open: end it as failed;
 /// - the run never started a turn (`turns_before` unchanged): report a
 ///   started-and-failed turn;
@@ -313,6 +349,16 @@ impl AgentBackend for NativeBackend {
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
         self.check_session(session).await?;
+        // Reserve the turn before checking the harness, so two callers
+        // cannot both pass the check.
+        if self
+            .prompting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(BackendError::Busy);
+        }
+        let slot = PromptSlot(Arc::clone(&self.prompting));
         if self.harness.phase() != AgentHarnessPhase::Idle {
             return Err(BackendError::Busy);
         }
@@ -324,7 +370,10 @@ impl AgentBackend for NativeBackend {
         let updates = self.updates.clone();
         let turns_before = self.stream.lock().mapper.turns_started();
         tokio::spawn(async move {
-            let outcome = match harness.prompt(input).await {
+            let result = harness.prompt(input).await;
+            drop(slot);
+            let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
+            let outcome = match result {
                 Ok(message) => match message.as_assistant().map(turn_outcome) {
                     Some((StopReason::Cancelled, _)) => TurnOutcome::Cancelled,
                     Some((StopReason::Error, error)) => {
@@ -344,10 +393,18 @@ impl AgentBackend for NativeBackend {
                     other => ErrorInfo::new(ErrorCategory::Internal, other.to_string()),
                 }),
             };
-            if let TurnOutcome::Failed(info) = &outcome {
-                for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
-                    let _ = updates.send(envelope);
+            match &outcome {
+                // Another caller of the harness is running a turn; that
+                // turn is not this prompt's to close.
+                TurnOutcome::Failed(info) if rejected_busy => {
+                    let _ = updates.send(error_notice(&instance, &stream, info));
                 }
+                TurnOutcome::Failed(info) => {
+                    for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
+                        let _ = updates.send(envelope);
+                    }
+                }
+                _ => {}
             }
             let _ = done.send(outcome);
         });
@@ -359,7 +416,7 @@ impl AgentBackend for NativeBackend {
     }
 
     fn is_busy(&self, _session: &SessionRef) -> bool {
-        self.harness.phase() != AgentHarnessPhase::Idle
+        self.prompting.load(Ordering::Acquire) || self.harness.phase() != AgentHarnessPhase::Idle
     }
 
     async fn shutdown(&self) {
