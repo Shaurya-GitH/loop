@@ -4952,7 +4952,10 @@ async fn choose_model(
 fn effort_status(runtime: &CliRuntime) -> String {
     match runtime.active_model_label() {
         Some(label) if !runtime.is_native() => format!("ready · {label}"),
-        Some(spec) => format!("ready · {spec} · {}", runtime.settings.default_thinking_level),
+        Some(spec) => format!(
+            "ready · {spec} · {}",
+            runtime.settings.default_thinking_level
+        ),
         None => "ready".into(),
     }
 }
