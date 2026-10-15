@@ -16,8 +16,9 @@ mod update;
 
 pub use backend::{
     AgentBackend, BackendError, BackendResult, Compaction, CompactionReport, HostFileSystem,
-    HostServices, HostTerminals, LocalShell, SessionRef, SessionSpec, SessionStats, ShellResult,
-    StatsSummary, TerminalExit, TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome,
+    HostServices, HostTerminals, LocalShell, ModelChoice, ModelChoices, ModelControl, SessionRef,
+    SessionSpec, SessionStats, ShellResult, StatsSummary, TerminalExit, TerminalOutput,
+    TerminalRequest, TurnHandle, TurnOutcome,
 };
 pub use capabilities::Capabilities;
 pub use content::ContentBlock;

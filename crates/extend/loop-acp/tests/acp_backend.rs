@@ -185,7 +185,11 @@ async fn handle(agent: &Agent, world: &World, method: &str, params: Value) -> Re
         "authenticate" => Ok(json!({})),
         "session/new" => {
             let n = world.sessions.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(json!({"sessionId": format!("s{n}")}))
+            Ok(json!({"sessionId": format!("s{n}"), "configOptions": [model_option("gpt-a")]}))
+        }
+        "session/set_config_option" => {
+            let value = params["value"].as_str().unwrap_or_default().to_owned();
+            Ok(json!({"configOptions": [model_option(&value)]}))
         }
         "session/load" => {
             let session = params["sessionId"].as_str().unwrap_or_default().to_owned();
@@ -207,6 +211,12 @@ async fn handle(agent: &Agent, world: &World, method: &str, params: Value) -> Re
         }
         _ => Err(json!({"code": -32601, "message": "unknown"})),
     }
+}
+
+fn model_option(current: &str) -> Value {
+    json!({"id": "model", "name": "Model", "category": "model", "type": "select",
+        "currentValue": current,
+        "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B", "description": "faster"}]})
 }
 
 async fn prompt(agent: &Agent, world: &World, session: &str, text: &str) -> Result<Value, Value> {
@@ -818,4 +828,40 @@ async fn the_prompt_after_a_cancelled_turn_works() {
         .filter(|m| m["method"] == "session/cancel")
         .count();
     assert_eq!(cancels, 1, "the cancel reached only the cancelled turn");
+}
+
+#[tokio::test]
+async fn models_come_from_the_session_config_and_can_be_switched() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    let control = fx.backend.model_control().unwrap();
+
+    let choices = control.models(&session).await.unwrap();
+    assert_eq!(choices.current.as_deref(), Some("gpt-a"));
+    let ids: Vec<_> = choices.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["gpt-a", "gpt-b"]);
+    assert_eq!(choices.models[1].description.as_deref(), Some("faster"));
+
+    control.set_model(&session, "gpt-b").await.unwrap();
+    assert_eq!(
+        control.models(&session).await.unwrap().current.as_deref(),
+        Some("gpt-b")
+    );
+    let sent = fx
+        .world
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|m| m["method"] == "session/set_config_option")
+        .cloned()
+        .unwrap();
+    assert_eq!(sent["params"]["configId"], "model");
+    assert_eq!(sent["params"]["value"], "gpt-b");
+
+    assert!(control.set_model(&session, "gpt-z").await.is_err());
 }
