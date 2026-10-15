@@ -2828,7 +2828,10 @@ async fn handle_key(
             }
             Action::ThinkingCycle => {
                 match runtime.cycle_effort().await {
-                    Ok(level) => chat.push(sys(format!("effort → {level}"))),
+                    Ok(level) => {
+                        chat.push(sys(format!("effort → {level}")));
+                        *status = effort_status(runtime);
+                    }
                     Err(err) => chat.push(error_item(format!("{err:#}"))),
                 }
                 return Ok(());
@@ -4177,7 +4180,10 @@ async fn apply_effect(
             Err(err) => chat.push(error_item(format!("{err:#}"))),
         },
         CommandEffect::Effort(Some(level)) => match runtime.set_effort(&level).await {
-            Ok(level) => chat.push(sys(format!("effort → {level}"))),
+            Ok(level) => {
+                chat.push(sys(format!("effort → {level}")));
+                *status = effort_status(runtime);
+            }
             Err(err) => chat.push(error_item(format!("{err:#}"))),
         },
         CommandEffect::SetSandbox(mode) => {
@@ -4939,6 +4945,15 @@ async fn choose_model(
             chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
         }
         Err(err) => chat.push(error_item(format!("{err:#}"))),
+    }
+}
+
+/// Status line after the reasoning effort changes.
+fn effort_status(runtime: &CliRuntime) -> String {
+    match runtime.active_model_label() {
+        Some(label) if !runtime.is_native() => format!("ready · {label}"),
+        Some(spec) => format!("ready · {spec} · {}", runtime.settings.default_thinking_level),
+        None => "ready".into(),
     }
 }
 
