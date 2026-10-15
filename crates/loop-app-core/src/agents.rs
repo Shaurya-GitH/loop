@@ -40,6 +40,14 @@ pub struct AgentEntry {
     /// What to install when the command is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_hint: Option<String>,
+    /// Environment variable naming the folder where the agent keeps its own
+    /// state (for Codex, `CODEX_HOME`). Loop points it at a private folder,
+    /// so the agent does not reuse sign-ins from its standalone install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_env: Option<String>,
+    /// The agent must be signed in through `/login` before use.
+    #[serde(default)]
+    pub sign_in: bool,
 }
 
 impl AgentEntry {
@@ -51,6 +59,8 @@ impl AgentEntry {
             args: args.iter().map(|a| (*a).into()).collect(),
             env: BTreeMap::new(),
             install_hint: Some(install_hint.into()),
+            home_env: None,
+            sign_in: false,
         }
     }
 
@@ -79,14 +89,17 @@ impl AgentEntry {
 
 /// Built-in agents. Each command is the one its project documents for ACP.
 pub fn builtin_agents() -> Vec<AgentEntry> {
+    let mut codex = AgentEntry::preset(
+        "codex",
+        "Codex (ChatGPT plan or OpenAI API key)",
+        "npx",
+        &["-y", "@agentclientprotocol/codex-acp"],
+        "Needs Node.js (npx).",
+    );
+    codex.home_env = Some("CODEX_HOME".into());
+    codex.sign_in = true;
     vec![
-        AgentEntry::preset(
-            "codex",
-            "Codex (ChatGPT plan or OpenAI API key)",
-            "npx",
-            &["-y", "@agentclientprotocol/codex-acp"],
-            "Needs Node.js (npx). Signs in with your ChatGPT plan through `/agent login`.",
-        ),
+        codex,
         AgentEntry::preset(
             "claude",
             "Claude Agent",
@@ -176,30 +189,33 @@ pub struct AgentManager {
     entries: Vec<AgentEntry>,
     cwd: PathBuf,
     index_path: PathBuf,
+    /// Per-agent state: private homes and sign-in markers.
+    state_dir: PathBuf,
     connector: Arc<dyn Connector>,
     host: Mutex<Arc<dyn HostServices>>,
     started: tokio::sync::Mutex<HashMap<String, Arc<AcpBackend>>>,
 }
 
 impl AgentManager {
-    /// A manager for `entries`, starting agents in `cwd` and recording
-    /// sessions in `index_path`. Until a surface installs its host,
+    /// A manager for `entries`, starting agents in `cwd` and keeping agent
+    /// state under `agent_dir`. Until a surface installs its host,
     /// interactions are answered by [`HeadlessHost`].
-    pub fn new(entries: Vec<AgentEntry>, cwd: PathBuf, index_path: PathBuf) -> Self {
-        Self::with_connector(entries, cwd, index_path, Arc::new(ProcessConnector))
+    pub fn new(entries: Vec<AgentEntry>, cwd: PathBuf, agent_dir: &Path) -> Self {
+        Self::with_connector(entries, cwd, agent_dir, Arc::new(ProcessConnector))
     }
 
     /// A manager that reaches agents through `connector` (tests use a fake).
     pub fn with_connector(
         entries: Vec<AgentEntry>,
         cwd: PathBuf,
-        index_path: PathBuf,
+        agent_dir: &Path,
         connector: Arc<dyn Connector>,
     ) -> Self {
         Self {
             entries,
             cwd,
-            index_path,
+            index_path: index_path(agent_dir),
+            state_dir: agent_dir.join("agents"),
             connector,
             host: Mutex::new(Arc::new(HeadlessHost)),
             started: tokio::sync::Mutex::new(HashMap::new()),
@@ -231,23 +247,54 @@ impl AgentManager {
             return Ok(Arc::clone(backend));
         }
         let host = Arc::clone(&self.host.lock().unwrap_or_else(|p| p.into_inner()));
-        let backend = AcpBackend::start(
-            entry.config(),
-            self.cwd.clone(),
-            Arc::clone(&self.connector),
-            host,
-        )
-        .await
-        .map_err(|e| match &entry.install_hint {
-            Some(hint) => anyhow!("{e}. {hint}"),
-            None => anyhow!("{e}"),
-        })?;
+        let mut config = entry.config();
+        if let Some(var) = &entry.home_env {
+            let home = self.state_dir.join(&entry.id).join("home");
+            std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
+            config
+                .env
+                .push((var.clone(), home.to_string_lossy().into_owned()));
+        }
+        let backend =
+            AcpBackend::start(config, self.cwd.clone(), Arc::clone(&self.connector), host)
+                .await
+                .map_err(|e| match &entry.install_hint {
+                    Some(hint) => anyhow!("{e}. {hint}"),
+                    None => anyhow!("{e}"),
+                })?;
         started.insert(id.to_owned(), Arc::clone(&backend));
         Ok(backend)
     }
 
+    /// Whether agent `id` may be used: signed in through `/login`, or not
+    /// needing it.
+    pub fn is_signed_in(&self, id: &str) -> bool {
+        match self.entry(id) {
+            Some(entry) if entry.sign_in => self.marker(id).exists(),
+            _ => true,
+        }
+    }
+
+    /// Agents that sign in through `/login`.
+    pub fn sign_in_agents(&self) -> Vec<&AgentEntry> {
+        self.entries.iter().filter(|e| e.sign_in).collect()
+    }
+
+    fn marker(&self, id: &str) -> PathBuf {
+        self.state_dir.join(id).join("signed-in")
+    }
+
+    fn require_sign_in(&self, id: &str) -> anyhow::Result<()> {
+        if self.is_signed_in(id) {
+            return Ok(());
+        }
+        let name = self.entry(id).map(AgentEntry::display_name).unwrap_or(id);
+        bail!("sign in to {name} first: /login and choose it")
+    }
+
     /// Open a new session with agent `id` and remember it for `--resume`.
     pub async fn new_session(&self, id: &str) -> anyhow::Result<(Arc<AcpBackend>, SessionRef)> {
+        self.require_sign_in(id)?;
         let backend = self.backend(id).await?;
         let session = backend
             .new_session(SessionSpec {
@@ -278,6 +325,7 @@ impl AgentManager {
         &self,
         record: &AgentSessionRecord,
     ) -> anyhow::Result<(Arc<AcpBackend>, SessionRef)> {
+        self.require_sign_in(&record.agent)?;
         let backend = self.backend(&record.agent).await?;
         let session = SessionRef {
             instance: backend.instance().clone(),
@@ -342,9 +390,20 @@ impl AgentManager {
             }
             _ => {
                 backend.authenticate(method).await?;
+                self.mark_signed_in(id)?;
                 Ok(None)
             }
         }
+    }
+
+    /// Record that agent `id` was signed in through Loop.
+    pub fn mark_signed_in(&self, id: &str) -> anyhow::Result<()> {
+        let marker = self.marker(id);
+        if let Some(dir) = marker.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&marker, now_ms().to_string())?;
+        Ok(())
     }
 
     /// Stop every running agent.
@@ -417,6 +476,8 @@ mod tests {
             args: vec![],
             env: BTreeMap::from([("PROFILE".into(), "work".into())]),
             install_hint: None,
+            home_env: None,
+            sign_in: false,
         };
         let entries = agent_entries(&[codex, mine]);
         assert_eq!(entries[0].id, "codex");
@@ -441,11 +502,7 @@ mod tests {
     #[test]
     fn session_index_round_trips_and_replaces() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = AgentManager::new(
-            Vec::new(),
-            dir.path().into(),
-            dir.path().join("agent-sessions.json"),
-        );
+        let manager = AgentManager::new(Vec::new(), dir.path().into(), dir.path());
         let record = |agent: &str| AgentSessionRecord {
             id: "s1".into(),
             agent: agent.into(),

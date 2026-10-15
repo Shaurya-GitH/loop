@@ -150,7 +150,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "agent",
             description: "Run an external agent (Codex, Claude, Gemini, …) or Loop's own",
-            args_hint: Some("[<id>|off|login [<id>] [<method>]]"),
+            args_hint: Some("[<id>|off]"),
         },
         SlashCommand {
             name: "mcp",
@@ -460,40 +460,17 @@ pub enum AgentCommand {
     Use(String),
     /// Switch back to Loop's own agent.
     Off,
-    /// Show an agent's sign-in methods, or sign in with one.
-    Login {
-        /// Agent id; `None` means the active agent.
-        agent: Option<String>,
-        /// Method id; `None` lists the methods.
-        method: Option<String>,
-    },
 }
 
-const AGENT_USAGE: &str = "Usage: /agent [<id>|off|login [<id>] [<method>]] — no args lists agents";
+const AGENT_USAGE: &str = "Usage: /agent [<id>|off] — no args lists agents · sign in with /login";
 
-/// Parse `/agent` arguments; `Err` carries the usage text. `is_agent` tells
-/// agent ids from sign-in method ids after `login`.
-pub fn parse_agent(args: &str, is_agent: impl Fn(&str) -> bool) -> Result<AgentCommand, String> {
+/// Parse `/agent` arguments; `Err` carries the usage text.
+pub fn parse_agent(args: &str) -> Result<AgentCommand, String> {
     let words: Vec<&str> = args.split_whitespace().collect();
     match words.as_slice() {
         [] | ["list"] => Ok(AgentCommand::List),
         ["off"] | ["loop"] => Ok(AgentCommand::Off),
-        ["login"] => Ok(AgentCommand::Login {
-            agent: None,
-            method: None,
-        }),
-        ["login", one] if is_agent(one) => Ok(AgentCommand::Login {
-            agent: Some((*one).to_owned()),
-            method: None,
-        }),
-        ["login", method] => Ok(AgentCommand::Login {
-            agent: None,
-            method: Some((*method).to_owned()),
-        }),
-        ["login", agent, method] => Ok(AgentCommand::Login {
-            agent: Some((*agent).to_owned()),
-            method: Some((*method).to_owned()),
-        }),
+        ["login", ..] => Err("Sign in to agents with /login".into()),
         [id] => Ok(AgentCommand::Use((*id).to_owned())),
         _ => Err(AGENT_USAGE.into()),
     }
@@ -756,43 +733,12 @@ mod tests {
 mod agent_command_tests {
     use super::*;
 
-    fn parse(args: &str) -> Result<AgentCommand, String> {
-        parse_agent(args, |id| ["codex", "gemini"].contains(&id))
-    }
-
     #[test]
     fn agent_subcommands() {
-        assert_eq!(parse(""), Ok(AgentCommand::List));
-        assert_eq!(parse("off"), Ok(AgentCommand::Off));
-        assert_eq!(parse("codex"), Ok(AgentCommand::Use("codex".into())));
-        assert_eq!(
-            parse("login"),
-            Ok(AgentCommand::Login {
-                agent: None,
-                method: None
-            })
-        );
-        assert_eq!(
-            parse("login gemini"),
-            Ok(AgentCommand::Login {
-                agent: Some("gemini".into()),
-                method: None
-            })
-        );
-        assert_eq!(
-            parse("login chatgpt"),
-            Ok(AgentCommand::Login {
-                agent: None,
-                method: Some("chatgpt".into())
-            })
-        );
-        assert_eq!(
-            parse("login codex chatgpt"),
-            Ok(AgentCommand::Login {
-                agent: Some("codex".into()),
-                method: Some("chatgpt".into())
-            })
-        );
-        assert!(parse("a b c d").is_err());
+        assert_eq!(parse_agent(""), Ok(AgentCommand::List));
+        assert_eq!(parse_agent("off"), Ok(AgentCommand::Off));
+        assert_eq!(parse_agent("codex"), Ok(AgentCommand::Use("codex".into())));
+        assert!(parse_agent("login codex").unwrap_err().contains("/login"));
+        assert!(parse_agent("a b").is_err());
     }
 }

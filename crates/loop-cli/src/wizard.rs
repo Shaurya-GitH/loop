@@ -33,7 +33,7 @@ pub trait WizardView {
     /// Placeholder while the input line is empty.
     fn placeholder(&self) -> &'static str;
     /// Picker rows `(label, description)` and the highlighted row, on choice steps.
-    fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
         None
     }
     /// Whether the input line is hidden (secrets).

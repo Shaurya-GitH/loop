@@ -48,7 +48,7 @@ impl SetupPrompt {
     }
 
     /// Picker rows and the highlighted row, on choice steps.
-    pub fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    pub fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
         self.view().options()
     }
 
@@ -110,8 +110,8 @@ mod tests {
 
     #[test]
     fn provider_prompt_delegates_to_login_wizard() {
-        let prompt = SetupPrompt::Provider(ProviderSetup::start(None).unwrap());
-        assert_eq!(prompt.title(), "Connect a model provider");
+        let prompt = SetupPrompt::Provider(ProviderSetup::start(None, Vec::new()).unwrap());
+        assert_eq!(prompt.title(), "Connect a model provider or agent");
         assert!(prompt.options().is_some());
         assert!(prompt.esc_quits(true));
         assert!(!prompt.esc_quits(false));
@@ -119,7 +119,7 @@ mod tests {
         assert!(prompt.status_hint(false).starts_with("login · ↑↓ choose"));
         assert!(prompt.status_hint(true).ends_with("esc quit"));
 
-        let key = SetupPrompt::Provider(ProviderSetup::start(Some("openai")).unwrap());
+        let key = SetupPrompt::Provider(ProviderSetup::start(Some("openai"), Vec::new()).unwrap());
         assert!(key.masked());
         assert_eq!(key.env_hint(), None);
         assert!(key.status_hint(false).contains("enter save"));

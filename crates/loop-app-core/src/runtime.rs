@@ -851,7 +851,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let agents = Arc::new(crate::agents::AgentManager::new(
         crate::agents::agent_entries(&settings.agents),
         opts.cwd.clone(),
-        crate::agents::index_path(&agent_dir),
+        &agent_dir,
     ));
 
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);

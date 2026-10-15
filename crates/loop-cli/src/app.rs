@@ -42,7 +42,7 @@ use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
 };
-use crate::provider_setup::ProviderSetup;
+use crate::provider_setup::{LoginChoice, ProviderSetup};
 use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
@@ -73,8 +73,13 @@ enum UiEvent {
         id: String,
         result: Result<(Arc<dyn AgentBackend>, loop_protocol::SessionRef), String>,
     },
-    /// A message from background agent work (sign-in, method lists).
+    /// A message from background agent work (sign-in).
     AgentNote(Result<String, String>),
+    /// An agent's sign-in methods, for the `/login` method step.
+    AgentMethods {
+        agent: crate::provider_setup::AgentRow,
+        result: Result<Vec<crate::provider_setup::MethodRow>, String>,
+    },
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
     /// `/sandbox` enable/disable finished.
@@ -418,8 +423,21 @@ async fn run_loop(
             Vec::new()
         }
     };
+    // An agent that needs a sign-in opens /login instead of failing.
+    let mut sign_in_first: Option<String> = None;
     if let Some(pending) = runtime.pending_agent.take() {
-        chat.push(sys(start_agent(runtime, pending, &tx)));
+        let id = match &pending {
+            PendingAgent::New(id) => id.clone(),
+            PendingAgent::Resume(record) => record.agent.clone(),
+        };
+        if runtime.agents.is_signed_in(&id) {
+            chat.push(sys(start_agent(runtime, pending, &tx)));
+        } else {
+            chat.push(sys(format!(
+                "sign in to {id} first, then /agent {id} · login is open below"
+            )));
+            sign_in_first = Some(id);
+        }
     }
     let mut flushed = 0usize;
     // Visual lines of `chat[flushed..]` already pushed into native scrollback.
@@ -456,7 +474,13 @@ async fn run_loop(
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
     let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup {
-        ProviderSetup::start(None).ok().map(SetupPrompt::Provider)
+        ProviderSetup::start(None, login_agents(runtime))
+            .ok()
+            .map(SetupPrompt::Provider)
+    } else if let Some(id) = &sign_in_first {
+        ProviderSetup::start(Some(id), login_agents(runtime))
+            .ok()
+            .map(SetupPrompt::Provider)
     } else {
         None
     };
@@ -808,6 +832,7 @@ async fn run_loop(
                 &mut rx,
                 &mut review_rx,
                 &mut active_approval,
+                &mut pending_setup,
                 &mut chat,
                 &mut status,
                 &mut turn_step,
@@ -966,6 +991,7 @@ async fn run_loop(
             &mut rx,
             &mut review_rx,
             &mut active_approval,
+            &mut pending_setup,
             &mut chat,
             &mut status,
             &mut turn_step,
@@ -1141,6 +1167,10 @@ fn print_welcome(
         &runtime.theme,
         version,
         runtime.selected_model.as_ref(),
+        runtime
+            .active_agent
+            .as_deref()
+            .or(runtime.starting_agent.as_deref()),
         runtime.model_note.as_deref(),
         &endpoint,
         &runtime.session_id,
@@ -1307,6 +1337,7 @@ async fn drain_ui_events(
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<PendingInteraction>,
     active_approval: &mut Option<ActiveApproval>,
+    pending_setup: &mut Option<SetupPrompt>,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
@@ -1354,26 +1385,52 @@ async fn drain_ui_events(
                     refresh_token_bar,
                 );
             }
-            UiEvent::AgentReady { id, result } => match result {
-                Ok((backend, session)) => {
-                    let resumed = runtime.session_id == session.native_id;
-                    runtime.adopt_agent(&id, backend, session);
-                    *status = format!("ready · agent {id}");
-                    if !resumed {
-                        push_before_queued(
+            UiEvent::AgentReady { id, result } => {
+                runtime.starting_agent = None;
+                match result {
+                    Ok((backend, session)) => {
+                        let resumed = runtime.session_id == session.native_id;
+                        runtime.adopt_agent(&id, backend, session);
+                        *status = format!("ready · agent {id}");
+                        if !resumed {
+                            push_before_queued(
                             chat,
                             sys(format!("{id} is ready · new session · /agent off returns to Loop's own agent")),
                         );
+                        }
+                    }
+                    Err(err) => {
+                        // A failed resume pointed the transcript at the agent's
+                        // session; return to Loop's own.
+                        if runtime.is_native() {
+                            runtime.use_native().await;
+                        }
+                        push_before_queued(chat, error_item(format!("{id}: {err}")));
+                        *status = "agent failed to start".into();
                     }
                 }
+            }
+            UiEvent::AgentMethods { agent, result } => match result {
+                Ok(methods) if methods.is_empty() => {
+                    let _ = runtime.agents.mark_signed_in(&agent.id);
+                    push_before_queued(
+                        chat,
+                        sys(format!(
+                            "{} needs no sign-in · /agent {} to use it",
+                            agent.name, agent.id
+                        )),
+                    );
+                    *status = "ready".into();
+                }
+                Ok(methods) => {
+                    *pending_setup = Some(SetupPrompt::Provider(ProviderSetup::agent_methods(
+                        agent, methods,
+                    )));
+                    *status = "login · choose how to sign in".into();
+                }
                 Err(err) => {
-                    // A failed resume pointed the transcript at the agent's
-                    // session; return to Loop's own.
-                    if runtime.is_native() {
-                        runtime.use_native().await;
-                    }
-                    push_before_queued(chat, error_item(format!("{id}: {err}")));
-                    *status = "agent failed to start".into();
+                    push_before_queued(chat, error_item(format!("{}: {err}", agent.name)));
+                    *status = "ready".into();
                 }
             },
             UiEvent::AgentNote(note) => {
@@ -1601,6 +1658,7 @@ fn start_agent(
             record.agent.clone()
         }
     };
+    runtime.starting_agent = Some(id.clone());
     let agents = Arc::clone(&runtime.agents);
     let forwarded = Arc::clone(&runtime.forwarded);
     let debug_log = runtime.debug_log_path.clone();
@@ -1633,6 +1691,19 @@ fn start_agent(
     format!("starting {id}… (the first start can take a while)")
 }
 
+/// Agents offered in the `/login` wizard.
+fn login_agents(runtime: &CliRuntime) -> Vec<crate::provider_setup::AgentRow> {
+    runtime
+        .agents
+        .sign_in_agents()
+        .into_iter()
+        .map(|entry| crate::provider_setup::AgentRow {
+            id: entry.id.clone(),
+            name: entry.display_name().to_owned(),
+        })
+        .collect()
+}
+
 /// `/agent …`
 async fn handle_agent_command(
     runtime: &mut CliRuntime,
@@ -1641,7 +1712,7 @@ async fn handle_agent_command(
     status: &mut String,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
-    let command = match parse_agent(args, |id| runtime.agents.entry(id).is_some()) {
+    let command = match parse_agent(args) {
         Ok(command) => command,
         Err(usage) => {
             chat.push(sys(usage));
@@ -1669,7 +1740,7 @@ async fn handle_agent_command(
                     entry.args.join(" ")
                 ));
             }
-            lines.push("Switch: /agent <id> · sign in: /agent login · back: /agent off".into());
+            lines.push("Switch: /agent <id> · sign in: /login · back: /agent off".into());
             chat.push(sys(lines.join(
                 "
 ",
@@ -1695,51 +1766,6 @@ async fn handle_agent_command(
                 *status = format!("starting {id}…");
                 chat.push(sys(start_agent(runtime, PendingAgent::New(id), tx)));
             }
-        }
-        AgentCommand::Login { agent, method } => {
-            let Some(id) = agent.or_else(|| runtime.active_agent.clone()) else {
-                chat.push(sys("Which agent? /agent login <id>   (see /agent)"));
-                return;
-            };
-            let agents = Arc::clone(&runtime.agents);
-            let tx = tx.clone();
-            chat.push(sys(format!("asking {id}…")));
-            tokio::spawn(async move {
-                let note = match method {
-                    None => agents.auth_methods(&id).await.map(|methods| {
-                        if methods.is_empty() {
-                            return format!("{id} needs no sign-in, or manages it itself");
-                        }
-                        let mut lines = vec![format!("{id} sign-in methods:")];
-                        for m in methods {
-                            let how = if m.in_terminal {
-                                " (runs in a terminal)"
-                            } else {
-                                ""
-                            };
-                            lines.push(format!("  {} — {}{how}", m.id, m.name));
-                        }
-                        lines.push(format!("Sign in: /agent login {id} <method>"));
-                        lines.join(
-                            "
-",
-                        )
-                    }),
-                    Some(method) => {
-                        agents
-                            .authenticate(&id, &method)
-                            .await
-                            .map(|terminal| match terminal {
-                                None => format!("signed in to {id}"),
-                                Some(command) => format!(
-                                    "run this in a terminal, then /agent {id} again:
-  {command}"
-                                ),
-                            })
-                    }
-                };
-                let _ = tx.send(UiEvent::AgentNote(note.map_err(|e| format!("{id}: {e:#}"))));
-            });
         }
     }
 }
@@ -2575,6 +2601,7 @@ async fn handle_key(
                         input,
                         chat,
                         status,
+                        tx,
                     )
                     .await;
                 }
@@ -3963,7 +3990,12 @@ fn advance_tracing_setup(
     *status = "ready".into();
 }
 
-/// Feed one answer to the `/login` wizard; on the last step, connect the provider.
+/// Feed one answer to the `/login` wizard; on the last step, connect the
+/// provider or start the agent sign-in.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 async fn advance_provider_setup(
     step: ProviderSetup,
     value: &str,
@@ -3972,8 +4004,9 @@ async fn advance_provider_setup(
     input: &mut InputBuffer,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Some(request) = step_wizard(
+    let Some(choice) = step_wizard(
         step.submit(value),
         SetupPrompt::Provider,
         value,
@@ -3982,6 +4015,60 @@ async fn advance_provider_setup(
         chat,
     ) else {
         return;
+    };
+    let request = match choice {
+        LoginChoice::Provider(request) => request,
+        LoginChoice::AgentMethods(agent) => {
+            *status = format!("login · asking {} how to sign in…", agent.name);
+            chat.push(sys(format!(
+                "starting {} to ask how it signs in (the first start can take a while)",
+                agent.name
+            )));
+            let agents = Arc::clone(&runtime.agents);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = agents
+                    .auth_methods(&agent.id)
+                    .await
+                    .map(|methods| {
+                        methods
+                            .into_iter()
+                            .map(|m| crate::provider_setup::MethodRow {
+                                id: m.id,
+                                name: m.name,
+                                in_terminal: m.in_terminal,
+                            })
+                            .collect()
+                    })
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiEvent::AgentMethods { agent, result });
+            });
+            return;
+        }
+        LoginChoice::AgentSignIn { agent, method } => {
+            *status = format!("login · signing in to {}…", agent.name);
+            chat.push(sys(format!(
+                "signing in to {} · finish in the browser if one opens",
+                agent.name
+            )));
+            let agents = Arc::clone(&runtime.agents);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let note = match agents.authenticate(&agent.id, &method).await {
+                    Ok(None) => Ok(format!(
+                        "✓ Signed in to {} · /agent {} to use it",
+                        agent.name, agent.id
+                    )),
+                    Ok(Some(command)) => Ok(format!(
+                        "run this in a terminal, then /login {} again:\n  {command}",
+                        agent.id
+                    )),
+                    Err(e) => Err(format!("{}: sign-in failed: {e:#}", agent.name)),
+                };
+                let _ = tx.send(UiEvent::AgentNote(note));
+            });
+            return;
+        }
     };
     *status = format!("login · connecting {}…", request.display_name());
     match runtime.connect_provider(&request).await {
@@ -4228,14 +4315,16 @@ async fn apply_effect(
                 input,
             )));
         }
-        CommandEffect::Login(provider) => match ProviderSetup::start(provider.as_deref()) {
-            Ok(step) => {
-                *pending_setup = Some(SetupPrompt::Provider(step));
-                input.clear();
-                chat.push(sys("login — follow the prompts below · esc cancels"));
+        CommandEffect::Login(provider) => {
+            match ProviderSetup::start(provider.as_deref(), login_agents(runtime)) {
+                Ok(step) => {
+                    *pending_setup = Some(SetupPrompt::Provider(step));
+                    input.clear();
+                    chat.push(sys("login — follow the prompts below · esc cancels"));
+                }
+                Err(usage) => chat.push(sys(usage)),
             }
-            Err(usage) => chat.push(sys(usage)),
-        },
+        }
         CommandEffect::Logout(provider) => {
             chat.push(sys(apply_logout(provider, runtime).await));
         }

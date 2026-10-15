@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use loop_acp::{AgentConfig, AgentLink, Connector};
-use loop_app_core::agents::{find_recorded_session, index_path, AgentEntry, AgentManager};
+use loop_app_core::agents::{find_recorded_session, AgentEntry, AgentManager};
 use loop_protocol::{
     AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest, Origin, Role,
     SessionUpdate, StopReason, TurnOutcome,
@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// A fake agent: answers the ACP calls Loop makes and records what it saw.
 struct FakeAgent {
     seen: Arc<Mutex<Vec<Value>>>,
+    env: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[async_trait]
@@ -28,6 +29,7 @@ impl Connector for FakeAgent {
             ["acp"],
             "the registry entry's args reach the connector"
         );
+        *self.env.lock().unwrap() = config.env.clone();
         let (loop_end, agent_end) = tokio::io::duplex(1 << 16);
         let (read, mut write) = tokio::io::split(agent_end);
         let seen = Arc::clone(&self.seen);
@@ -115,9 +117,10 @@ fn manager(dir: &Path, seen: &Arc<Mutex<Vec<Value>>>) -> AgentManager {
     AgentManager::with_connector(
         vec![entry()],
         dir.to_path_buf(),
-        index_path(dir),
+        dir,
         Arc::new(FakeAgent {
             seen: Arc::clone(seen),
+            env: Arc::default(),
         }),
     )
 }
@@ -228,4 +231,38 @@ async fn unknown_agent_is_an_error() {
     let agents = manager(dir.path(), &Arc::default());
     let err = agents.backend("nope").await.unwrap_err();
     assert!(err.to_string().contains("no agent named `nope`"));
+}
+
+#[tokio::test]
+async fn sign_in_agents_need_login_and_get_a_private_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gated = entry();
+    gated.sign_in = true;
+    gated.home_env = Some("FAKE_HOME".into());
+    let env: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let agents = AgentManager::with_connector(
+        vec![gated],
+        dir.path().to_path_buf(),
+        dir.path(),
+        Arc::new(FakeAgent {
+            seen: Arc::default(),
+            env: Arc::clone(&env),
+        }),
+    );
+    assert!(!agents.is_signed_in("fake"));
+    assert_eq!(agents.sign_in_agents().len(), 1);
+    let err = agents.new_session("fake").await.unwrap_err();
+    assert!(err.to_string().contains("/login"), "{err}");
+
+    agents.authenticate("fake", "chatgpt").await.unwrap();
+    assert!(agents.is_signed_in("fake"));
+    agents.new_session("fake").await.unwrap();
+
+    let home = dir.path().join("agents").join("fake").join("home");
+    assert!(home.is_dir());
+    assert!(env
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(k, v)| k == "FAKE_HOME" && Path::new(v) == home));
 }

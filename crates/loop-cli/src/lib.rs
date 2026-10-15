@@ -34,6 +34,8 @@ pub struct CliRuntime {
     pub debug_log_path: Option<std::path::PathBuf>,
     /// External agent to start once the surface is ready.
     pub pending_agent: Option<PendingAgent>,
+    /// External agent being started, until it is ready or fails.
+    pub starting_agent: Option<String>,
     /// Backend instances whose updates are already forwarded to the surface.
     pub forwarded: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
@@ -72,6 +74,7 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         debug: false,
         debug_log_path: None,
         pending_agent: None,
+        starting_agent: None,
         forwarded: Default::default(),
     })
 }
