@@ -147,6 +147,8 @@ struct ActiveApproval {
     reason: String,
     reason_focused: bool,
     reply: ApprovalReply,
+    /// The interaction this picker answers, to close it if withdrawn.
+    interaction: loop_protocol::InteractionId,
 }
 
 impl ActiveApproval {
@@ -155,7 +157,9 @@ impl ActiveApproval {
     fn from_interaction(pending: PendingInteraction) -> Option<Self> {
         let PendingInteraction { request, respond } = pending;
         let InteractionRequest::Permission {
-            tool_call, options, ..
+            id,
+            tool_call,
+            options,
         } = request
         else {
             let _ = respond.send(InteractionOutcome::Rejected {
@@ -180,6 +184,7 @@ impl ActiveApproval {
             reason: String::new(),
             reason_focused: false,
             reply: ApprovalReply::new(&options, respond),
+            interaction: id,
         })
     }
 
@@ -187,11 +192,8 @@ impl ActiveApproval {
         PickerView::FileReview {
             path: format!("{} · {}", self.tool_name, self.summary),
             selected: self.selected,
-            accept_all_label: if self.reply.offers_accept_session() {
-                self.kind.accept_all_label().into()
-            } else {
-                "Accept (this agent offers no session-wide choice)".into()
-            },
+            accept_label: self.reply.accept_label(),
+            accept_all_label: self.reply.accept_session_label(),
             reason: self.reason.clone(),
             reason_focused: self.reason_focused,
         }
@@ -1326,6 +1328,17 @@ async fn drain_ui_events(
                 // /new or a fork) must not leak into this transcript.
                 if envelope.session.as_str() != runtime.session_id {
                     continue;
+                }
+                // An approval the backend withdrew (for example on cancel)
+                // must not keep capturing keys.
+                if let SessionUpdate::InteractionResolved { id, .. } = &envelope.update {
+                    if active_approval
+                        .as_ref()
+                        .is_some_and(|a| &a.interaction == id)
+                    {
+                        active_approval.take();
+                        push_before_queued(chat, sys("approval withdrawn"));
+                    }
                 }
                 let UpdateEnvelope { update, origin, .. } = *envelope;
                 handle_update(
@@ -3662,6 +3675,10 @@ fn handle_update(
         SessionUpdate::TurnEnded { stop, error, .. } => {
             if let Some(error) = error {
                 push_before_queued(chat, error_item(format!("error: {}", error.message)));
+            } else if live && stop == StopReason::Cancelled {
+                push_before_queued(chat, sys("interrupted"));
+            } else if live && !answered_since_last_prompt(chat) {
+                push_before_queued(chat, sys("(no reply)"));
             }
             *streaming_assistant = None;
             finish_thinking(chat, streaming_thinking);
@@ -3685,6 +3702,22 @@ fn handle_update(
         | SessionUpdate::Plan { .. }
         | SessionUpdate::Unknown(_) => {}
     }
+}
+
+/// Whether anything from the agent follows the latest user message.
+fn answered_since_last_prompt(chat: &[ChatItem]) -> bool {
+    chat.iter()
+        .rev()
+        .take_while(|item| !matches!(item, ChatItem::User { .. }))
+        .any(|item| {
+            matches!(
+                item,
+                ChatItem::Assistant { .. }
+                    | ChatItem::Thinking { .. }
+                    | ChatItem::Tool { .. }
+                    | ChatItem::Error { .. }
+            )
+        })
 }
 
 fn apply_tool_update(
@@ -5011,6 +5044,71 @@ mod tests {
         let (chat, status) = run_turn(FauxResponse::Error("HTTP 502 Bad Gateway".into())).await;
         assert_eq!(errors(&chat), ["error: HTTP 502 Bad Gateway"]);
         assert_eq!(status, "error · see above");
+    }
+
+    fn live(updates: Vec<SessionUpdate>) -> Vec<ChatItem> {
+        let mut chat = vec![ChatItem::User { text: "hi".into() }];
+        let (mut status, mut step) = (String::new(), String::new());
+        let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, false, false);
+        let mut token_bar = TokenBarState {
+            total_tokens: 0,
+            context_tokens: None,
+            context_window: 0,
+        };
+        for update in updates {
+            handle_update(
+                update,
+                Origin::Live,
+                &mut chat,
+                &mut status,
+                &mut step,
+                &mut assistant,
+                &mut thinking,
+                &mut working,
+                &mut token_bar,
+                &mut refresh,
+            );
+        }
+        chat
+    }
+
+    fn system_lines(chat: &[ChatItem]) -> Vec<String> {
+        chat.iter()
+            .filter_map(|item| match item {
+                ChatItem::System { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancelled_and_silent_turns_are_marked() {
+        let end = |stop| SessionUpdate::TurnEnded {
+            turn_id: "t".into(),
+            stop,
+            error: None,
+        };
+        let started = || SessionUpdate::TurnStarted {
+            turn_id: "t".into(),
+        };
+        assert_eq!(
+            system_lines(&live(vec![started(), end(StopReason::Cancelled)])),
+            ["interrupted"]
+        );
+        assert_eq!(
+            system_lines(&live(vec![started(), end(StopReason::EndTurn)])),
+            ["(no reply)"]
+        );
+        let answered = live(vec![
+            started(),
+            SessionUpdate::MessageChunk {
+                message_id: "m".into(),
+                role: Role::Agent,
+                content: ContentBlock::text("ok"),
+            },
+            end(StopReason::EndTurn),
+        ]);
+        assert!(system_lines(&answered).is_empty());
     }
 
     #[tokio::test]

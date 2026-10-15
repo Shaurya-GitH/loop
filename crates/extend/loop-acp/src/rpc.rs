@@ -1,8 +1,11 @@
 //! Line-delimited JSON-RPC 2.0 over any byte stream.
 //!
-//! One [`Connection`] owns a reader task and a writer task. Responses are
-//! matched to requests by id; requests and notifications from the peer are
-//! delivered on the [`Incoming`] channel. When the stream ends, every pending
+//! One [`Connection`] owns a reader task and a writer task. Everything the
+//! peer sends arrives on one ordered [`Incoming`] channel, responses
+//! included: the consumer hands each [`Incoming::Response`] to
+//! [`Connection::resolve`]. Keeping responses in that order means a request's
+//! result is seen only after every notification the peer sent before it (an
+//! ACP turn's output before its end). When the stream ends, every pending
 //! request fails with [`RpcError::Closed`] and the incoming channel closes.
 
 use std::collections::HashMap;
@@ -62,9 +65,17 @@ impl std::error::Error for RpcError {}
 /// A request id as the peer sent it, echoed back unchanged.
 pub type PeerRequestId = Value;
 
-/// A message from the peer that is not a response.
+/// A message from the peer.
 #[derive(Debug)]
 pub enum Incoming {
+    /// The result of one of Loop's requests. Pass it to
+    /// [`Connection::resolve`] once everything before it is handled.
+    Response {
+        /// Loop's request id.
+        id: i64,
+        /// The result.
+        result: Result<Value, RpcError>,
+    },
     /// The peer asks for something and waits for [`Connection::respond`].
     Request {
         /// Id to answer with.
@@ -128,14 +139,10 @@ impl Connection {
             let _ = writer.shutdown().await;
         });
 
-        let reader_pending = Arc::clone(&pending);
         tokio::spawn(async move {
-            read_loop(reader, &reader_pending, &incoming_tx).await;
-            // Fail every request still waiting; the incoming channel closes
-            // when `incoming_tx` drops here.
-            for (_, waiter) in reader_pending.lock().await.drain() {
-                let _ = waiter.send(Err(RpcError::Closed));
-            }
+            // The incoming channel closes when `incoming_tx` drops here; the
+            // consumer then calls `fail_pending`.
+            read_loop(reader, &incoming_tx).await;
         });
 
         (
@@ -160,6 +167,25 @@ impl Connection {
             return Err(RpcError::Closed);
         }
         rx.await.unwrap_or(Err(RpcError::Closed))
+    }
+
+    /// Deliver a response from the incoming channel to its waiting request.
+    pub async fn resolve(&self, id: i64, result: Result<Value, RpcError>) {
+        match self.pending.lock().await.remove(&id) {
+            Some(waiter) => {
+                let _ = waiter.send(result);
+            }
+            None => tracing::debug!(id, "response to an unknown or finished request"),
+        }
+    }
+
+    /// Fail every request still waiting with [`RpcError::Closed`]. Call once
+    /// the incoming channel has closed and everything in it was handled, so
+    /// no queued response is lost.
+    pub async fn fail_pending(&self) {
+        for (_, waiter) in self.pending.lock().await.drain() {
+            let _ = waiter.send(Err(RpcError::Closed));
+        }
     }
 
     /// Stop writing and close the agent's input. Reading continues until the
@@ -187,7 +213,7 @@ impl Connection {
     }
 }
 
-async fn read_loop<R>(reader: R, pending: &Pending, incoming: &mpsc::UnboundedSender<Incoming>)
+async fn read_loop<R>(reader: R, incoming: &mpsc::UnboundedSender<Incoming>)
 where
     R: AsyncRead + Unpin,
 {
@@ -217,7 +243,7 @@ where
                 continue;
             }
         };
-        dispatch(message, pending, incoming).await;
+        dispatch(message, incoming);
     }
 }
 
@@ -257,28 +283,26 @@ where
     }
 }
 
-async fn dispatch(message: Value, pending: &Pending, incoming: &mpsc::UnboundedSender<Incoming>) {
+fn dispatch(message: Value, incoming: &mpsc::UnboundedSender<Incoming>) {
     let method = message
         .get("method")
         .and_then(Value::as_str)
         .map(str::to_owned);
     let id = message.get("id").cloned().filter(|id| !id.is_null());
-    match (method, id) {
-        (Some(method), Some(id)) => {
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let _ = incoming.send(Incoming::Request { id, method, params });
-        }
-        (Some(method), None) => {
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let _ = incoming.send(Incoming::Notification { method, params });
-        }
+    let params = || message.get("params").cloned().unwrap_or(Value::Null);
+    let incoming_message = match (method, id) {
+        (Some(method), Some(id)) => Incoming::Request {
+            id,
+            method,
+            params: params(),
+        },
+        (Some(method), None) => Incoming::Notification {
+            method,
+            params: params(),
+        },
         (None, Some(id)) => {
             let Some(id) = id.as_i64() else {
                 tracing::debug!(%id, "response with an id Loop never sent");
-                return;
-            };
-            let Some(waiter) = pending.lock().await.remove(&id) else {
-                tracing::debug!(id, "response to an unknown or finished request");
                 return;
             };
             let result = if let Some(error) = message.get("error") {
@@ -294,10 +318,14 @@ async fn dispatch(message: Value, pending: &Pending, incoming: &mpsc::UnboundedS
             } else {
                 Ok(message.get("result").cloned().unwrap_or(Value::Null))
             };
-            let _ = waiter.send(result);
+            Incoming::Response { id, result }
         }
-        (None, None) => tracing::debug!("skipping a message with neither method nor id"),
-    }
+        (None, None) => {
+            tracing::debug!("skipping a message with neither method nor id");
+            return;
+        }
+    };
+    let _ = incoming.send(incoming_message);
 }
 
 fn truncate(text: &str, max: usize) -> &str {
@@ -317,7 +345,8 @@ mod tests {
     async fn requests_and_responses_match_by_id_across_split_frames() {
         let (client_end, agent_end) = duplex(64);
         let (read, write) = tokio::io::split(client_end);
-        let (conn, _incoming) = Connection::new(read, write);
+        let (conn, incoming) = Connection::new(read, write);
+        resolve_responses(&conn, incoming);
         let (agent_read, mut agent_write) = tokio::io::split(agent_end);
 
         let call = tokio::spawn({
@@ -359,6 +388,7 @@ mod tests {
             Incoming::Notification { method, .. } if method == "session/update"
         ));
 
+        resolve_responses(&conn, incoming);
         let waiting = tokio::spawn({
             let conn = Arc::clone(&conn);
             async move { conn.request("slow", Value::Null).await }
@@ -367,6 +397,58 @@ mod tests {
         drop(agent_write);
         drop(_agent_read);
         assert_eq!(waiting.await.unwrap(), Err(RpcError::Closed));
-        assert!(incoming.recv().await.is_none());
+    }
+
+    /// Resolve responses the way a consumer does: in channel order.
+    fn resolve_responses(conn: &Arc<Connection>, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
+        let conn = Arc::clone(conn);
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if let Incoming::Response { id, result } = message {
+                    conn.resolve(id, result).await;
+                }
+            }
+            conn.fail_pending().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_response_comes_after_the_notifications_sent_before_it() {
+        let (client_end, agent_end) = duplex(1 << 16);
+        let (read, write) = tokio::io::split(client_end);
+        let (conn, mut incoming) = Connection::new(read, write);
+        let (agent_read, mut agent_write) = tokio::io::split(agent_end);
+        let call = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move { conn.request("go", Value::Null).await }
+        });
+        let mut lines = BufReader::new(agent_read).lines();
+        let request: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let mut burst = String::new();
+        for n in 0..50 {
+            burst.push_str(&format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "method": "note", "params": {"n": n}})
+            ));
+        }
+        burst.push_str(&format!(
+            "{}\n",
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": "done"})
+        ));
+        agent_write.write_all(burst.as_bytes()).await.unwrap();
+        let mut seen = 0;
+        loop {
+            match incoming.recv().await.unwrap() {
+                Incoming::Notification { .. } => seen += 1,
+                Incoming::Response { id, result } => {
+                    assert_eq!(seen, 50, "every earlier notification arrives first");
+                    conn.resolve(id, result).await;
+                    break;
+                }
+                Incoming::Request { .. } => unreachable!(),
+            }
+        }
+        assert_eq!(call.await.unwrap().unwrap(), json!("done"));
     }
 }

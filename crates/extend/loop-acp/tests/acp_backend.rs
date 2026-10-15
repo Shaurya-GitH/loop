@@ -260,6 +260,12 @@ async fn prompt(agent: &Agent, world: &World, session: &str, text: &str) -> Resu
             world.cancel.notified().await;
             Ok(json!({"stopReason": "cancelled"}))
         }
+        "burst" => {
+            for n in 0..40 {
+                agent.text(session, &format!("{n},"));
+            }
+            end_turn
+        }
         "hang" => std::future::pending().await,
         "crash" => {
             agent.text(session, "about to crash");
@@ -756,4 +762,60 @@ async fn second_prompt_while_busy_is_rejected() {
         fx.backend.prompt(&session, say("hello")).await.unwrap_err(),
         loop_protocol::BackendError::Busy
     );
+}
+
+#[tokio::test]
+async fn output_always_arrives_before_the_turn_ends() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        let mut rx = fx.backend.subscribe();
+        let handle = fx.backend.prompt(&session, say("burst")).await.unwrap();
+        let envelopes = until_turn_end(&mut rx, &session).await;
+        outcome(handle).await;
+        let expected: String = (0..40).map(|n| format!("{n},")).collect();
+        assert_eq!(agent_text(&envelopes), expected);
+    }
+}
+
+#[tokio::test]
+async fn the_prompt_after_a_cancelled_turn_works() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    let mut rx = fx.backend.subscribe();
+    let handle = fx.backend.prompt(&session, say("wait")).await.unwrap();
+    loop {
+        let envelope = rx.recv().await.unwrap();
+        if matches!(envelope.update, SessionUpdate::InteractionRequested { .. }) {
+            break;
+        }
+    }
+    fx.backend.cancel(&session);
+    assert_eq!(outcome(handle).await, TurnOutcome::Cancelled);
+    until_turn_end(&mut rx, &session).await;
+
+    let handle = fx.backend.prompt(&session, say("hello")).await.unwrap();
+    let envelopes = until_turn_end(&mut rx, &session).await;
+    assert_eq!(
+        outcome(handle).await,
+        TurnOutcome::Completed(StopReason::EndTurn)
+    );
+    assert_eq!(agent_text(&envelopes), "Hi there");
+    let cancels = fx
+        .world
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m["method"] == "session/cancel")
+        .count();
+    assert_eq!(cancels, 1, "the cancel reached only the cancelled turn");
 }

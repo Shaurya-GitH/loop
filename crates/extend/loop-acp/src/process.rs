@@ -59,6 +59,9 @@ pub struct AgentConfig {
     /// How long a cancelled turn may take to end before the agent process is
     /// killed.
     pub cancel_timeout: Duration,
+    /// How long starting the agent and the ACP handshake may take. The first
+    /// start of an `npx` agent includes downloading it.
+    pub start_timeout: Duration,
 }
 
 impl AgentConfig {
@@ -72,6 +75,7 @@ impl AgentConfig {
             args: Vec::new(),
             env: Vec::new(),
             cancel_timeout: Duration::from_secs(10),
+            start_timeout: Duration::from_secs(180),
         }
     }
 }
