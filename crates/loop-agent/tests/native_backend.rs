@@ -230,3 +230,23 @@ async fn services_are_available() {
         "{refused}"
     );
 }
+
+#[tokio::test]
+async fn back_to_back_prompts_cannot_both_start() {
+    let backend = backend(vec![FauxResponse::Text("one".into())], Vec::new()).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    // Before the first prompt's task has run, the harness still looks idle.
+    let first = backend.prompt(&session, text("one")).await.unwrap();
+    assert!(backend.is_busy(&session));
+    assert!(matches!(
+        backend.prompt(&session, text("two")).await,
+        Err(BackendError::Busy)
+    ));
+    assert_eq!(
+        first.outcome().await,
+        TurnOutcome::Completed(StopReason::EndTurn)
+    );
+    collect_turn(&mut rx).await;
+    assert!(!backend.is_busy(&session));
+}
