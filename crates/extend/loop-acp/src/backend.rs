@@ -59,6 +59,8 @@ struct Live {
 
 #[derive(Default)]
 struct State {
+    /// The live connection and its generation, for synchronous use.
+    conn: Option<(u64, Arc<Connection>)>,
     generation: u64,
     next_turn: u64,
     capabilities: Capabilities,
@@ -69,6 +71,8 @@ struct State {
 
 struct SessionState {
     key: SessionKey,
+    /// Working directory the session was opened with, reused on reopen.
+    cwd: PathBuf,
     /// Generation of the process that holds this session, or `None` after
     /// that process was lost.
     attached: Option<u64>,
@@ -197,7 +201,19 @@ impl AcpBackend {
                     .terminal(self.host.terminals().is_some()),
             )
             .client_info(acp::Implementation::new("loop", env!("CARGO_PKG_VERSION")));
-        let response = match conn.request("initialize", to_value(&request)?).await {
+        let handshake = tokio::time::timeout(
+            self.config.start_timeout,
+            conn.request("initialize", to_value(&request)?),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(RpcError::Invalid(format!(
+                "{} did not answer within {}s",
+                self.config.name,
+                self.config.start_timeout.as_secs()
+            )))
+        });
+        let response = match handshake {
             Ok(response) => response,
             Err(error) => {
                 if let Some(process) = live.process.as_mut() {
@@ -232,6 +248,7 @@ impl AcpBackend {
                 ..Capabilities::default()
             };
             state.auth_methods = response.auth_methods;
+            state.conn = Some((generation, Arc::clone(&conn)));
         }
         *link = Some(live);
         Ok(conn)
@@ -240,6 +257,7 @@ impl AcpBackend {
     /// Kill the agent process and close its connection. The dispatcher then
     /// sees the connection end and settles live turns as uncertain.
     async fn kill(&self) {
+        self.lock_state().conn = None;
         let live = self.link.lock().await.take();
         if let Some(mut live) = live {
             if let Some(process) = live.process.as_mut() {
@@ -262,6 +280,9 @@ impl AcpBackend {
             }
         }
         let mut state = self.lock_state();
+        if state.conn.as_ref().is_some_and(|(g, _)| *g == generation) {
+            state.conn = None;
+        }
         let instance = self.config.id.clone();
         let mut envelopes = Vec::new();
         for session in state.sessions.values_mut() {
@@ -345,7 +366,7 @@ impl AcpBackend {
     /// a restart when the agent supports that.
     async fn attach(&self, session: &SessionRef) -> BackendResult<Arc<Connection>> {
         let conn = self.connection().await?;
-        let (generation, attached, can_load) = {
+        let (generation, attached, can_load, cwd) = {
             let state = self.lock_state();
             let Some(known) = state.sessions.get(&session.native_id) else {
                 return Err(BackendError::SessionNotFound(session.key.clone()));
@@ -354,6 +375,7 @@ impl AcpBackend {
                 state.generation,
                 known.attached,
                 state.capabilities.load_session,
+                known.cwd.clone(),
             )
         };
         if attached == Some(generation) {
@@ -365,9 +387,13 @@ impl AcpBackend {
                 "the agent restarted and cannot reopen this session; start a new one",
             ));
         }
-        // Reattach quietly: the surface already shows this history.
-        self.load(&conn, session, &SessionSpec::default(), false)
-            .await?;
+        // Reattach quietly, in the session's own directory: the surface
+        // already shows this history.
+        let spec = SessionSpec {
+            cwd: Some(cwd),
+            name: None,
+        };
+        self.load(&conn, session, &spec, false).await?;
         Ok(conn)
     }
 
@@ -381,10 +407,12 @@ impl AcpBackend {
         let generation = {
             let mut state = self.lock_state();
             let generation = state.generation;
+            let cwd = self.session_cwd(spec);
             let entry = state
                 .sessions
                 .entry(session.native_id.clone())
-                .or_insert_with(|| SessionState::new(session.key.clone()));
+                .or_insert_with(|| SessionState::new(session.key.clone(), cwd.clone()));
+            entry.cwd = cwd;
             entry.replay = if show_history {
                 Replay::Show
             } else {
@@ -458,9 +486,10 @@ impl AcpBackend {
 }
 
 impl SessionState {
-    fn new(key: SessionKey) -> Self {
+    fn new(key: SessionKey, cwd: PathBuf) -> Self {
         Self {
             key,
+            cwd,
             attached: None,
             seq: 0,
             messages: MessageTracker::default(),
@@ -550,6 +579,12 @@ async fn dispatch(
     mut incoming: mpsc::UnboundedReceiver<Incoming>,
 ) {
     while let Some(message) = incoming.recv().await {
+        if let Incoming::Response { id, result } = message {
+            // In order: every update the agent sent before this response has
+            // been published, so a turn's output always precedes its end.
+            conn.resolve(id, result).await;
+            continue;
+        }
         let Some(backend) = backend.upgrade() else {
             return;
         };
@@ -568,8 +603,10 @@ async fn dispatch(
                     conn.respond(id, result);
                 });
             }
+            Incoming::Response { .. } => {}
         }
     }
+    conn.fail_pending().await;
     if let Some(backend) = backend.upgrade() {
         backend.connection_lost(generation).await;
     }
@@ -801,7 +838,8 @@ impl AgentBackend for AcpBackend {
 
     async fn new_session(&self, spec: SessionSpec) -> BackendResult<SessionRef> {
         let conn = self.connection().await?;
-        let request = acp::NewSessionRequest::new(self.session_cwd(&spec)).mcp_servers(Vec::new());
+        let cwd = self.session_cwd(&spec);
+        let request = acp::NewSessionRequest::new(cwd.clone()).mcp_servers(Vec::new());
         let response = conn
             .request("session/new", to_value(&request)?)
             .await
@@ -812,7 +850,7 @@ impl AgentBackend for AcpBackend {
         let session = self.session_ref(native_id.clone());
         let mut state = self.lock_state();
         let generation = state.generation;
-        let mut entry = SessionState::new(session.key.clone());
+        let mut entry = SessionState::new(session.key.clone(), cwd);
         entry.attached = Some(generation);
         state.sessions.insert(native_id, entry);
         Ok(session)
@@ -926,32 +964,35 @@ impl AgentBackend for AcpBackend {
     }
 
     fn cancel(&self, session: &SessionRef) {
-        let Some((turn_id, cancel)) = ({
+        // Everything happens under one lock and right away, so the cancel
+        // can only reach the turn that is running now, never a later one.
+        let (turn_id, generation) = {
             let state = self.lock_state();
-            state
+            let Some(turn) = state
                 .sessions
                 .get(&session.native_id)
                 .and_then(|s| s.turn.as_ref())
-                .map(|turn| (turn.id.clone(), turn.cancel.clone()))
-        }) else {
-            return;
+            else {
+                return;
+            };
+            // Pending interactions answer "cancelled", as ACP requires.
+            turn.cancel.cancel();
+            if let Some((g, conn)) = &state.conn {
+                if *g == turn.generation {
+                    let notice = acp::CancelNotification::new(acp::SessionId::new(
+                        session.native_id.as_str(),
+                    ));
+                    if let Ok(params) = serde_json::to_value(&notice) {
+                        let _ = conn.notify("session/cancel", params);
+                    }
+                }
+            }
+            (turn.id.clone(), turn.generation)
         };
-        // Pending interactions answer "cancelled", as ACP requires.
-        cancel.cancel();
         let me = self.me.clone();
         let native = session.native_id.clone();
         let timeout = self.config.cancel_timeout;
         tokio::spawn(async move {
-            let Some(backend) = me.upgrade() else {
-                return;
-            };
-            if let Some(live) = backend.link.lock().await.as_ref() {
-                let notice = acp::CancelNotification::new(acp::SessionId::new(native.as_str()));
-                if let Ok(params) = serde_json::to_value(&notice) {
-                    let _ = live.conn.notify("session/cancel", params);
-                }
-            }
-            drop(backend);
             tokio::time::sleep(timeout).await;
             let Some(backend) = me.upgrade() else {
                 return;
@@ -961,7 +1002,7 @@ impl AgentBackend for AcpBackend {
                 .sessions
                 .get(&native)
                 .and_then(|s| s.turn.as_ref())
-                .is_some_and(|turn| turn.id == turn_id);
+                .is_some_and(|turn| turn.id == turn_id && turn.generation == generation);
             if still_running {
                 tracing::warn!(agent = %backend.config.id, "agent ignored cancel; stopping it");
                 backend.kill().await;
