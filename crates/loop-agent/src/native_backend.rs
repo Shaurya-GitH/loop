@@ -5,6 +5,7 @@
 //! Agent events are translated by [`NativeEventMapper`] and published as
 //! [`UpdateEnvelope`]s on a broadcast stream.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,6 +37,18 @@ pub struct NativeBackend {
     harness: Arc<AgentHarness>,
     updates: broadcast::Sender<UpdateEnvelope>,
     stream: Arc<Mutex<StreamState>>,
+    /// Set while a prompt sent through this backend runs, so two callers
+    /// cannot both start one.
+    prompting: Arc<AtomicBool>,
+}
+
+/// Clears [`NativeBackend::prompting`] when the prompt is over.
+struct PromptSlot(Arc<AtomicBool>);
+
+impl Drop for PromptSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Translation state, shared with the harness subscription.
@@ -63,6 +76,7 @@ impl NativeBackend {
             harness: Arc::clone(&harness),
             updates: updates.clone(),
             stream: Arc::clone(&stream),
+            prompting: Arc::new(AtomicBool::new(false)),
         });
         let instance = backend.instance.clone();
         harness.subscribe(move |event: AgentEvent| {
@@ -313,6 +327,16 @@ impl AgentBackend for NativeBackend {
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
         self.check_session(session).await?;
+        // Reserve the turn before checking the harness, so two callers
+        // cannot both pass the check.
+        if self
+            .prompting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(BackendError::Busy);
+        }
+        let slot = PromptSlot(Arc::clone(&self.prompting));
         if self.harness.phase() != AgentHarnessPhase::Idle {
             return Err(BackendError::Busy);
         }
@@ -324,7 +348,9 @@ impl AgentBackend for NativeBackend {
         let updates = self.updates.clone();
         let turns_before = self.stream.lock().mapper.turns_started();
         tokio::spawn(async move {
-            let outcome = match harness.prompt(input).await {
+            let result = harness.prompt(input).await;
+            drop(slot);
+            let outcome = match result {
                 Ok(message) => match message.as_assistant().map(turn_outcome) {
                     Some((StopReason::Cancelled, _)) => TurnOutcome::Cancelled,
                     Some((StopReason::Error, error)) => {
@@ -359,7 +385,7 @@ impl AgentBackend for NativeBackend {
     }
 
     fn is_busy(&self, _session: &SessionRef) -> bool {
-        self.harness.phase() != AgentHarnessPhase::Idle
+        self.prompting.load(Ordering::Acquire) || self.harness.phase() != AgentHarnessPhase::Idle
     }
 
     async fn shutdown(&self) {
