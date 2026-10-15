@@ -164,6 +164,27 @@ fn translate(
 ///   started-and-failed turn;
 /// - the run's turn already ended (for example the failure was while saving
 ///   it): report an error notice.
+/// An error notice outside any turn.
+fn error_notice(
+    instance: &BackendInstanceId,
+    stream: &Mutex<StreamState>,
+    info: &ErrorInfo,
+) -> UpdateEnvelope {
+    let mut state = stream.lock();
+    state.seq += 1;
+    UpdateEnvelope::live(
+        instance.clone(),
+        0,
+        state.session.clone(),
+        None,
+        state.seq,
+        SessionUpdate::Notice {
+            level: NoticeLevel::Error,
+            text: info.message.clone(),
+        },
+    )
+}
+
 fn close_failed_turn(
     instance: &BackendInstanceId,
     stream: &Mutex<StreamState>,
@@ -350,6 +371,7 @@ impl AgentBackend for NativeBackend {
         tokio::spawn(async move {
             let result = harness.prompt(input).await;
             drop(slot);
+            let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
             let outcome = match result {
                 Ok(message) => match message.as_assistant().map(turn_outcome) {
                     Some((StopReason::Cancelled, _)) => TurnOutcome::Cancelled,
@@ -370,10 +392,18 @@ impl AgentBackend for NativeBackend {
                     other => ErrorInfo::new(ErrorCategory::Internal, other.to_string()),
                 }),
             };
-            if let TurnOutcome::Failed(info) = &outcome {
-                for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
-                    let _ = updates.send(envelope);
+            match &outcome {
+                // Another caller of the harness is running a turn; that
+                // turn is not this prompt's to close.
+                TurnOutcome::Failed(info) if rejected_busy => {
+                    let _ = updates.send(error_notice(&instance, &stream, info));
                 }
+                TurnOutcome::Failed(info) => {
+                    for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
+                        let _ = updates.send(envelope);
+                    }
+                }
+                _ => {}
             }
             let _ = done.send(outcome);
         });

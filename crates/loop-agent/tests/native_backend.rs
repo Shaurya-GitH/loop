@@ -19,6 +19,10 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 async fn backend(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<NativeBackend> {
+    NativeBackend::new(harness(responses, tools).await).await
+}
+
+async fn harness(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<AgentHarness> {
     let script = FauxScript::new();
     script.extend(responses);
     let models = Arc::new(Models::new());
@@ -27,7 +31,7 @@ async fn backend(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<Nat
     let repo = create_session_repository(create_in_memory_session_store(), None);
     let session = repo.create(None, None).await.unwrap();
     let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
-    let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
+    Arc::new(AgentHarness::new(AgentHarnessOptions {
         models,
         model: Some(model),
         session,
@@ -36,8 +40,7 @@ async fn backend(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<Nat
         system_prompt: "sys".into(),
         sandbox: SandboxMode::Disabled,
         resources: Default::default(),
-    }));
-    NativeBackend::new(harness).await
+    }))
 }
 
 /// Envelopes until (and including) the turn's end.
@@ -249,4 +252,49 @@ async fn back_to_back_prompts_cannot_both_start() {
     );
     collect_turn(&mut rx).await;
     assert!(!backend.is_busy(&session));
+}
+
+#[tokio::test]
+async fn a_busy_rejection_leaves_the_running_turn_open() {
+    let harness = harness(
+        vec![
+            FauxResponse::Text("direct".into()),
+            FauxResponse::Text("unused".into()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    // The backend's check passes, then another caller takes the harness
+    // before the backend's prompt task runs.
+    let queued = backend.prompt(&session, text("queued")).await.unwrap();
+    let mut direct = Box::pin(harness.prompt("direct"));
+    assert!(futures::poll!(&mut direct).is_pending());
+
+    match queued.outcome().await {
+        TurnOutcome::Failed(info) => assert_eq!(info.message, "a turn is already running"),
+        other => panic!("expected a busy failure, got {other:?}"),
+    }
+    direct.await.unwrap();
+    let updates: Vec<_> = collect_turn(&mut rx)
+        .await
+        .into_iter()
+        .map(|e| e.update)
+        .collect();
+    assert!(updates.iter().any(|u| matches!(u,
+        SessionUpdate::Notice { text, .. } if text == "a turn is already running")));
+    let ends: Vec<_> = updates
+        .iter()
+        .filter_map(|u| match u {
+            SessionUpdate::TurnEnded { stop, .. } => Some(*stop),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [StopReason::EndTurn],
+        "only the direct turn ends, normally"
+    );
 }
