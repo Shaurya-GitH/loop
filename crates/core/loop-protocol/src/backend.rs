@@ -209,6 +209,15 @@ pub trait ModelControl: Send + Sync {
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices>;
     /// Switch the session to `model` (a [`ModelChoice::id`]).
     async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()>;
+    /// The reasoning effort levels the session's model offers, as choices.
+    async fn efforts(&self, _session: &SessionRef) -> BackendResult<ModelChoices> {
+        Err(BackendError::Unsupported("choosing a reasoning effort".into()))
+    }
+    /// Switch the session to reasoning effort `effort` (a [`ModelChoice::id`]
+    /// from [`Self::efforts`]).
+    async fn set_effort(&self, _session: &SessionRef, _effort: &str) -> BackendResult<()> {
+        Err(BackendError::Unsupported("choosing a reasoning effort".into()))
+    }
 }
 
 /// What Loop provides to every backend. Implemented once by the host
