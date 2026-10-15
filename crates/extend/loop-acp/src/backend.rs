@@ -376,7 +376,16 @@ impl AcpBackend {
 
     /// Make sure `session` is attached to the live process, reloading it after
     /// a restart when the agent supports that.
+    /// Whether `session` names one of this backend's sessions. Sessions are
+    /// looked up by native id, which another agent may reuse.
+    fn owns(&self, session: &SessionRef) -> bool {
+        session.instance == self.config.id
+    }
+
     async fn attach(&self, session: &SessionRef) -> BackendResult<Arc<Connection>> {
+        if !self.owns(session) {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
         let conn = self.connection().await?;
         let (generation, attached, can_load, cwd) = {
             let state = self.lock_state();
@@ -888,7 +897,7 @@ impl AgentBackend for AcpBackend {
         session: &SessionRef,
         spec: SessionSpec,
     ) -> BackendResult<SessionRef> {
-        if session.instance != self.config.id {
+        if !self.owns(session) {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
         if !self.lock_state().capabilities.load_session {
@@ -991,6 +1000,9 @@ impl AgentBackend for AcpBackend {
     }
 
     fn cancel(&self, session: &SessionRef) {
+        if !self.owns(session) {
+            return;
+        }
         // Everything happens under one lock and right away, so the cancel
         // can only reach the turn that is running now, never a later one.
         let (turn_id, generation) = {
@@ -1038,10 +1050,12 @@ impl AgentBackend for AcpBackend {
     }
 
     fn is_busy(&self, session: &SessionRef) -> bool {
-        self.lock_state()
-            .sessions
-            .get(&session.native_id)
-            .is_some_and(|s| s.turn.is_some())
+        self.owns(session)
+            && self
+                .lock_state()
+                .sessions
+                .get(&session.native_id)
+                .is_some_and(|s| s.turn.is_some())
     }
 
     async fn shutdown(&self) {
@@ -1115,6 +1129,9 @@ fn model_choices(select: &acp::SessionConfigSelect) -> ModelChoices {
 
 impl AcpBackend {
     fn choices(&self, session: &SessionRef, setting: Setting) -> BackendResult<ModelChoices> {
+        if !self.owns(session) {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
         let state = self.lock_state();
         let known = state
             .sessions
@@ -1131,6 +1148,9 @@ impl AcpBackend {
         setting: Setting,
         value: &str,
     ) -> BackendResult<()> {
+        if !self.owns(session) {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
         let config_id = {
             let state = self.lock_state();
             let known = state
