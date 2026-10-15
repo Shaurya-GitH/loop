@@ -157,13 +157,6 @@ fn translate(
     envelopes
 }
 
-/// Keep the stream complete when the harness fails outside a normal run, so
-/// every prompt produces exactly one `TurnEnded`:
-/// - the run's turn is still open: end it as failed;
-/// - the run never started a turn (`turns_before` unchanged): report a
-///   started-and-failed turn;
-/// - the run's turn already ended (for example the failure was while saving
-///   it): report an error notice.
 /// An error notice outside any turn.
 fn error_notice(
     instance: &BackendInstanceId,
@@ -185,6 +178,14 @@ fn error_notice(
     )
 }
 
+/// Keep the stream complete when the harness fails outside a normal run, so
+/// every prompt that ran produces exactly one `TurnEnded` (a prompt rejected
+/// as busy gets only an [`error_notice`]):
+/// - the run's turn is still open: end it as failed;
+/// - the run never started a turn (`turns_before` unchanged): report a
+///   started-and-failed turn;
+/// - the run's turn already ended (for example the failure was while saving
+///   it): report an error notice.
 fn close_failed_turn(
     instance: &BackendInstanceId,
     stream: &Mutex<StreamState>,
