@@ -21,8 +21,9 @@ use async_trait::async_trait;
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
     ErrorCategory, ErrorInfo, HostServices, InteractionId, InteractionOutcome, InteractionRequest,
-    Origin, SessionKey, SessionRef, SessionSpec, SessionUpdate, StopReason, TerminalRequest,
-    TurnHandle, TurnId, TurnOutcome, UpdateEnvelope, PROTOCOL_VERSION,
+    ModelChoice, ModelChoices, ModelControl, Origin, SessionKey, SessionRef, SessionSpec,
+    SessionUpdate, StopReason, TerminalRequest, TurnHandle, TurnId, TurnOutcome, UpdateEnvelope,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -82,6 +83,8 @@ struct SessionState {
     key: SessionKey,
     /// Working directory the session was opened with, reused on reopen.
     cwd: PathBuf,
+    /// The agent's configuration options for the session (model and others).
+    config_options: Vec<acp::SessionConfigOption>,
     /// Generation of the process that holds this session, or `None` after
     /// that process was lost.
     attached: Option<u64>,
@@ -436,6 +439,11 @@ impl AcpBackend {
         )
         .mcp_servers(Vec::new());
         let result = conn.request("session/load", to_value(&request)?).await;
+        let options = result.as_ref().ok().and_then(|value| {
+            serde_json::from_value::<acp::LoadSessionResponse>(value.clone())
+                .ok()
+                .and_then(|response| response.config_options)
+        });
         let closing = {
             let mut state = self.lock_state();
             let entry = state.sessions.get_mut(&session.native_id);
@@ -444,6 +452,9 @@ impl AcpBackend {
                     entry.replay = Replay::Off;
                     if result.is_ok() {
                         entry.attached = Some(generation);
+                    }
+                    if let Some(options) = options {
+                        entry.config_options = options;
                     }
                     entry.messages.close()
                 }
@@ -499,6 +510,7 @@ impl SessionState {
         Self {
             key,
             cwd,
+            config_options: Vec::new(),
             attached: None,
             seq: 0,
             messages: MessageTracker::default(),
@@ -633,6 +645,11 @@ fn on_session_update(backend: &AcpBackend, generation: u64, params: &Value) {
             tracing::debug!(session = native, "update for a session Loop does not know");
             return;
         };
+        if raw.get("sessionUpdate").and_then(Value::as_str) == Some("config_option_update") {
+            if let Ok(update) = serde_json::from_value::<acp::ConfigOptionUpdate>(raw.clone()) {
+                session.config_options = update.config_options;
+            }
+        }
         // A quiet reload (after a restart) replays history the surface
         // already shows; drop it.
         let show = session.replay != Replay::Hide;
@@ -861,6 +878,7 @@ impl AgentBackend for AcpBackend {
         let generation = state.generation;
         let mut entry = SessionState::new(session.key.clone(), cwd);
         entry.attached = Some(generation);
+        entry.config_options = response.config_options.unwrap_or_default();
         state.sessions.insert(native_id, entry);
         Ok(session)
     }
@@ -1028,5 +1046,93 @@ impl AgentBackend for AcpBackend {
 
     async fn shutdown(&self) {
         self.kill().await;
+    }
+
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        Some(self)
+    }
+}
+
+/// The session's model option: its id and select value, when the agent has one.
+fn model_option(
+    options: &[acp::SessionConfigOption],
+) -> Option<(String, &acp::SessionConfigSelect)> {
+    options.iter().find_map(|option| {
+        let is_model = matches!(
+            option.category,
+            Some(acp::SessionConfigOptionCategory::Model)
+        );
+        match (&option.kind, is_model) {
+            (acp::SessionConfigKind::Select(select), true) => {
+                Some((option.id.0.to_string(), select))
+            }
+            _ => None,
+        }
+    })
+}
+
+fn model_choices(select: &acp::SessionConfigSelect) -> ModelChoices {
+    let choice = |option: &acp::SessionConfigSelectOption| ModelChoice {
+        id: option.value.0.to_string(),
+        name: option.name.clone(),
+        description: option.description.clone(),
+    };
+    let models = match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(options) => options.iter().map(choice).collect(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter().map(choice))
+            .collect(),
+        _ => Vec::new(),
+    };
+    ModelChoices {
+        current: Some(select.current_value.0.to_string()),
+        models,
+    }
+}
+
+#[async_trait]
+impl ModelControl for AcpBackend {
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        let state = self.lock_state();
+        let known = state
+            .sessions
+            .get(&session.native_id)
+            .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))?;
+        model_option(&known.config_options)
+            .map(|(_, select)| model_choices(select))
+            .ok_or_else(|| BackendError::Unsupported("choosing a model".into()))
+    }
+
+    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()> {
+        let config_id = {
+            let state = self.lock_state();
+            let known = state
+                .sessions
+                .get(&session.native_id)
+                .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))?;
+            let (config_id, select) = model_option(&known.config_options)
+                .ok_or_else(|| BackendError::Unsupported("choosing a model".into()))?;
+            if !model_choices(select).models.iter().any(|m| m.id == model) {
+                return Err(BackendError::Unsupported(format!("the model `{model}`")));
+            }
+            config_id
+        };
+        let conn = self.attach(session).await?;
+        let response = conn
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": session.native_id, "configId": config_id, "value": model}),
+            )
+            .await
+            .map_err(rpc_failure)?;
+        if let Ok(response) =
+            serde_json::from_value::<acp::SetSessionConfigOptionResponse>(response)
+        {
+            if let Some(known) = self.lock_state().sessions.get_mut(&session.native_id) {
+                known.config_options = response.config_options;
+            }
+        }
+        Ok(())
     }
 }

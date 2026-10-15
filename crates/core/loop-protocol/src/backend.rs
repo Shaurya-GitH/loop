@@ -175,6 +175,40 @@ pub trait AgentBackend: Send + Sync {
     fn local_shell(&self) -> Option<&dyn LocalShell> {
         None
     }
+
+    /// Choosing the model the backend uses for a session.
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        None
+    }
+}
+
+/// One model a backend offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    /// The backend's id for the model, passed back to [`ModelControl::set_model`].
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Short description, when the backend gives one.
+    pub description: Option<String>,
+}
+
+/// The models a session can use, and the one it uses now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelChoices {
+    /// The current model's id, when known.
+    pub current: Option<String>,
+    /// Every model on offer.
+    pub models: Vec<ModelChoice>,
+}
+
+/// Model selection for backends that choose their own models.
+#[async_trait]
+pub trait ModelControl: Send + Sync {
+    /// The models the session can use.
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices>;
+    /// Switch the session to `model` (a [`ModelChoice::id`]).
+    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()>;
 }
 
 /// What Loop provides to every backend. Implemented once by the host
