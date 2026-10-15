@@ -151,7 +151,7 @@ pub async fn run_print(
     // No one can approve anything here: external agents get the default
     // host, which rejects every request, so they decline the action.
     match runtime.pending_agent.take() {
-        Some(PendingAgent::New(id)) => runtime.use_agent(&id).await?,
+        Some(PendingAgent::New { id, model }) => runtime.use_agent(&id, model.as_deref()).await?,
         Some(PendingAgent::Resume(record)) => runtime.resume_agent(&record).await?,
         None => {}
     }

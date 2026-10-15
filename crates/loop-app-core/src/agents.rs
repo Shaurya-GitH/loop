@@ -1,9 +1,13 @@
-//! External agents: the registry of ACP agents Loop can run, and the manager
-//! that starts them and remembers their sessions.
+//! Subscription providers: model access that comes with a subscription
+//! (such as a ChatGPT Plus/Pro plan) and is served by an external agent over
+//! the Agent Client Protocol.
 //!
-//! Agents are data. Built-in presets cover common ACP agents; a settings
-//! entry with the same id replaces a preset, and any other entry adds an
-//! agent. Nothing here branches on a particular vendor.
+//! To the user a subscription is one more provider: it is signed in with
+//! `/login`, and its models appear in `/model`. Underneath, each subscription
+//! is an ACP agent (for ChatGPT, `codex-acp`) that Loop starts on demand.
+//!
+//! Subscriptions are data. A settings entry with the same id replaces a
+//! built-in one; any other entry adds one. Nothing here branches on a vendor.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -14,20 +18,23 @@ use async_trait::async_trait;
 use loop_acp::schema::v1::AuthMethod;
 use loop_acp::{AcpBackend, AgentConfig, Connector, ProcessConnector};
 use loop_protocol::{
-    AgentBackend, HostServices, InteractionOutcome, InteractionRequest, SessionKey, SessionRef,
-    SessionSpec,
+    AgentBackend, HostServices, InteractionOutcome, InteractionRequest, ModelChoice, SessionKey,
+    SessionRef, SessionSpec,
 };
 use serde::{Deserialize, Serialize};
 
-/// One agent Loop can run over the Agent Client Protocol.
+/// A subscription provider and the ACP agent that serves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEntry {
-    /// Short id used in `/agent <id>` and `--agent <id>`.
+    /// Provider id, used in `provider/model` specs (for example `chatgpt`).
     pub id: String,
-    /// Display name.
+    /// Short name, such as "ChatGPT".
     #[serde(default)]
     pub name: String,
+    /// The `/login` row, such as "ChatGPT Plus/Pro (Codex subscription)".
+    #[serde(default)]
+    pub label: String,
     /// Program to run.
     pub command: String,
     /// Arguments.
@@ -45,31 +52,29 @@ pub struct AgentEntry {
     /// so the agent does not reuse sign-ins from its standalone install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_env: Option<String>,
-    /// The agent must be signed in through `/login` before use.
-    #[serde(default)]
-    pub sign_in: bool,
+    /// The agent's sign-in method for the subscription (an ACP auth method
+    /// id the agent handles itself, for example by opening a browser).
+    /// `None` means the agent needs no sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
 }
 
 impl AgentEntry {
-    fn preset(id: &str, name: &str, command: &str, args: &[&str], install_hint: &str) -> Self {
-        Self {
-            id: id.into(),
-            name: name.into(),
-            command: command.into(),
-            args: args.iter().map(|a| (*a).into()).collect(),
-            env: BTreeMap::new(),
-            install_hint: Some(install_hint.into()),
-            home_env: None,
-            sign_in: false,
-        }
-    }
-
-    /// The display name, falling back to the id.
+    /// The short name, falling back to the id.
     pub fn display_name(&self) -> &str {
         if self.name.is_empty() {
             &self.id
         } else {
             &self.name
+        }
+    }
+
+    /// The `/login` row label, falling back to the name.
+    pub fn login_label(&self) -> &str {
+        if self.label.is_empty() {
+            self.display_name()
+        } else {
+            &self.label
         }
     }
 
@@ -87,51 +92,22 @@ impl AgentEntry {
     }
 }
 
-/// Built-in agents. Each command is the one its project documents for ACP.
+/// Built-in subscriptions.
 pub fn builtin_agents() -> Vec<AgentEntry> {
-    let mut codex = AgentEntry::preset(
-        "codex",
-        "Codex (ChatGPT plan or OpenAI API key)",
-        "npx",
-        &["-y", "@agentclientprotocol/codex-acp"],
-        "Needs Node.js (npx).",
-    );
-    codex.home_env = Some("CODEX_HOME".into());
-    codex.sign_in = true;
-    vec![
-        codex,
-        AgentEntry::preset(
-            "claude",
-            "Claude Agent",
-            "npx",
-            &["-y", "@agentclientprotocol/claude-agent-acp"],
-            "Needs Node.js (npx).",
-        ),
-        AgentEntry::preset(
-            "gemini",
-            "Gemini CLI",
-            "gemini",
-            &["--acp"],
-            "Install Gemini CLI: npm install -g @google/gemini-cli",
-        ),
-        AgentEntry::preset(
-            "hermes",
-            "Hermes Agent (Nous Research)",
-            "hermes",
-            &["acp"],
-            "Install Hermes Agent and run `hermes model` once to choose a provider.",
-        ),
-        AgentEntry::preset(
-            "opencode",
-            "OpenCode",
-            "opencode",
-            &["acp"],
-            "Install OpenCode: https://opencode.ai",
-        ),
-    ]
+    vec![AgentEntry {
+        id: "chatgpt".into(),
+        name: "ChatGPT".into(),
+        label: "ChatGPT Plus/Pro (Codex subscription)".into(),
+        command: "npx".into(),
+        args: vec!["-y".into(), "@agentclientprotocol/codex-acp".into()],
+        env: BTreeMap::new(),
+        install_hint: Some("Needs Node.js (npx).".into()),
+        home_env: Some("CODEX_HOME".into()),
+        auth_method: Some("chat-gpt".into()),
+    }]
 }
 
-/// Presets, with settings entries replacing presets of the same id and
+/// Built-ins, with settings entries replacing those of the same id and
 /// adding the rest, in a stable order.
 pub fn agent_entries(configured: &[AgentEntry]) -> Vec<AgentEntry> {
     let mut entries = builtin_agents();
@@ -144,31 +120,18 @@ pub fn agent_entries(configured: &[AgentEntry]) -> Vec<AgentEntry> {
     entries
 }
 
-/// A session Loop opened with an external agent, kept so `--resume` can find
-/// it again.
+/// A session Loop opened with a subscription, kept so `--resume` can find it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionRecord {
     /// The agent's session id (also Loop's session key for it).
     pub id: String,
-    /// Agent id.
+    /// Subscription id.
     pub agent: String,
     /// Working directory the session was opened in.
     pub cwd: PathBuf,
     /// Unix epoch milliseconds.
     pub created_at: i64,
-}
-
-/// One way to sign in to an agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignInMethod {
-    /// The agent's id for the method.
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Whether the user runs a command in a terminal (instead of the agent
-    /// handling it, for example by opening a browser).
-    pub in_terminal: bool,
 }
 
 /// Answers every interaction "rejected": used when no surface can ask the
@@ -184,12 +147,21 @@ impl HostServices for HeadlessHost {
     }
 }
 
-/// Starts external agents on demand and remembers their sessions.
+/// A model cached from a subscription, shown in `/model`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedModel {
+    /// The agent's model id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+}
+
+/// Starts subscription agents on demand and remembers their sessions.
 pub struct AgentManager {
     entries: Vec<AgentEntry>,
     cwd: PathBuf,
     index_path: PathBuf,
-    /// Per-agent state: private homes and sign-in markers.
+    /// Per-agent state: private homes, sign-in markers, model caches.
     state_dir: PathBuf,
     connector: Arc<dyn Connector>,
     host: Mutex<Arc<dyn HostServices>>,
@@ -197,7 +169,7 @@ pub struct AgentManager {
 }
 
 impl AgentManager {
-    /// A manager for `entries`, starting agents in `cwd` and keeping agent
+    /// A manager for `entries`, starting agents in `cwd` and keeping their
     /// state under `agent_dir`. Until a surface installs its host,
     /// interactions are answered by [`HeadlessHost`].
     pub fn new(entries: Vec<AgentEntry>, cwd: PathBuf, agent_dir: &Path) -> Self {
@@ -227,21 +199,84 @@ impl AgentManager {
         *self.host.lock().unwrap_or_else(|p| p.into_inner()) = host;
     }
 
-    /// Every agent Loop can run.
+    /// Every subscription Loop knows.
     pub fn entries(&self) -> &[AgentEntry] {
         &self.entries
     }
 
-    /// The registry entry for `id`.
+    /// The subscription `id`, if there is one.
     pub fn entry(&self, id: &str) -> Option<&AgentEntry> {
         self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// Whether subscription `id` may be used: signed in through `/login`, or
+    /// needing no sign-in.
+    pub fn is_signed_in(&self, id: &str) -> bool {
+        match self.entry(id) {
+            Some(entry) if entry.auth_method.is_some() => self.marker(id).exists(),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Models cached at sign-in for `id`, for `/model`.
+    pub fn models(&self, id: &str) -> Vec<CachedModel> {
+        std::fs::read_to_string(self.models_path(id))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Sign in to subscription `id` with its declared method (the agent may
+    /// open a browser), then read and cache its models. Returns how many
+    /// models it offers.
+    pub async fn sign_in(&self, id: &str) -> anyhow::Result<usize> {
+        let entry = self
+            .entry(id)
+            .ok_or_else(|| anyhow!("no subscription named `{id}`"))?;
+        let backend = self.backend(id).await?;
+        if let Some(method) = &entry.auth_method {
+            let offered = backend.auth_methods().into_iter().any(|m| match m {
+                AuthMethod::Agent(m) => m.id.0.as_ref() == method.as_str(),
+                _ => false,
+            });
+            if !offered {
+                bail!(
+                    "{} no longer offers the `{method}` sign-in; update Loop",
+                    entry.display_name()
+                );
+            }
+            backend.authenticate(method).await?;
+            self.mark_signed_in(id)?;
+        }
+        // A short-lived session, only to learn the models.
+        let probe = backend
+            .new_session(SessionSpec {
+                cwd: Some(self.cwd.clone()),
+                name: None,
+            })
+            .await?;
+        self.refresh_models(id, backend.as_ref(), &probe).await
+    }
+
+    /// Forget the sign-in for `id`: stop the agent, delete its private home
+    /// (where it keeps its credentials), the marker and the model cache.
+    pub async fn sign_out(&self, id: &str) -> anyhow::Result<()> {
+        if let Some(backend) = self.started.lock().await.remove(id) {
+            backend.shutdown().await;
+        }
+        let dir = self.state_dir.join(id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+        }
+        Ok(())
     }
 
     /// The running backend for `id`, starting the agent if needed.
     pub async fn backend(&self, id: &str) -> anyhow::Result<Arc<AcpBackend>> {
         let entry = self
             .entry(id)
-            .ok_or_else(|| anyhow!("no agent named `{id}` (see /agent)"))?;
+            .ok_or_else(|| anyhow!("no subscription named `{id}`"))?;
         let mut started = self.started.lock().await;
         if let Some(backend) = started.get(id) {
             return Ok(Arc::clone(backend));
@@ -266,34 +301,13 @@ impl AgentManager {
         Ok(backend)
     }
 
-    /// Whether agent `id` may be used: signed in through `/login`, or not
-    /// needing it.
-    pub fn is_signed_in(&self, id: &str) -> bool {
-        match self.entry(id) {
-            Some(entry) if entry.sign_in => self.marker(id).exists(),
-            _ => true,
-        }
-    }
-
-    /// Agents that sign in through `/login`.
-    pub fn sign_in_agents(&self) -> Vec<&AgentEntry> {
-        self.entries.iter().filter(|e| e.sign_in).collect()
-    }
-
-    fn marker(&self, id: &str) -> PathBuf {
-        self.state_dir.join(id).join("signed-in")
-    }
-
-    fn require_sign_in(&self, id: &str) -> anyhow::Result<()> {
-        if self.is_signed_in(id) {
-            return Ok(());
-        }
-        let name = self.entry(id).map(AgentEntry::display_name).unwrap_or(id);
-        bail!("sign in to {name} first: /login and choose it")
-    }
-
-    /// Open a new session with agent `id` and remember it for `--resume`.
-    pub async fn new_session(&self, id: &str) -> anyhow::Result<(Arc<AcpBackend>, SessionRef)> {
+    /// Open a new session with subscription `id`, switch it to `model` when
+    /// given, and remember it for `--resume`.
+    pub async fn new_session(
+        &self,
+        id: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<(Arc<AcpBackend>, SessionRef)> {
         self.require_sign_in(id)?;
         let backend = self.backend(id).await?;
         let session = backend
@@ -302,6 +316,14 @@ impl AgentManager {
                 name: None,
             })
             .await?;
+        // Keep the cache current; a failure here is not worth failing the session.
+        let _ = self.refresh_models(id, backend.as_ref(), &session).await;
+        if let Some(model) = model {
+            let control = backend
+                .model_control()
+                .ok_or_else(|| anyhow!("{id} does not let Loop choose its model"))?;
+            control.set_model(&session, model).await?;
+        }
         self.record(AgentSessionRecord {
             id: session.native_id.clone(),
             agent: id.to_owned(),
@@ -311,7 +333,7 @@ impl AgentManager {
         Ok((backend, session))
     }
 
-    /// The recorded external-agent session `session_id`, if Loop opened one.
+    /// The recorded session `session_id`, if Loop opened one.
     pub fn find_session(&self, session_id: &str) -> Option<AgentSessionRecord> {
         read_index(&self.index_path)
             .ok()?
@@ -345,58 +367,15 @@ impl AgentManager {
         Ok((backend, session))
     }
 
-    /// The agent's sign-in methods.
-    pub async fn auth_methods(&self, id: &str) -> anyhow::Result<Vec<SignInMethod>> {
-        let backend = self.backend(id).await?;
-        Ok(backend
-            .auth_methods()
-            .into_iter()
-            .filter_map(|method| match method {
-                AuthMethod::Agent(m) => Some(SignInMethod {
-                    id: m.id.0.to_string(),
-                    name: m.name,
-                    in_terminal: false,
-                }),
-                AuthMethod::Terminal(m) => Some(SignInMethod {
-                    id: m.id.0.to_string(),
-                    name: m.name,
-                    in_terminal: true,
-                }),
-                _ => None,
-            })
-            .collect())
-    }
-
-    /// Sign in to agent `id` with `method`. Agent-handled methods run through
-    /// ACP `authenticate`; terminal methods return the command to run.
-    pub async fn authenticate(&self, id: &str, method: &str) -> anyhow::Result<Option<String>> {
-        let backend = self.backend(id).await?;
-        let Some(auth) = backend.auth_methods().into_iter().find(|m| match m {
-            AuthMethod::Agent(m) => m.id.0.as_ref() == method,
-            AuthMethod::Terminal(m) => m.id.0.as_ref() == method,
-            _ => false,
-        }) else {
-            bail!("{id} has no sign-in method `{method}`");
-        };
-        match auth {
-            AuthMethod::Terminal(m) => {
-                let entry = self
-                    .entry(id)
-                    .ok_or_else(|| anyhow!("unknown agent {id}"))?;
-                let mut command = vec![entry.command.clone()];
-                command.extend(entry.args.iter().cloned());
-                command.extend(m.args);
-                Ok(Some(command.join(" ")))
-            }
-            _ => {
-                backend.authenticate(method).await?;
-                self.mark_signed_in(id)?;
-                Ok(None)
-            }
+    /// Stop every running agent.
+    pub async fn shutdown(&self) {
+        let started: Vec<_> = self.started.lock().await.drain().map(|(_, b)| b).collect();
+        for backend in started {
+            backend.shutdown().await;
         }
     }
 
-    /// Record that agent `id` was signed in through Loop.
+    /// Record that subscription `id` was signed in through Loop.
     pub fn mark_signed_in(&self, id: &str) -> anyhow::Result<()> {
         let marker = self.marker(id);
         if let Some(dir) = marker.parent() {
@@ -406,12 +385,47 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Stop every running agent.
-    pub async fn shutdown(&self) {
-        let started: Vec<_> = self.started.lock().await.drain().map(|(_, b)| b).collect();
-        for backend in started {
-            backend.shutdown().await;
+    async fn refresh_models(
+        &self,
+        id: &str,
+        backend: &dyn AgentBackend,
+        session: &SessionRef,
+    ) -> anyhow::Result<usize> {
+        let Some(control) = backend.model_control() else {
+            return Ok(0);
+        };
+        let models: Vec<CachedModel> = control
+            .models(session)
+            .await?
+            .models
+            .into_iter()
+            .map(|ModelChoice { id, name, .. }| CachedModel { id, name })
+            .collect();
+        let path = self.models_path(id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
         }
+        std::fs::write(&path, serde_json::to_vec_pretty(&models)?)?;
+        Ok(models.len())
+    }
+
+    fn require_sign_in(&self, id: &str) -> anyhow::Result<()> {
+        if self.entry(id).is_none() {
+            bail!("no subscription named `{id}`");
+        }
+        if self.is_signed_in(id) {
+            return Ok(());
+        }
+        let label = self.entry(id).map(AgentEntry::login_label).unwrap_or(id);
+        bail!("sign in first: /login → {label}")
+    }
+
+    fn marker(&self, id: &str) -> PathBuf {
+        self.state_dir.join(id).join("signed-in")
+    }
+
+    fn models_path(&self, id: &str) -> PathBuf {
+        self.state_dir.join(id).join("models.json")
     }
 
     fn record(&self, record: AgentSessionRecord) -> anyhow::Result<()> {
@@ -422,8 +436,8 @@ impl AgentManager {
     }
 }
 
-/// The recorded external-agent session `session_id` in `agent_dir`, if Loop
-/// opened one there. Lets `--resume` tell agent sessions from its own.
+/// The recorded subscription session `session_id` in `agent_dir`, if Loop
+/// opened one there. Lets `--resume` tell these sessions from its own.
 pub fn find_recorded_session(agent_dir: &Path, session_id: &str) -> Option<AgentSessionRecord> {
     read_index(&index_path(agent_dir))
         .ok()?
@@ -431,7 +445,21 @@ pub fn find_recorded_session(agent_dir: &Path, session_id: &str) -> Option<Agent
         .find(|record| record.id == session_id)
 }
 
-/// Where external-agent sessions are recorded.
+/// Subscription ids known in `agent_dir`: built-ins plus global settings.
+/// Lets the CLI tell `--provider chatgpt` from Loop's own providers before
+/// the runtime starts.
+pub fn subscription_ids(agent_dir: &Path) -> Vec<String> {
+    let path = crate::config::paths::settings_path(agent_dir);
+    let configured = crate::config::settings::Settings::load_file(&path)
+        .map(|settings| settings.agents)
+        .unwrap_or_default();
+    agent_entries(&configured)
+        .into_iter()
+        .map(|e| e.id)
+        .collect()
+}
+
+/// Where subscription sessions are recorded.
 pub fn index_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("agent-sessions.json")
 }
@@ -466,37 +494,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_replace_and_extend_presets() {
-        let mut codex = builtin_agents()[0].clone();
-        codex.args = vec!["--custom".into()];
-        let mine = AgentEntry {
-            id: "mine".into(),
-            name: String::new(),
-            command: "/opt/mine".into(),
-            args: vec![],
-            env: BTreeMap::from([("PROFILE".into(), "work".into())]),
-            install_hint: None,
-            home_env: None,
-            sign_in: false,
-        };
-        let entries = agent_entries(&[codex, mine]);
-        assert_eq!(entries[0].id, "codex");
-        assert_eq!(entries[0].args, ["--custom"]);
-        assert_eq!(entries.last().unwrap().id, "mine");
-        assert_eq!(entries.last().unwrap().display_name(), "mine");
-        let config = entries.last().unwrap().config();
-        assert_eq!(config.env, [("PROFILE".to_owned(), "work".to_owned())]);
-        assert_eq!(entries.len(), builtin_agents().len() + 1);
+    fn chatgpt_is_the_builtin_subscription() {
+        let builtins = builtin_agents();
+        assert_eq!(builtins.len(), 1);
+        let chatgpt = &builtins[0];
+        assert_eq!(chatgpt.id, "chatgpt");
+        assert_eq!(
+            chatgpt.login_label(),
+            "ChatGPT Plus/Pro (Codex subscription)"
+        );
+        assert_eq!(chatgpt.auth_method.as_deref(), Some("chat-gpt"));
+        assert_eq!(chatgpt.home_env.as_deref(), Some("CODEX_HOME"));
     }
 
     #[test]
-    fn settings_entries_parse_from_camel_case_json() {
-        let entry: AgentEntry = serde_json::from_value(serde_json::json!({
-            "id": "kimi", "command": "kimi", "args": ["--acp"], "installHint": "pip install kimi-cli"
+    fn settings_replace_and_extend_builtins() {
+        let mut chatgpt = builtin_agents()[0].clone();
+        chatgpt.args = vec!["--custom".into()];
+        let mine: AgentEntry = serde_json::from_value(serde_json::json!({
+            "id": "mine", "command": "/opt/mine", "env": {"PROFILE": "work"}
         }))
         .unwrap();
-        assert_eq!(entry.install_hint.as_deref(), Some("pip install kimi-cli"));
-        assert!(entry.env.is_empty());
+        let entries = agent_entries(&[chatgpt, mine]);
+        assert_eq!(entries[0].args, ["--custom"]);
+        let mine = entries.last().unwrap();
+        assert_eq!(mine.login_label(), "mine");
+        assert!(mine.auth_method.is_none());
+        assert_eq!(
+            mine.config().env,
+            [("PROFILE".to_owned(), "work".to_owned())]
+        );
     }
 
     #[test]
@@ -509,9 +536,9 @@ mod tests {
             cwd: dir.path().into(),
             created_at: 1,
         };
-        manager.record(record("codex")).unwrap();
-        manager.record(record("gemini")).unwrap();
-        assert_eq!(manager.find_session("s1").unwrap().agent, "gemini");
+        manager.record(record("chatgpt")).unwrap();
+        manager.record(record("other")).unwrap();
+        assert_eq!(manager.find_session("s1").unwrap().agent, "other");
         assert!(manager.find_session("nope").is_none());
     }
 

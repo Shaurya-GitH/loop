@@ -46,10 +46,6 @@ struct Cli {
     #[arg(long, global = true)]
     resume: Option<String>,
 
-    /// Use an external agent (see `/agent`), e.g. `codex`, `claude`, `gemini`.
-    #[arg(long, global = true)]
-    agent: Option<String>,
-
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
     print: Option<String>,
@@ -230,22 +226,38 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let interactive = cli.print.is_none() && !cli.serve_mcp;
-    // `--resume` may name a session Loop opened with an external agent.
-    let agent_resume = cli.resume.as_deref().and_then(|id| {
-        loop_app_core::agents::find_recorded_session(&config::paths::get_agent_dir(), id)
-    });
-    let pending_agent = match (&agent_resume, &cli.agent) {
+    let agent_dir = config::paths::get_agent_dir();
+    // `--resume` may name a session Loop opened with a subscription, and
+    // `--provider` may name a subscription (such as `chatgpt`).
+    let agent_resume = cli
+        .resume
+        .as_deref()
+        .and_then(|id| loop_app_core::agents::find_recorded_session(&agent_dir, id));
+    let subscription = cli
+        .provider
+        .clone()
+        .filter(|p| loop_app_core::agents::subscription_ids(&agent_dir).contains(p));
+    let pending_agent = match (&agent_resume, &subscription) {
         (Some(record), _) => Some(loop_cli::PendingAgent::Resume(record.clone())),
-        (None, Some(id)) => Some(loop_cli::PendingAgent::New(id.clone())),
+        (None, Some(id)) => Some(loop_cli::PendingAgent::New {
+            id: id.clone(),
+            model: cli.model.clone(),
+        }),
         (None, None) => None,
     };
+    let (provider, model) = if subscription.is_some() {
+        (None, None)
+    } else {
+        (cli.provider, cli.model)
+    };
+    let explicit_model = provider.is_some() || model.is_some() || cli.resume.is_some();
     if cli.serve_mcp && pending_agent.is_some() {
         anyhow::bail!("--serve-mcp serves Loop's own tools; it cannot run with an external agent");
     }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
-        provider: cli.provider,
-        model: cli.model,
+        provider,
+        model,
         theme: cli.theme,
         system_prompt: cli.system_prompt,
         append_system_prompt: cli.append_system_prompt,
@@ -257,12 +269,25 @@ async fn real_main() -> anyhow::Result<()> {
             cli.resume
         },
         agent: pending_agent.as_ref().map(|pending| match pending {
-            loop_cli::PendingAgent::New(id) => id.clone(),
+            loop_cli::PendingAgent::New { id, .. } => id.clone(),
             loop_cli::PendingAgent::Resume(record) => record.agent.clone(),
         }),
     })
     .await?;
-    runtime.pending_agent = pending_agent;
+    // With no model asked for, a saved subscription model starts as before.
+    let saved_subscription = (pending_agent.is_none() && !explicit_model)
+        .then(|| {
+            runtime
+                .settings
+                .selected_model()
+                .filter(|(p, _)| runtime.is_subscription(p))
+                .map(|(p, m)| loop_cli::PendingAgent::New {
+                    id: p.to_owned(),
+                    model: Some(m.to_owned()),
+                })
+        })
+        .flatten();
+    runtime.pending_agent = pending_agent.or(saved_subscription);
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
     #[cfg(feature = "telemetry")]

@@ -281,7 +281,7 @@ pub fn welcome_lines(
     let (dot_style, status_text) = if let Some(agent) = agent {
         (
             theme.style("success"),
-            format!("starting {agent} — /agent off returns to Loop's own agent"),
+            format!("starting {agent} — /model switches models or providers"),
         )
     } else if needs_setup {
         (
@@ -1989,10 +1989,11 @@ mod tests {
         let otlp = TracingSetup::OtlpEndpoint;
         for prompt in [
             SetupPrompt::Provider(
-                crate::provider_setup::ProviderSetup::start(None, Vec::new()).unwrap(),
+                crate::provider_setup::ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap(),
             ),
             SetupPrompt::Provider(
-                crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new()).unwrap(),
+                crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                    .unwrap(),
             ),
             SetupPrompt::Tracing(picker),
             SetupPrompt::Tracing(host),
@@ -2051,9 +2052,13 @@ mod tests {
             public_key: "p".into(),
         };
         assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
-        let key = crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new()).unwrap();
+        let key =
+            crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(key)).contains("enter save"));
-        let name = crate::provider_setup::ProviderSetup::start(Some("custom"), Vec::new()).unwrap();
+        let name =
+            crate::provider_setup::ProviderSetup::start(Some("custom"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(name)).contains("enter next"));
     }
 

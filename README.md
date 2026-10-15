@@ -72,7 +72,7 @@ Build from source:
 cargo run -p loop-cli
 ```
 
-First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
+First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). `/login` also signs in to a **ChatGPT Plus/Pro subscription** (served by Codex through `codex-acp`, which needs Node.js); its models then appear in `/model` as `chatgpt/<model>`. Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
 
 ### Supported platforms
 

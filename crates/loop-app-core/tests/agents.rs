@@ -1,5 +1,5 @@
-//! AgentManager with a fake ACP agent: sessions are recorded for `--resume`,
-//! resuming replays history, and both kinds of sign-in work.
+//! Subscriptions with a fake ACP agent: explicit sign-in through the declared
+//! method, cached models, sessions on a chosen model, resume and sign-out.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -8,27 +8,30 @@ use std::time::Duration;
 use async_trait::async_trait;
 use loop_acp::{AgentConfig, AgentLink, Connector};
 use loop_app_core::agents::{find_recorded_session, AgentEntry, AgentManager};
-use loop_protocol::{
-    AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest, Origin, Role,
-    SessionUpdate, StopReason, TurnOutcome,
-};
+use loop_protocol::{AgentBackend, Origin, SessionUpdate};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// A fake agent: answers the ACP calls Loop makes and records what it saw.
+type Seen = Arc<Mutex<Vec<Value>>>;
+type Env = Arc<Mutex<Vec<(String, String)>>>;
+
+/// A fake agent that needs a sign-in: answers the ACP calls Loop makes and
+/// records them, with the environment it was started with.
+#[derive(Default)]
 struct FakeAgent {
-    seen: Arc<Mutex<Vec<Value>>>,
-    env: Arc<Mutex<Vec<(String, String)>>>,
+    seen: Seen,
+    env: Env,
+}
+
+fn model_option(current: &str) -> Value {
+    json!({"id": "model", "name": "Model", "category": "model", "type": "select",
+        "currentValue": current,
+        "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B"}]})
 }
 
 #[async_trait]
 impl Connector for FakeAgent {
     async fn connect(&self, config: &AgentConfig, _cwd: &Path) -> std::io::Result<AgentLink> {
-        assert_eq!(
-            config.args,
-            ["acp"],
-            "the registry entry's args reach the connector"
-        );
         *self.env.lock().unwrap() = config.env.clone();
         let (loop_end, agent_end) = tokio::io::duplex(1 << 16);
         let (read, mut write) = tokio::io::split(agent_end);
@@ -41,20 +44,30 @@ impl Connector for FakeAgent {
                 let Some(id) = message.get("id").cloned() else {
                     continue;
                 };
-                let session = message["params"]["sessionId"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_owned();
+                let params = &message["params"];
+                let session = params["sessionId"].as_str().unwrap_or("").to_owned();
                 let mut out = Vec::new();
                 let result = match message["method"].as_str().unwrap_or("") {
                     "initialize" => json!({"protocolVersion": 1,
                     "agentCapabilities": {"loadSession": true},
                     "authMethods": [
-                        {"id": "chatgpt", "name": "Sign in with ChatGPT"},
-                        {"type": "terminal", "id": "setup", "name": "Set up", "args": ["--setup"]}
+                        {"id": "api-key", "name": "API Key"},
+                        {"id": "chat-gpt", "name": "ChatGPT"}
                     ]}),
                     "authenticate" => json!({}),
-                    "session/new" => json!({"sessionId": "agent-session-1"}),
+                    "session/new" => {
+                        let n = seen
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|m| m["method"] == "session/new")
+                            .count();
+                        json!({"sessionId": format!("s{n}"), "configOptions": [model_option("gpt-a")]})
+                    }
+                    "session/set_config_option" => {
+                        let value = params["value"].as_str().unwrap_or("");
+                        json!({"configOptions": [model_option(value)]})
+                    }
                     "session/load" => {
                         out.push(
                             json!({"jsonrpc": "2.0", "method": "session/update", "params": {
@@ -62,14 +75,6 @@ impl Connector for FakeAgent {
                             "content": {"type": "text", "text": "from before"}}}}),
                         );
                         json!({})
-                    }
-                    "session/prompt" => {
-                        out.push(
-                            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
-                            "sessionId": session, "update": {"sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": "ok"}}}}),
-                        );
-                        json!({"stopReason": "end_turn"})
                     }
                     _ => json!(null),
                 };
@@ -94,88 +99,102 @@ impl Connector for FakeAgent {
     }
 }
 
-/// Approves everything and counts requests.
-#[derive(Default)]
-struct CountingHost(Mutex<usize>);
-
-#[async_trait]
-impl HostServices for CountingHost {
-    async fn interact(&self, _request: InteractionRequest) -> InteractionOutcome {
-        *self.0.lock().unwrap() += 1;
-        InteractionOutcome::Cancelled
-    }
-}
-
-fn entry() -> AgentEntry {
-    serde_json::from_value(
-        json!({"id": "fake", "name": "Fake", "command": "fake-agent", "args": ["acp"]}),
-    )
+fn subscription() -> AgentEntry {
+    serde_json::from_value(json!({
+        "id": "sub", "name": "Sub", "label": "Sub Plus (subscription)",
+        "command": "fake-agent", "homeEnv": "FAKE_HOME", "authMethod": "chat-gpt"
+    }))
     .unwrap()
 }
 
-fn manager(dir: &Path, seen: &Arc<Mutex<Vec<Value>>>) -> AgentManager {
-    AgentManager::with_connector(
-        vec![entry()],
+fn manager(dir: &Path) -> (AgentManager, Seen, Env) {
+    let agent = FakeAgent::default();
+    let seen = Arc::clone(&agent.seen);
+    let env = Arc::clone(&agent.env);
+    let manager = AgentManager::with_connector(
+        vec![subscription()],
         dir.to_path_buf(),
         dir,
-        Arc::new(FakeAgent {
-            seen: Arc::clone(seen),
-            env: Arc::default(),
-        }),
-    )
-}
-
-#[tokio::test]
-async fn new_session_is_recorded_and_prompts_work() {
-    let dir = tempfile::tempdir().unwrap();
-    let seen = Arc::default();
-    let agents = manager(dir.path(), &seen);
-    agents.set_host(Arc::new(CountingHost::default()));
-
-    let (backend, session) = agents.new_session("fake").await.unwrap();
-    assert_eq!(session.native_id, "agent-session-1");
-    let record = find_recorded_session(dir.path(), "agent-session-1").unwrap();
-    assert_eq!(record.agent, "fake");
-    assert_eq!(record.cwd, dir.path());
-
-    let mut updates = backend.subscribe();
-    let turn = backend
-        .prompt(&session, vec![ContentBlock::text("hi")])
-        .await
-        .unwrap();
-    assert_eq!(
-        turn.outcome().await,
-        TurnOutcome::Completed(StopReason::EndTurn)
+        Arc::new(agent),
     );
-    let mut text = String::new();
-    while let Ok(Ok(envelope)) =
-        tokio::time::timeout(Duration::from_millis(100), updates.recv()).await
-    {
-        if let SessionUpdate::MessageChunk {
-            role: Role::Agent,
-            content,
-            ..
-        } = envelope.update
-        {
-            text.push_str(content.as_text().unwrap_or_default());
-        }
-    }
-    assert_eq!(text, "ok");
-    agents.shutdown().await;
+    (manager, seen, env)
+}
+
+fn sent(seen: &Seen, method: &str) -> Vec<Value> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m["method"] == method)
+        .cloned()
+        .collect()
 }
 
 #[tokio::test]
-async fn resume_reopens_the_recorded_session_with_replay() {
+async fn sign_in_uses_the_declared_method_and_caches_models() {
     let dir = tempfile::tempdir().unwrap();
-    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
-    let agents = manager(dir.path(), &seen);
-    agents.new_session("fake").await.unwrap();
-    let record = agents.find_session("agent-session-1").unwrap();
+    let (agents, seen, env) = manager(dir.path());
 
-    let backend = agents.backend("fake").await.unwrap();
+    assert!(!agents.is_signed_in("sub"));
+    let err = agents.new_session("sub", None).await.unwrap_err();
+    assert!(
+        err.to_string().contains("/login → Sub Plus (subscription)"),
+        "{err}"
+    );
+
+    assert_eq!(agents.sign_in("sub").await.unwrap(), 2);
+    assert!(agents.is_signed_in("sub"));
+    let auth = sent(&seen, "authenticate");
+    assert_eq!(auth.len(), 1);
+    assert_eq!(
+        auth[0]["params"]["methodId"], "chat-gpt",
+        "never the API-key method"
+    );
+    let models: Vec<_> = agents.models("sub").into_iter().map(|m| m.id).collect();
+    assert_eq!(models, ["gpt-a", "gpt-b"]);
+
+    let home = dir.path().join("agents").join("sub").join("home");
+    assert!(home.is_dir());
+    assert!(env
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(k, v)| k == "FAKE_HOME" && Path::new(v) == home));
+}
+
+#[tokio::test]
+async fn sessions_start_on_the_chosen_model_and_are_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agents, seen, _) = manager(dir.path());
+    agents.sign_in("sub").await.unwrap();
+
+    let (backend, session) = agents.new_session("sub", Some("gpt-b")).await.unwrap();
+    let set = sent(&seen, "session/set_config_option");
+    assert_eq!(set.last().unwrap()["params"]["value"], "gpt-b");
+    let current = backend
+        .model_control()
+        .unwrap()
+        .models(&session)
+        .await
+        .unwrap()
+        .current;
+    assert_eq!(current.as_deref(), Some("gpt-b"));
+
+    let record = find_recorded_session(dir.path(), &session.native_id).unwrap();
+    assert_eq!(record.agent, "sub");
+    assert!(agents.new_session("sub", Some("gpt-z")).await.is_err());
+}
+
+#[tokio::test]
+async fn resume_replays_the_recorded_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agents, _, _) = manager(dir.path());
+    agents.sign_in("sub").await.unwrap();
+    let (_, session) = agents.new_session("sub", None).await.unwrap();
+    let record = agents.find_session(&session.native_id).unwrap();
+
+    let backend = agents.backend("sub").await.unwrap();
     let mut updates = backend.subscribe();
-    let (_, session) = agents.resume(&record).await.unwrap();
-    assert_eq!(session.native_id, "agent-session-1");
+    agents.resume(&record).await.unwrap();
     let mut replayed = Vec::new();
     while let Ok(Ok(envelope)) =
         tokio::time::timeout(Duration::from_millis(100), updates.recv()).await
@@ -185,84 +204,24 @@ async fn resume_reopens_the_recorded_session_with_replay() {
     assert!(replayed.iter().all(|e| e.origin == Origin::Replay));
     assert!(replayed.iter().any(|e| matches!(&e.update,
         SessionUpdate::MessageChunk { content, .. } if content.as_text() == Some("from before"))));
-    let load = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|m| m["method"] == "session/load")
-        .cloned()
-        .unwrap();
-    assert_eq!(load["params"]["sessionId"], "agent-session-1");
 }
 
 #[tokio::test]
-async fn sign_in_methods_and_both_kinds_of_sign_in() {
+async fn sign_out_forgets_everything() {
     let dir = tempfile::tempdir().unwrap();
-    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
-    let agents = manager(dir.path(), &seen);
-
-    let methods = agents.auth_methods("fake").await.unwrap();
-    assert_eq!(methods.len(), 2);
-    assert!(!methods[0].in_terminal);
-    assert!(methods[1].in_terminal);
-
-    // Agent-handled: an ACP authenticate call.
-    assert_eq!(agents.authenticate("fake", "chatgpt").await.unwrap(), None);
-    assert!(seen
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|m| m["method"] == "authenticate" && m["params"]["methodId"] == "chatgpt"));
-    // Terminal: the command for the user to run.
-    assert_eq!(
-        agents
-            .authenticate("fake", "setup")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("fake-agent acp --setup")
-    );
-    assert!(agents.authenticate("fake", "nope").await.is_err());
+    let (agents, _, _) = manager(dir.path());
+    agents.sign_in("sub").await.unwrap();
+    agents.sign_out("sub").await.unwrap();
+    assert!(!agents.is_signed_in("sub"));
+    assert!(agents.models("sub").is_empty());
+    assert!(!dir.path().join("agents").join("sub").exists());
 }
 
 #[tokio::test]
-async fn unknown_agent_is_an_error() {
+async fn unknown_subscription_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    let agents = manager(dir.path(), &Arc::default());
+    let (agents, _, _) = manager(dir.path());
     let err = agents.backend("nope").await.unwrap_err();
-    assert!(err.to_string().contains("no agent named `nope`"));
-}
-
-#[tokio::test]
-async fn sign_in_agents_need_login_and_get_a_private_home() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut gated = entry();
-    gated.sign_in = true;
-    gated.home_env = Some("FAKE_HOME".into());
-    let env: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
-    let agents = AgentManager::with_connector(
-        vec![gated],
-        dir.path().to_path_buf(),
-        dir.path(),
-        Arc::new(FakeAgent {
-            seen: Arc::default(),
-            env: Arc::clone(&env),
-        }),
-    );
-    assert!(!agents.is_signed_in("fake"));
-    assert_eq!(agents.sign_in_agents().len(), 1);
-    let err = agents.new_session("fake").await.unwrap_err();
-    assert!(err.to_string().contains("/login"), "{err}");
-
-    agents.authenticate("fake", "chatgpt").await.unwrap();
-    assert!(agents.is_signed_in("fake"));
-    agents.new_session("fake").await.unwrap();
-
-    let home = dir.path().join("agents").join("fake").join("home");
-    assert!(home.is_dir());
-    assert!(env
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|(k, v)| k == "FAKE_HOME" && Path::new(v) == home));
+    assert!(err.to_string().contains("no subscription"));
+    assert!(!agents.is_signed_in("nope"));
 }

@@ -1,5 +1,5 @@
-//! `/login` wizard: pick a provider and enter its key, or pick an external
-//! agent (such as Codex on a ChatGPT plan) and one of its sign-in methods.
+//! `/login` wizard: pick an API-key provider and enter its key, or pick a
+//! subscription (such as ChatGPT Plus/Pro) and sign in to it.
 //!
 //! Pure state machine; the app acts on the resulting [`LoginChoice`].
 
@@ -47,60 +47,37 @@ impl PartialEq for LoginTarget {
 
 impl Eq for LoginTarget {}
 
-/// An external agent that signs in through `/login`.
+/// A subscription offered in `/login`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRow {
-    /// Agent id.
+    /// Subscription id (the provider id in `provider/model`).
     pub id: String,
-    /// Display name.
-    pub name: String,
-}
-
-/// One of an agent's sign-in methods.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MethodRow {
-    /// The agent's id for the method.
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// The user runs a command in a terminal instead of the agent handling it.
-    pub in_terminal: bool,
+    /// Row label, such as "ChatGPT Plus/Pro (Codex subscription)".
+    pub label: String,
+    /// Already signed in.
+    pub configured: bool,
 }
 
 /// What the finished wizard asks the app to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginChoice {
-    /// Connect a model provider.
+    /// Connect an API-key provider.
     Provider(ProviderLoginRequest),
-    /// Ask the agent for its sign-in methods, then show [`ProviderSetup::AgentMethod`].
-    AgentMethods(AgentRow),
-    /// Sign in to the agent with this method.
-    AgentSignIn {
-        /// The agent.
-        agent: AgentRow,
-        /// Method id.
-        method: String,
-    },
+    /// Sign in to a subscription.
+    Subscription(AgentRow),
 }
 
 /// Current step of the wizard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSetup {
-    /// Choose a preset, an agent or Custom.
+    /// Choose a provider, a subscription or Custom.
     Choose {
         /// Highlighted row.
         selected: usize,
-        /// Agents listed after the presets.
+        /// Subscriptions listed after the API-key presets.
         agents: Vec<AgentRow>,
-    },
-    /// Choose how to sign in to an agent.
-    AgentMethod {
-        /// The agent.
-        agent: AgentRow,
-        /// Its methods.
-        methods: Vec<MethodRow>,
-        /// Highlighted row.
-        selected: usize,
+        /// Preset ids that already have a key.
+        connected: Vec<String>,
     },
     /// Custom provider name.
     CustomName,
@@ -121,12 +98,18 @@ pub type Transition = crate::wizard::Transition<ProviderSetup, LoginChoice>;
 
 impl ProviderSetup {
     /// Start the wizard; `provider` (`/login openrouter`, `/login custom`)
-    /// skips the picker, and an agent id (`/login codex`) highlights it.
-    pub fn start(provider: Option<&str>, agents: Vec<AgentRow>) -> Result<Self, String> {
+    /// skips the picker, and a subscription id (`/login chatgpt`) highlights
+    /// it. `connected` lists preset ids that already have a key.
+    pub fn start(
+        provider: Option<&str>,
+        agents: Vec<AgentRow>,
+        connected: Vec<String>,
+    ) -> Result<Self, String> {
         match provider.map(str::trim).filter(|p| !p.is_empty()) {
             None => Ok(Self::Choose {
                 selected: 0,
                 agents,
+                connected,
             }),
             Some(p) if p.eq_ignore_ascii_case(CUSTOM_PROVIDER) => Ok(Self::CustomName),
             Some(p) => {
@@ -139,19 +122,11 @@ impl ProviderSetup {
                     Some(i) => Ok(Self::Choose {
                         selected: PROVIDER_PRESETS.len() + i,
                         agents,
+                        connected,
                     }),
                     None => Err(format!("unknown provider `{p}`. {}", login_usage(&agents))),
                 }
             }
-        }
-    }
-
-    /// The method picker for `agent`.
-    pub fn agent_methods(agent: AgentRow, methods: Vec<MethodRow>) -> Self {
-        Self::AgentMethod {
-            agent,
-            methods,
-            selected: 0,
         }
     }
 
@@ -164,6 +139,7 @@ impl ProviderSetup {
                     return Self::Choose {
                         selected: 0,
                         agents: Vec::new(),
+                        connected: Vec::new(),
                     }
                 }
             },
@@ -183,14 +159,16 @@ impl ProviderSetup {
     pub fn submit(self, input: &str) -> Transition {
         let value = input.trim().to_string();
         match self {
-            Self::Choose { selected, agents } => {
+            Self::Choose {
+                selected, agents, ..
+            } => {
                 let step = match PROVIDER_PRESETS.get(selected) {
                     Some(preset) => Self::ApiKey {
                         target: LoginTarget::Preset(preset),
                     },
                     None => match agents.get(selected - PROVIDER_PRESETS.len()) {
                         Some(agent) => {
-                            return Transition::Done(LoginChoice::AgentMethods(agent.clone()))
+                            return Transition::Done(LoginChoice::Subscription(agent.clone()))
                         }
                         None => Self::CustomName,
                     },
@@ -200,22 +178,6 @@ impl ProviderSetup {
                     prefill: String::new(),
                 }
             }
-            Self::AgentMethod {
-                agent,
-                methods,
-                selected,
-            } => match methods.get(selected) {
-                Some(method) => Transition::Done(LoginChoice::AgentSignIn {
-                    method: method.id.clone(),
-                    agent,
-                }),
-                None => Self::AgentMethod {
-                    agent,
-                    methods,
-                    selected: 0,
-                }
-                .retry("choose a sign-in method"),
-            },
             Self::CustomName => {
                 let id = slugify(&value);
                 if id.is_empty() {
@@ -287,8 +249,7 @@ pub fn login_usage(agents: &[AgentRow]) -> String {
 impl WizardView for ProviderSetup {
     fn title(&self) -> String {
         match self {
-            Self::Choose { .. } => "Connect a model provider or agent".into(),
-            Self::AgentMethod { agent, .. } => format!("Sign in to {}", agent.name),
+            Self::Choose { .. } => "Connect a model provider or subscription".into(),
             Self::CustomName => "Connect a custom provider · step 1 of 3".into(),
             Self::CustomBaseUrl { .. } => "Connect a custom provider · step 2 of 3".into(),
             Self::ApiKey {
@@ -303,10 +264,6 @@ impl WizardView for ProviderSetup {
     fn instructions(&self) -> String {
         match self {
             Self::Choose { .. } => "Choose where Loop sends model requests".into(),
-            Self::AgentMethod { agent, .. } => format!(
-                "Choose how to sign in. {} handles it and may open your browser",
-                agent.name
-            ),
             Self::CustomName => "A name for this provider, e.g. Together, Groq or LM Studio".into(),
             Self::CustomBaseUrl { name } => {
                 format!("Base URL of {name}'s OpenAI-compatible API, including the version path")
@@ -327,7 +284,7 @@ impl WizardView for ProviderSetup {
 
     fn placeholder(&self) -> &'static str {
         match self {
-            Self::Choose { .. } | Self::AgentMethod { .. } => " ↑↓ to choose, enter to continue",
+            Self::Choose { .. } => " ↑↓ to choose, enter to continue",
             Self::CustomName => " e.g. Together",
             Self::CustomBaseUrl { .. } => {
                 " https://api.together.xyz/v1 or http://localhost:11434/v1"
@@ -342,34 +299,35 @@ impl WizardView for ProviderSetup {
     }
 
     fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
+        let state = |configured: bool| {
+            if configured {
+                "configured"
+            } else {
+                "not configured"
+            }
+        };
         match self {
-            Self::Choose { selected, agents } => Some((
+            Self::Choose {
+                selected,
+                agents,
+                connected,
+            } => Some((
                 PROVIDER_PRESETS
                     .iter()
-                    .map(|p| (p.name.to_owned(), p.description.to_owned()))
+                    .map(|p| {
+                        let configured = connected.iter().any(|c| c == p.id);
+                        (
+                            format!("{} · api key", p.name),
+                            format!("{} · {}", state(configured), p.description),
+                        )
+                    })
                     .chain(agents.iter().map(|a| {
                         (
-                            a.name.clone(),
-                            format!("external agent · signs in with `/login {}`", a.id),
+                            format!("{} · subscription", a.label),
+                            state(a.configured).to_owned(),
                         )
                     }))
                     .chain([(CUSTOM_LABEL.to_owned(), CUSTOM_DESCRIPTION.to_owned())])
-                    .collect(),
-                *selected,
-            )),
-            Self::AgentMethod {
-                methods, selected, ..
-            } => Some((
-                methods
-                    .iter()
-                    .map(|m| {
-                        let how = if m.in_terminal {
-                            "run a command in a terminal"
-                        } else {
-                            "handled by the agent"
-                        };
-                        (m.name.clone(), how.to_owned())
-                    })
                     .collect(),
                 *selected,
             )),
@@ -387,16 +345,11 @@ impl WizardView for ProviderSetup {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        match self {
-            Self::Choose { selected, agents } => {
-                *selected = wrap_selection(*selected, delta, Self::row_count(agents));
-            }
-            Self::AgentMethod {
-                selected, methods, ..
-            } => {
-                *selected = wrap_selection(*selected, delta, methods.len().max(1));
-            }
-            _ => {}
+        if let Self::Choose {
+            selected, agents, ..
+        } = self
+        {
+            *selected = wrap_selection(*selected, delta, Self::row_count(agents));
         }
     }
 }
@@ -421,10 +374,18 @@ mod tests {
 
     #[test]
     fn picker_lists_presets_then_custom_with_soket_first() {
-        let step = ProviderSetup::start(None, Vec::new()).unwrap();
+        let step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         let (rows, selected) = step.options().unwrap();
         let labels: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(labels, ["Soket", "OpenRouter", "OpenAI", "Custom"]);
+        assert_eq!(
+            labels,
+            [
+                "Soket · api key",
+                "OpenRouter · api key",
+                "OpenAI · api key",
+                "Custom"
+            ]
+        );
         assert_eq!(selected, 0);
         assert!(!step.masked());
     }
@@ -434,20 +395,22 @@ mod tests {
         let mut step = ProviderSetup::Choose {
             selected: 0,
             agents: Vec::new(),
+            connected: Vec::new(),
         };
         step.move_selection(-1);
         assert_eq!(
             step,
             ProviderSetup::Choose {
                 selected: 3,
-                agents: Vec::new()
+                agents: Vec::new(),
+                connected: Vec::new(),
             }
         );
     }
 
     #[test]
     fn openrouter_flow() {
-        let mut step = ProviderSetup::start(None, Vec::new()).unwrap();
+        let mut step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         step.move_selection(1);
         let key = next(step.submit(""));
         assert!(key.masked());
@@ -466,7 +429,7 @@ mod tests {
 
     #[test]
     fn custom_flow_allows_empty_key_and_validates() {
-        let step = ProviderSetup::start(Some("custom"), Vec::new()).unwrap();
+        let step = ProviderSetup::start(Some("custom"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(step, ProviderSetup::CustomName);
         assert!(retry_error(ProviderSetup::CustomName.submit("!!")).contains("letters"));
         assert!(retry_error(ProviderSetup::CustomName.submit("OpenAI")).contains("built-in"));
@@ -487,9 +450,9 @@ mod tests {
 
     #[test]
     fn start_with_argument_skips_the_picker() {
-        let step = ProviderSetup::start(Some("OpenAI"), Vec::new()).unwrap();
+        let step = ProviderSetup::start(Some("OpenAI"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(step.title(), "Connect OpenAI");
-        let err = ProviderSetup::start(Some("groq"), Vec::new()).unwrap_err();
+        let err = ProviderSetup::start(Some("groq"), Vec::new(), Vec::new()).unwrap_err();
         assert!(
             err.contains("Usage: /login [soket|openrouter|openai|custom]"),
             "{err}"
@@ -516,61 +479,33 @@ mod tests {
         ));
     }
 
-    fn codex() -> AgentRow {
+    fn chatgpt(configured: bool) -> AgentRow {
         AgentRow {
-            id: "codex".into(),
-            name: "Codex (ChatGPT plan)".into(),
+            id: "chatgpt".into(),
+            label: "ChatGPT Plus/Pro (Codex subscription)".into(),
+            configured,
         }
     }
 
     #[test]
-    fn agents_are_listed_and_signed_in_with_a_chosen_method() {
-        let step = ProviderSetup::start(None, vec![codex()]).unwrap();
+    fn subscriptions_are_rows_with_their_state_and_sign_in_directly() {
+        let step = ProviderSetup::start(None, vec![chatgpt(false)], vec!["openai".into()]).unwrap();
         let (rows, _) = step.options().unwrap();
-        let labels: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(rows[2].0, "OpenAI · api key");
+        assert!(rows[2].1.starts_with("configured"));
         assert_eq!(
-            labels,
-            [
-                "Soket",
-                "OpenRouter",
-                "OpenAI",
-                "Codex (ChatGPT plan)",
-                "Custom"
-            ]
+            rows[3].0,
+            "ChatGPT Plus/Pro (Codex subscription) · subscription"
         );
+        assert_eq!(rows[3].1, "not configured");
+        assert_eq!(rows[4].0, "Custom");
 
-        let step = ProviderSetup::start(Some("codex"), vec![codex()]).unwrap();
+        let step = ProviderSetup::start(Some("chatgpt"), vec![chatgpt(false)], Vec::new()).unwrap();
         assert_eq!(
             step.submit(""),
-            Transition::Done(LoginChoice::AgentMethods(codex()))
+            Transition::Done(LoginChoice::Subscription(chatgpt(false)))
         );
-
-        let mut methods = ProviderSetup::agent_methods(
-            codex(),
-            vec![
-                MethodRow {
-                    id: "chatgpt".into(),
-                    name: "Sign in with ChatGPT".into(),
-                    in_terminal: false,
-                },
-                MethodRow {
-                    id: "api-key".into(),
-                    name: "Use an API key".into(),
-                    in_terminal: false,
-                },
-            ],
-        );
-        assert_eq!(methods.title(), "Sign in to Codex (ChatGPT plan)");
-        methods.move_selection(1);
-        methods.move_selection(1);
-        assert_eq!(
-            methods.submit(""),
-            Transition::Done(LoginChoice::AgentSignIn {
-                agent: codex(),
-                method: "chatgpt".into()
-            })
-        );
-        let err = ProviderSetup::start(Some("nope"), vec![codex()]).unwrap_err();
-        assert!(err.contains("openai|codex|custom"), "{err}");
+        let err = ProviderSetup::start(Some("nope"), vec![chatgpt(true)], Vec::new()).unwrap_err();
+        assert!(err.contains("openai|chatgpt|custom"), "{err}");
     }
 }

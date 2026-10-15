@@ -110,8 +110,9 @@ mod tests {
 
     #[test]
     fn provider_prompt_delegates_to_login_wizard() {
-        let prompt = SetupPrompt::Provider(ProviderSetup::start(None, Vec::new()).unwrap());
-        assert_eq!(prompt.title(), "Connect a model provider or agent");
+        let prompt =
+            SetupPrompt::Provider(ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap());
+        assert_eq!(prompt.title(), "Connect a model provider or subscription");
         assert!(prompt.options().is_some());
         assert!(prompt.esc_quits(true));
         assert!(!prompt.esc_quits(false));
@@ -119,7 +120,9 @@ mod tests {
         assert!(prompt.status_hint(false).starts_with("login · ↑↓ choose"));
         assert!(prompt.status_hint(true).ends_with("esc quit"));
 
-        let key = SetupPrompt::Provider(ProviderSetup::start(Some("openai"), Vec::new()).unwrap());
+        let key = SetupPrompt::Provider(
+            ProviderSetup::start(Some("openai"), Vec::new(), Vec::new()).unwrap(),
+        );
         assert!(key.masked());
         assert_eq!(key.env_hint(), None);
         assert!(key.status_hint(false).contains("enter save"));

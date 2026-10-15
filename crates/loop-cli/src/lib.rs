@@ -43,8 +43,13 @@ pub struct CliRuntime {
 /// An external agent to start when the surface is ready.
 #[derive(Debug, Clone)]
 pub enum PendingAgent {
-    /// Open a new session with this agent id.
-    New(String),
+    /// Open a new session with this subscription, on this model.
+    New {
+        /// Subscription id.
+        id: String,
+        /// Model id; `None` keeps the agent's default.
+        model: Option<String>,
+    },
     /// Reopen this recorded session.
     Resume(loop_app_core::agents::AgentSessionRecord),
 }

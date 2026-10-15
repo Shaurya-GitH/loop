@@ -58,6 +58,8 @@ pub struct Runtime {
     pub agents: Arc<crate::agents::AgentManager>,
     /// The external agent prompts go to, or `None` for Loop's own agent.
     pub active_agent: Option<String>,
+    /// The model chosen for the active subscription, when one was chosen.
+    pub agent_model: Option<String>,
     /// Theme.
     pub theme: Theme,
     /// Resources.
@@ -95,23 +97,47 @@ impl Runtime {
         self.active_agent.is_none()
     }
 
-    /// Make `backend`'s `session` the active one, with external agent `id`.
+    /// Whether `provider` is a subscription served by an external agent.
+    pub fn is_subscription(&self, provider: &str) -> bool {
+        self.agents.entry(provider).is_some()
+    }
+
+    /// Make `backend`'s `session` the active one, for subscription `id`
+    /// running `model`.
     pub fn adopt_agent(
         &mut self,
         id: &str,
         backend: Arc<dyn loop_protocol::AgentBackend>,
         session: loop_protocol::SessionRef,
+        model: Option<String>,
     ) {
         self.backend = backend;
         self.session_id = session.native_id;
         self.active_agent = Some(id.to_owned());
+        self.agent_model = model;
     }
 
-    /// Start a new session with external agent `id` and make it active.
-    pub async fn use_agent(&mut self, id: &str) -> anyhow::Result<()> {
-        let (backend, session) = self.agents.new_session(id).await?;
-        self.adopt_agent(id, backend, session);
+    /// Start a new session with subscription `id` (on `model`, when given)
+    /// and make it active.
+    pub async fn use_agent(&mut self, id: &str, model: Option<&str>) -> anyhow::Result<()> {
+        let (backend, session) = self.agents.new_session(id, model).await?;
+        self.adopt_agent(id, backend, session, model.map(str::to_owned));
         Ok(())
+    }
+
+    /// Save `provider/model` as the default for the next start.
+    pub fn remember_model(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
+        self.settings.set_selected_model(provider, model);
+        self.save_settings()
+    }
+
+    /// `provider/model` of what prompts go to, with the kind of access.
+    pub fn active_model_label(&self) -> Option<String> {
+        match (&self.active_agent, &self.agent_model) {
+            (Some(agent), Some(model)) => Some(format!("{agent}/{model} · subscription")),
+            (Some(agent), None) => Some(format!("{agent} · subscription")),
+            (None, _) => self.selected_model_spec(),
+        }
     }
 
     /// Reopen a recorded external-agent session and make it active. The
@@ -123,7 +149,7 @@ impl Runtime {
         let previous = std::mem::replace(&mut self.session_id, record.id.clone());
         match self.agents.resume(record).await {
             Ok((backend, session)) => {
-                self.adopt_agent(&record.agent, backend, session);
+                self.adopt_agent(&record.agent, backend, session, None);
                 Ok(())
             }
             Err(e) => {
@@ -138,12 +164,16 @@ impl Runtime {
         self.backend = self.native.clone();
         self.session_id = self.harness.session_id().await;
         self.active_agent = None;
+        self.agent_model = None;
     }
 
     /// Start a new session with the active agent.
     pub async fn new_session(&mut self) -> anyhow::Result<()> {
         match self.active_agent.clone() {
-            Some(id) => self.use_agent(&id).await,
+            Some(id) => {
+                let model = self.agent_model.clone();
+                self.use_agent(&id, model.as_deref()).await
+            }
             None => {
                 let session = self
                     .backend
@@ -679,8 +709,18 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     }
 
     let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
-    // An external agent brings its own model access.
+    let agents = Arc::new(crate::agents::AgentManager::new(
+        crate::agents::agent_entries(&settings.agents),
+        opts.cwd.clone(),
+        &agent_dir,
+    ));
+    // A signed-in subscription is a connected provider too.
+    let subscribed = agents
+        .entries()
+        .iter()
+        .any(|e| e.auth_method.is_some() && agents.is_signed_in(&e.id));
     let needs_provider_setup = opts.agent.is_none()
+        && !subscribed
         && ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
 
     let models = build_models(&agent_dir, Arc::clone(&credentials), &settings.providers)?;
@@ -712,9 +752,13 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         });
     }
 
+    // A saved subscription model is started by the surface, not Loop's agent.
+    let saved = settings
+        .selected_model()
+        .filter(|(provider, _)| agents.entry(provider).is_none());
     let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
         &models,
-        settings.selected_model(),
+        saved,
         opts.provider.as_deref(),
         opts.model.as_deref(),
     )? {
@@ -848,11 +892,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
-    let agents = Arc::new(crate::agents::AgentManager::new(
-        crate::agents::agent_entries(&settings.agents),
-        opts.cwd.clone(),
-        &agent_dir,
-    ));
 
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
@@ -905,6 +944,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         native,
         agents,
         active_agent: None,
+        agent_model: None,
         theme,
         resources,
         project_trusted,

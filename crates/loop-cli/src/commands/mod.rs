@@ -148,11 +148,6 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[list|enable <name>|disable <name>]"),
         },
         SlashCommand {
-            name: "agent",
-            description: "Run an external agent (Codex, Claude, Gemini, …) or Loop's own",
-            args_hint: Some("[<id>|off]"),
-        },
-        SlashCommand {
             name: "mcp",
             description: "Enable, disable, or authorize MCP server connections",
             args_hint: Some(
@@ -373,9 +368,6 @@ pub enum CommandEffect {
     CloneSession,
     /// MCP sub-command.
     Mcp(McpCommand),
-    /// External agent control; the arguments are parsed with
-    /// [`parse_agent`] once the agent registry is at hand.
-    Agent(String),
     /// Multi-agent workflow from a goal string.
     #[cfg(feature = "orchestration")]
     Workflow {
@@ -449,31 +441,6 @@ pub enum McpCommand {
     Login(String),
     /// Delete saved OAuth tokens for a remote server.
     Logout(String),
-}
-
-/// `/agent` subcommands.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentCommand {
-    /// List agents and show which is active.
-    List,
-    /// Switch to an external agent (new session).
-    Use(String),
-    /// Switch back to Loop's own agent.
-    Off,
-}
-
-const AGENT_USAGE: &str = "Usage: /agent [<id>|off] — no args lists agents · sign in with /login";
-
-/// Parse `/agent` arguments; `Err` carries the usage text.
-pub fn parse_agent(args: &str) -> Result<AgentCommand, String> {
-    let words: Vec<&str> = args.split_whitespace().collect();
-    match words.as_slice() {
-        [] | ["list"] => Ok(AgentCommand::List),
-        ["off"] | ["loop"] => Ok(AgentCommand::Off),
-        ["login", ..] => Err("Sign in to agents with /login".into()),
-        [id] => Ok(AgentCommand::Use((*id).to_owned())),
-        _ => Err(AGENT_USAGE.into()),
-    }
 }
 
 const MCP_USAGE: &str = "Usage: /mcp [list|reload|login <name>|logout <name>|enable <name>|disable <name>] — no args opens a picker";
@@ -619,7 +586,6 @@ pub fn dispatch(
         "scoped-models" => CommandEffect::ScopedModels,
         "fork" => CommandEffect::Fork,
         "clone" => CommandEffect::CloneSession,
-        "agent" => CommandEffect::Agent(cmd.args.clone()),
         "mcp" => match parse_mcp(&cmd.args) {
             Ok(command) => CommandEffect::Mcp(command),
             Err(usage) => CommandEffect::Status(usage),
@@ -726,19 +692,5 @@ mod tests {
         assert!(parse_mcp("enable").is_err());
         assert!(parse_mcp("login").is_err());
         assert!(parse_mcp("nope").is_err());
-    }
-}
-
-#[cfg(test)]
-mod agent_command_tests {
-    use super::*;
-
-    #[test]
-    fn agent_subcommands() {
-        assert_eq!(parse_agent(""), Ok(AgentCommand::List));
-        assert_eq!(parse_agent("off"), Ok(AgentCommand::Off));
-        assert_eq!(parse_agent("codex"), Ok(AgentCommand::Use("codex".into())));
-        assert!(parse_agent("login codex").unwrap_err().contains("/login"));
-        assert!(parse_agent("a b").is_err());
     }
 }
