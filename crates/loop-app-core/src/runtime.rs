@@ -60,6 +60,8 @@ pub struct Runtime {
     pub active_agent: Option<String>,
     /// The model chosen for the active subscription, when one was chosen.
     pub agent_model: Option<String>,
+    /// The active subscription's reasoning effort, when it has one.
+    pub agent_effort: Option<String>,
     /// Theme.
     pub theme: Theme,
     /// Resources.
@@ -115,6 +117,89 @@ impl Runtime {
         self.session_id = session.native_id;
         self.active_agent = Some(id.to_owned());
         self.agent_model = model;
+        self.agent_effort = None;
+    }
+
+    /// Read the active subscription's current reasoning effort into
+    /// [`Self::agent_effort`].
+    pub async fn sync_agent_effort(&mut self) {
+        self.agent_effort = match self.backend.model_control() {
+            Some(control) if !self.is_native() => control
+                .efforts(&self.session_ref())
+                .await
+                .ok()
+                .and_then(|e| e.current),
+            _ => None,
+        };
+    }
+
+    /// The reasoning effort levels on offer, and the current one.
+    pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
+        if self.is_native() {
+            let levels = NATIVE_EFFORTS.iter().map(|l| (*l).to_owned()).collect();
+            let current = self.settings.default_thinking_level.to_lowercase();
+            return Ok((levels, current));
+        }
+        let control = self
+            .backend
+            .model_control()
+            .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?;
+        let choices = control.efforts(&self.session_ref()).await?;
+        let levels = choices.models.into_iter().map(|m| m.id).collect();
+        Ok((levels, choices.current.unwrap_or_default()))
+    }
+
+    /// Set the reasoning effort to `level` and remember it for the next
+    /// session. Returns the level set.
+    pub async fn set_effort(&mut self, level: &str) -> anyhow::Result<String> {
+        let level = level.trim().to_lowercase();
+        let (levels, _) = self.efforts().await?;
+        if !levels.contains(&level) {
+            anyhow::bail!(
+                "unknown effort `{level}`; choose one of: {}",
+                levels.join(", ")
+            );
+        }
+        match self.active_agent.clone() {
+            None => {
+                self.harness
+                    .set_thinking_level(parse_thinking(&level))
+                    .await;
+                self.settings.default_thinking_level = level.clone();
+                self.save_settings()?;
+            }
+            Some(id) => {
+                if let Some(control) = self.backend.model_control() {
+                    control.set_effort(&self.session_ref(), &level).await?;
+                }
+                self.agents.remember_effort(&id, &level)?;
+                self.agent_effort = Some(level.clone());
+            }
+        }
+        Ok(level)
+    }
+
+    /// Step to the next reasoning effort (wrapping). Loop's own agent cycles
+    /// off → low → medium → high.
+    pub async fn cycle_effort(&mut self) -> anyhow::Result<String> {
+        let (levels, current) = if self.is_native() {
+            let levels: Vec<String> = ["off", "low", "medium", "high"]
+                .iter()
+                .map(|l| (*l).to_owned())
+                .collect();
+            (levels, self.settings.default_thinking_level.to_lowercase())
+        } else {
+            self.efforts().await?
+        };
+        let next = levels
+            .iter()
+            .position(|l| *l == current)
+            .map_or(0, |i| (i + 1) % levels.len());
+        let level = levels
+            .get(next)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no reasoning effort levels on offer"))?;
+        self.set_effort(&level).await
     }
 
     /// Start a new session with subscription `id` (on `model`, when given)
@@ -122,6 +207,7 @@ impl Runtime {
     pub async fn use_agent(&mut self, id: &str, model: Option<&str>) -> anyhow::Result<()> {
         let (backend, session) = self.agents.new_session(id, model).await?;
         self.adopt_agent(id, backend, session, model.map(str::to_owned));
+        self.sync_agent_effort().await;
         Ok(())
     }
 
@@ -134,8 +220,16 @@ impl Runtime {
     /// `provider/model` of what prompts go to, with the kind of access.
     pub fn active_model_label(&self) -> Option<String> {
         match (&self.active_agent, &self.agent_model) {
-            (Some(agent), Some(model)) => Some(format!("{agent}/{model} · subscription")),
-            (Some(agent), None) => Some(format!("{agent} · subscription")),
+            (Some(agent), model) => {
+                let mut label = agent.clone();
+                if let Some(model) = model {
+                    label = format!("{label}/{model}");
+                }
+                if let Some(effort) = &self.agent_effort {
+                    label = format!("{label} · {effort}");
+                }
+                Some(format!("{label} · subscription"))
+            }
             (None, _) => self.selected_model_spec(),
         }
     }
@@ -150,6 +244,7 @@ impl Runtime {
         match self.agents.resume(record).await {
             Ok((backend, session)) => {
                 self.adopt_agent(&record.agent, backend, session, None);
+                self.sync_agent_effort().await;
                 Ok(())
             }
             Err(e) => {
@@ -165,6 +260,7 @@ impl Runtime {
         self.session_id = self.harness.session_id().await;
         self.active_agent = None;
         self.agent_model = None;
+        self.agent_effort = None;
     }
 
     /// Start a new session with the active agent.
@@ -665,6 +761,9 @@ pub fn resolve_trust(
     }
 }
 
+/// Reasoning effort levels of Loop's own agent, as `/effort` names them.
+const NATIVE_EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 fn parse_thinking(s: &str) -> AgentThinkingLevel {
     match s.to_lowercase().as_str() {
         "minimal" => AgentThinkingLevel::Minimal,
@@ -945,6 +1044,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         agents,
         active_agent: None,
         agent_model: None,
+        agent_effort: None,
         theme,
         resources,
         project_trusted,

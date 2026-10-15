@@ -85,7 +85,7 @@ Type `!ls -la` (or any shell command) to run it in the current sandbox/host envi
 | `ctrl+c` | Clear (twice quits) |
 | `ctrl+l` | Model picker |
 | `ctrl+p` | Cycle models |
-| `shift+tab` | Cycle thinking |
+| `shift+tab` | Cycle reasoning effort (also `/effort [level]`) |
 | `ctrl+t` | Toggle thinking visibility |
 | `ctrl+x` | Copy last assistant message |
 | `ctrl+g` | External editor (`$EDITOR`) |

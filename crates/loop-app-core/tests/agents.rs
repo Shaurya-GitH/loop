@@ -23,10 +23,15 @@ struct FakeAgent {
     env: Env,
 }
 
-fn model_option(current: &str) -> Value {
-    json!({"id": "model", "name": "Model", "category": "model", "type": "select",
-        "currentValue": current,
-        "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B"}]})
+fn config_options(model: &str, effort: &str) -> Value {
+    json!([
+        {"id": "model", "name": "Model", "category": "model", "type": "select",
+        "currentValue": model,
+        "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B"}]},
+        {"id": "effort", "name": "Reasoning", "category": "thought_level", "type": "select",
+        "currentValue": effort,
+        "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
+    ])
 }
 
 #[async_trait]
@@ -62,11 +67,15 @@ impl Connector for FakeAgent {
                             .iter()
                             .filter(|m| m["method"] == "session/new")
                             .count();
-                        json!({"sessionId": format!("s{n}"), "configOptions": [model_option("gpt-a")]})
+                        json!({"sessionId": format!("s{n}"), "configOptions": config_options("gpt-a", "low")})
                     }
                     "session/set_config_option" => {
                         let value = params["value"].as_str().unwrap_or("");
-                        json!({"configOptions": [model_option(value)]})
+                        let options = match params["configId"].as_str() {
+                            Some("effort") => config_options("gpt-a", value),
+                            _ => config_options(value, "low"),
+                        };
+                        json!({"configOptions": options})
                     }
                     "session/load" => {
                         out.push(
@@ -204,6 +213,31 @@ async fn resume_replays_the_recorded_session() {
     assert!(replayed.iter().all(|e| e.origin == Origin::Replay));
     assert!(replayed.iter().any(|e| matches!(&e.update,
         SessionUpdate::MessageChunk { content, .. } if content.as_text() == Some("from before"))));
+}
+
+#[tokio::test]
+async fn new_sessions_reuse_the_remembered_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agents, seen, _) = manager(dir.path());
+    agents.sign_in("sub").await.unwrap();
+    assert_eq!(agents.effort("sub"), None);
+
+    agents.remember_effort("sub", "high").unwrap();
+    assert_eq!(agents.effort("sub").as_deref(), Some("high"));
+    let (backend, session) = agents.new_session("sub", None).await.unwrap();
+    let efforts = backend
+        .model_control()
+        .unwrap()
+        .efforts(&session)
+        .await
+        .unwrap();
+    assert_eq!(efforts.current.as_deref(), Some("high"));
+
+    // An effort the model does not offer is left alone.
+    agents.remember_effort("sub", "ultra").unwrap();
+    let before = sent(&seen, "session/set_config_option").len();
+    agents.new_session("sub", None).await.unwrap();
+    assert_eq!(sent(&seen, "session/set_config_option").len(), before);
 }
 
 #[tokio::test]

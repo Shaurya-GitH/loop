@@ -324,6 +324,16 @@ impl AgentManager {
                 .ok_or_else(|| anyhow!("{id} does not let Loop choose its model"))?;
             control.set_model(&session, model).await?;
         }
+        // Carry the last chosen effort over when this model offers it.
+        if let (Some(effort), Some(control)) = (self.effort(id), backend.model_control()) {
+            let offered = control
+                .efforts(&session)
+                .await
+                .is_ok_and(|e| e.models.iter().any(|m| m.id == effort));
+            if offered {
+                let _ = control.set_effort(&session, &effort).await;
+            }
+        }
         self.record(AgentSessionRecord {
             id: session.native_id.clone(),
             agent: id.to_owned(),
@@ -422,6 +432,26 @@ impl AgentManager {
 
     fn marker(&self, id: &str) -> PathBuf {
         self.state_dir.join(id).join("signed-in")
+    }
+
+    /// The reasoning effort last chosen for subscription `id`.
+    pub fn effort(&self, id: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.effort_path(id)).ok()?;
+        Some(text.trim().to_owned()).filter(|e| !e.is_empty())
+    }
+
+    /// Save `effort` for the next session with subscription `id`.
+    pub fn remember_effort(&self, id: &str, effort: &str) -> anyhow::Result<()> {
+        let path = self.effort_path(id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, effort)?;
+        Ok(())
+    }
+
+    fn effort_path(&self, id: &str) -> PathBuf {
+        self.state_dir.join(id).join("effort")
     }
 
     fn models_path(&self, id: &str) -> PathBuf {

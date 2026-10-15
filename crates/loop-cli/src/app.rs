@@ -21,7 +21,6 @@ use loop_agent::harness::{
     format_prompt_template_invocation, KrunSandbox, Sandbox, SandboxMode, SessionForkPoint,
     SessionForkSelection,
 };
-use loop_agent::types::AgentThinkingLevel;
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, ModelsRefreshOptions, Usage};
 use loop_app_core::interaction::{
@@ -1387,6 +1386,7 @@ async fn drain_ui_events(
                     Ok((backend, session)) => {
                         let resumed = runtime.session_id == session.native_id;
                         runtime.adopt_agent(&id, backend, session, model.clone());
+                        runtime.sync_agent_effort().await;
                         if let Some(model) = &model {
                             if let Err(err) = runtime.remember_model(&id, model) {
                                 tracing::warn!("save model selection: {err:#}");
@@ -1411,8 +1411,14 @@ async fn drain_ui_events(
             }
             UiEvent::AgentNote(note) => {
                 let item = match note {
-                    Ok(text) => sys(text),
-                    Err(err) => error_item(err),
+                    Ok(text) => {
+                        *status = "ready · /help for commands".into();
+                        sys(text)
+                    }
+                    Err(err) => {
+                        *status = "login failed".into();
+                        error_item(err)
+                    }
                 };
                 push_before_queued(chat, item);
             }
@@ -1634,7 +1640,10 @@ fn start_agent(
             (record.agent.clone(), None)
         }
     };
-    runtime.starting_agent = Some(id.clone());
+    runtime.starting_agent = Some(match &model {
+        Some(model) => format!("{id}/{model}"),
+        None => id.clone(),
+    });
     let agents = Arc::clone(&runtime.agents);
     let forwarded = Arc::clone(&runtime.forwarded);
     let debug_log = runtime.debug_log_path.clone();
@@ -2622,7 +2631,9 @@ async fn handle_key(
                 if had_work || had_queue {
                     *working = false;
                     turn_step.clear();
-                    *streaming_assistant = None;
+                    // Keep the reply open: text the agent sends before it
+                    // acts on the cancel belongs to it, not to a new reply.
+                    // The turn's end (or the next prompt) closes it.
                     if let Some(idx) = streaming_thinking.take() {
                         if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
                             *done = true;
@@ -2816,7 +2827,10 @@ async fn handle_key(
                 return Ok(());
             }
             Action::ThinkingCycle => {
-                cycle_thinking(runtime, chat).await;
+                match runtime.cycle_effort().await {
+                    Ok(level) => chat.push(sys(format!("effort → {level}"))),
+                    Err(err) => chat.push(error_item(format!("{err:#}"))),
+                }
                 return Ok(());
             }
             Action::ThinkingToggle => {
@@ -4149,6 +4163,23 @@ async fn apply_effect(
                 Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
+        CommandEffect::Effort(None) => match runtime.efforts().await {
+            Ok((levels, current)) => {
+                let levels: Vec<String> = levels
+                    .into_iter()
+                    .map(|l| if l == current { format!("[{l}]") } else { l })
+                    .collect();
+                chat.push(sys(format!(
+                    "reasoning effort: {} — /effort <level> or shift+tab",
+                    levels.join(" ")
+                )));
+            }
+            Err(err) => chat.push(error_item(format!("{err:#}"))),
+        },
+        CommandEffect::Effort(Some(level)) => match runtime.set_effort(&level).await {
+            Ok(level) => chat.push(sys(format!("effort → {level}"))),
+            Err(err) => chat.push(error_item(format!("{err:#}"))),
+        },
         CommandEffect::SetSandbox(mode) => {
             if mode.is_empty() || mode.trim() == "status" {
                 let info = runtime.harness.sandbox_info().await;
@@ -4909,33 +4940,6 @@ async fn choose_model(
         }
         Err(err) => chat.push(error_item(format!("{err:#}"))),
     }
-}
-
-async fn cycle_thinking(runtime: &mut CliRuntime, chat: &mut Vec<ChatItem>) {
-    let order = [
-        AgentThinkingLevel::Off,
-        AgentThinkingLevel::Low,
-        AgentThinkingLevel::Medium,
-        AgentThinkingLevel::High,
-    ];
-    let cur = runtime.settings.default_thinking_level.to_lowercase();
-    let idx = match cur.as_str() {
-        "low" => 1,
-        "medium" => 2,
-        "high" => 3,
-        _ => 0,
-    };
-    let next = order[(idx + 1) % order.len()];
-    let label = match next {
-        AgentThinkingLevel::Off => "off",
-        AgentThinkingLevel::Low => "low",
-        AgentThinkingLevel::Medium => "medium",
-        AgentThinkingLevel::High => "high",
-        _ => "off",
-    };
-    runtime.harness.set_thinking_level(next).await;
-    runtime.settings.default_thinking_level = label.into();
-    chat.push(sys(format!("thinking → {label}")));
 }
 
 fn copy_last_assistant(chat: &[ChatItem], status: &mut String) {

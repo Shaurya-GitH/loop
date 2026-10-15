@@ -144,7 +144,7 @@ pub enum TurnOutcome { Completed(StopReason), Cancelled, Failed(ErrorInfo), Unce
 
 // Optional, typed service interfaces. A backend exposes the ones it supports. Callers ask
 // `backend.service::<dyn T>()`, not a capability flag, so a missing operation can't be called by accident.
-pub trait ModelControl  { async fn models(&self) -> Result<Vec<ModelInfo>>; async fn set_model(&self, s, m) -> Result<()>; async fn set_thinking(&self, s, lvl) -> Result<()>; }
+pub trait ModelControl  { async fn models(&self) -> Result<Vec<ModelInfo>>; async fn set_model(&self, s, m) -> Result<()>; async fn efforts(&self, s) -> Result<Vec<Effort>>; async fn set_effort(&self, s, lvl) -> Result<()>; }
 pub trait ModeControl   { async fn set_mode(&self, s, mode) -> Result<()>; }
 pub trait Compaction    { async fn compact(&self, s, instructions: Option<String>) -> Result<()>; }
 pub trait Forking       { async fn fork_points(&self, s) -> Result<Vec<ForkPoint>>; async fn fork(&self, s, at) -> Result<SessionRef>; }
@@ -187,6 +187,7 @@ To the user, an external agent is a **subscription provider**. It is not a separ
 **Sign-in, models and sign-out:**
 - Sign-in runs ACP `authenticate` with the declared method, then reads the models from a session's `model` config option and caches them for `/model`.
 - `ModelControl` switches models with `session/set_config_option`.
+- `ModelControl` also sets the reasoning effort from the session's `thought_level` config option (for Codex: low … ultra). `/effort [level]` and Shift+Tab use it for subscriptions and Loop's own models alike; a subscription's last effort is saved in `<agent dir>/agents/<id>/effort` and applied to new sessions when the model offers it.
 - `/logout <id>` deletes the private home, the marker and the model cache.
 
 ### Sessions

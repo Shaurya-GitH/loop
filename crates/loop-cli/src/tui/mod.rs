@@ -264,8 +264,11 @@ pub fn welcome_lines(
     let border = theme.style("border");
     let rows: Vec<(&str, String)> = match (agent, model) {
         (Some(agent), _) => vec![
-            ("Agent", agent.to_string()),
-            ("Session", "opens when the agent is ready".to_string()),
+            ("Model", format!("{agent} · subscription")),
+            (
+                "Session",
+                "opens when the subscription is ready".to_string(),
+            ),
         ],
         (None, Some(model)) => vec![
             ("Provider", model.provider.clone()),
@@ -1117,6 +1120,13 @@ fn setup_lines(
         )),
     ];
     if let Some((rows, selected)) = prompt.options() {
+        let width = rows
+            .iter()
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(14)
+            + 2;
         for (i, (label, description)) in rows.into_iter().enumerate() {
             let (marker, label_style) = if i == selected {
                 ("  ▸ ", theme.accent().add_modifier(Modifier::BOLD))
@@ -1125,7 +1135,7 @@ fn setup_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(marker.to_string(), theme.accent()),
-                Span::styled(format!("{label:<16}"), label_style),
+                Span::styled(format!("{label:<width$}"), label_style),
                 Span::styled(description.to_string(), theme.dim()),
             ]));
         }
