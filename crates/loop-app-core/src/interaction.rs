@@ -137,53 +137,63 @@ pub fn approval_kind(kind: Option<ToolKind>) -> ApprovalKind {
 
 /// Answers a permission request from a three-choice picker
 /// (accept / accept for session / reject), using the backend's own option
-/// ids. A choice the backend did not offer falls back to the nearest one it
-/// did; with no matching option the request is cancelled.
+/// ids and labels. Each choice maps only to an option of the same meaning;
+/// a choice the backend did not offer is shown as unavailable and falls
+/// back to cancelling, never to an option with a different scope.
 #[derive(Debug)]
 pub struct ApprovalReply {
     respond: oneshot::Sender<InteractionOutcome>,
-    accept: Option<String>,
-    accept_session: Option<String>,
-    reject: Option<String>,
+    accept: Option<PermissionOption>,
+    accept_session: Option<PermissionOption>,
+    reject: Option<PermissionOption>,
 }
 
 impl ApprovalReply {
     /// A reply for `options`, answered through `respond`.
     pub fn new(options: &[PermissionOption], respond: oneshot::Sender<InteractionOutcome>) -> Self {
-        let find = |kinds: &[PermissionKind]| {
-            kinds.iter().find_map(|kind| {
-                options
-                    .iter()
-                    .find(|o| o.kind_hint == *kind)
-                    .map(|o| o.native_id.clone())
-            })
-        };
+        let find = |kind: PermissionKind| options.iter().find(|o| o.kind_hint == kind).cloned();
         Self {
             respond,
-            accept: find(&[PermissionKind::AllowOnce, PermissionKind::AllowAlways]),
-            accept_session: find(&[PermissionKind::AllowAlways]),
-            reject: find(&[PermissionKind::RejectOnce, PermissionKind::RejectAlways]),
+            accept: find(PermissionKind::AllowOnce),
+            accept_session: find(PermissionKind::AllowAlways),
+            reject: find(PermissionKind::RejectOnce).or_else(|| find(PermissionKind::RejectAlways)),
         }
     }
 
-    /// Whether the backend offers a "for this session" choice.
-    pub fn offers_accept_session(&self) -> bool {
-        self.accept_session.is_some()
+    /// Label for the "accept" row.
+    pub fn accept_label(&self) -> String {
+        label(&self.accept, "Accept (not offered)")
     }
 
-    /// Send the user's decision.
+    /// Label for the "accept for this session" row.
+    pub fn accept_session_label(&self) -> String {
+        label(&self.accept_session, "Accept always (not offered)")
+    }
+
+    /// Send the user's decision. A choice the backend did not offer cancels
+    /// the request rather than picking an option with another meaning.
     pub fn send(self, decision: ApprovalDecision) {
         let (choice, note) = match decision {
             ApprovalDecision::Accept => (self.accept, None),
-            ApprovalDecision::AcceptSession => (self.accept_session.or(self.accept), None),
+            ApprovalDecision::AcceptSession => (self.accept_session, None),
             ApprovalDecision::Reject { reason } => (self.reject, reason),
         };
         let outcome = match choice {
-            Some(native_id) => InteractionOutcome::Selected { native_id, note },
+            Some(option) => InteractionOutcome::Selected {
+                native_id: option.native_id,
+                note,
+            },
             None => InteractionOutcome::Cancelled,
         };
         let _ = self.respond.send(outcome);
     }
+}
+
+fn label(option: &Option<PermissionOption>, missing: &str) -> String {
+    option
+        .as_ref()
+        .map(|o| o.label.clone())
+        .unwrap_or_else(|| missing.to_owned())
 }
 
 #[cfg(test)]
@@ -234,9 +244,14 @@ mod tests {
         ];
         let (tx, rx) = oneshot::channel();
         let reply = ApprovalReply::new(&options, tx);
-        assert!(!reply.offers_accept_session());
-        // No "always" option: accepting for the session accepts once.
+        assert_eq!(reply.accept_label(), "Yes");
+        assert_eq!(reply.accept_session_label(), "Accept always (not offered)");
+        // No "always" option: choosing it cancels instead of accepting once.
         reply.send(ApprovalDecision::AcceptSession);
+        assert_eq!(rx.await.unwrap(), InteractionOutcome::Cancelled);
+
+        let (tx, rx) = oneshot::channel();
+        ApprovalReply::new(&options, tx).send(ApprovalDecision::Accept);
         assert_eq!(
             rx.await.unwrap(),
             InteractionOutcome::Selected {

@@ -139,6 +139,7 @@ pub enum PickerView {
         path: String,
         /// 0 = Accept, 1 = Accept all (session), 2 = Reject.
         selected: usize,
+        accept_label: String,
         accept_all_label: String,
         reason: String,
         reason_focused: bool,
@@ -1040,6 +1041,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
         PickerView::FileReview {
             path,
             selected,
+            accept_label,
             accept_all_label,
             reason,
             reason_focused,
@@ -1071,7 +1073,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                         theme.style("text").add_modifier(Modifier::BOLD),
                     ),
                 ]),
-                opt(0, "Accept", "success"),
+                opt(0, accept_label, "success"),
                 opt(1, accept_all_label, "success"),
                 opt(2, "Reject", "error"),
                 Line::from(Span::styled(reason_line, theme.muted())),
