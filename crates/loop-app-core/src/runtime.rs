@@ -121,24 +121,28 @@ impl Runtime {
     }
 
     /// Read the active subscription's current reasoning effort into
-    /// [`Self::agent_effort`].
+    /// [`Self::agent_effort`], and its model into [`Self::agent_model`] when
+    /// Loop did not choose one (a resumed session).
     pub async fn sync_agent_effort(&mut self) {
-        self.agent_effort = match self.backend.model_control() {
-            Some(control) if !self.is_native() => control
-                .efforts(&self.session_ref())
-                .await
-                .ok()
-                .and_then(|e| e.current),
-            _ => None,
+        let session = self.session_ref();
+        let Some(control) = self.backend.model_control().filter(|_| !self.is_native()) else {
+            self.agent_effort = None;
+            return;
         };
+        self.agent_effort = control.efforts(&session).await.ok().and_then(|e| e.current);
+        if self.agent_model.is_none() {
+            self.agent_model = control.models(&session).await.ok().and_then(|m| m.current);
+        }
     }
 
     /// The reasoning effort levels on offer, and the current one.
     pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
         if self.is_native() {
-            let levels = NATIVE_EFFORTS.iter().map(|l| (*l).to_owned()).collect();
             let current = self.settings.default_thinking_level.to_lowercase();
-            return Ok((levels, current));
+            return Ok((
+                native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS),
+                current,
+            ));
         }
         let control = self
             .backend
@@ -183,10 +187,10 @@ impl Runtime {
     /// off → low → medium → high.
     pub async fn cycle_effort(&mut self) -> anyhow::Result<String> {
         let (levels, current) = if self.is_native() {
-            let levels: Vec<String> = ["off", "low", "medium", "high"]
-                .iter()
-                .map(|l| (*l).to_owned())
-                .collect();
+            let levels = native_efforts(
+                self.selected_model.as_ref(),
+                &["off", "low", "medium", "high"],
+            );
             (levels, self.settings.default_thinking_level.to_lowercase())
         } else {
             self.efforts().await?
@@ -764,6 +768,27 @@ pub fn resolve_trust(
 /// Reasoning effort levels of Loop's own agent, as `/effort` names them.
 const NATIVE_EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// The levels of `candidates` that `model` accepts: only `off` for a model
+/// without reasoning, and none its thinking map marks unsupported.
+fn native_efforts(model: Option<&loop_ai::Model>, candidates: &[&str]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|level| {
+            let Some(model) = model else {
+                return true;
+            };
+            let Some(reasoning) = parse_thinking(level).to_reasoning() else {
+                return true; // "off" is always available
+            };
+            model.reasoning
+                && model.thinking_level_map.as_ref().is_none_or(|map| {
+                    map.get(&loop_ai::ModelThinkingLevel::from(reasoning)) != Some(&None)
+                })
+        })
+        .map(|level| (*level).to_owned())
+        .collect()
+}
+
 fn parse_thinking(s: &str) -> AgentThinkingLevel {
     match s.to_lowercase().as_str() {
         "minimal" => AgentThinkingLevel::Minimal,
@@ -1120,4 +1145,26 @@ pub fn mcp_server_entries(
         });
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_efforts_follow_the_model() {
+        let all = ["off", "low", "high"];
+        let mut model = loop_ai::providers::soket_seed_models().remove(0);
+        assert_eq!(native_efforts(Some(&model), &all), ["off", "low", "high"]);
+
+        model.thinking_level_map = Some(std::collections::HashMap::from([(
+            loop_ai::ModelThinkingLevel::High,
+            None,
+        )]));
+        assert_eq!(native_efforts(Some(&model), &all), ["off", "low"]);
+
+        model.reasoning = false;
+        assert_eq!(native_efforts(Some(&model), &all), ["off"]);
+        assert_eq!(native_efforts(None, &all), ["off", "low", "high"]);
+    }
 }

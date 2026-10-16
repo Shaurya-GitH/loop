@@ -66,6 +66,8 @@ enum UiEvent {
     Update(Box<UpdateEnvelope>),
     /// The backend refused to start a turn (no update was emitted for it).
     TurnFailed(String),
+    /// The turn's outcome is unknown: the agent was lost mid-turn.
+    TurnUncertain,
     /// A subscription's agent started (or failed to).
     AgentReady {
         id: String,
@@ -1436,6 +1438,17 @@ async fn drain_ui_events(
                 };
                 push_before_queued(chat, item);
             }
+            // Backends normally end an uncertain turn on the update stream;
+            // speak up only when none did.
+            UiEvent::TurnUncertain if !*working => {}
+            UiEvent::TurnUncertain => {
+                *working = false;
+                turn_step.clear();
+                chat.push(error_item(
+                    "error: lost contact with the agent; the turn may be incomplete",
+                ));
+                *status = "error".into();
+            }
             UiEvent::TurnFailed(err) => {
                 *working = false;
                 turn_step.clear();
@@ -1885,9 +1898,7 @@ fn start_user_turn(
             // The update stream reports the turn, including failures.
             Ok(turn) => {
                 if turn.outcome().await == TurnOutcome::Uncertain {
-                    let _ = tx.send(UiEvent::TurnFailed(
-                        "lost contact with the agent; the turn may be incomplete".into(),
-                    ));
+                    let _ = tx.send(UiEvent::TurnUncertain);
                 }
             }
             Err(e) => {
@@ -2656,7 +2667,7 @@ async fn handle_key(
                 return Ok(());
             }
             Action::Clear => {
-                if last_clear.elapsed() < Duration::from_secs(1) {
+                if last_clear.elapsed() < Duration::from_secs(2) {
                     *clear_presses += 1;
                 } else {
                     *clear_presses = 1;
