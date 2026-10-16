@@ -813,6 +813,8 @@ async fn run_loop(
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
+                    warning: (runtime.permission_mode() == PermissionMode::FullAccess)
+                        .then_some(FULL_ACCESS_BANNER),
                 },
             );
         })?;
@@ -4325,6 +4327,7 @@ async fn apply_effect(
             }
         }
         CommandEffect::Permissions(None) => {
+            runtime.confirm_full_access = false;
             let current = runtime.permission_mode();
             let mut lines = vec![format!(
                 "permission mode: {} — /permissions <mode> to switch",
@@ -4341,8 +4344,20 @@ async fn apply_effect(
             chat.push(sys(lines.join("\n")));
         }
         CommandEffect::Permissions(Some(arg)) => match PermissionMode::parse(&arg) {
+            Some(PermissionMode::FullAccess)
+                if runtime.permission_mode() != PermissionMode::FullAccess
+                    && !std::mem::take(&mut runtime.confirm_full_access) =>
+            {
+                runtime.confirm_full_access = true;
+                chat.push(error_item(
+                    "Full access: every tool call runs without asking, including shell \
+                     commands and file deletion. Deny rules and hooks still apply. Run \
+                     /permissions full-access again to confirm.",
+                ));
+            }
             Some(mode) => {
-                runtime.set_permission_mode(mode);
+                runtime.confirm_full_access = false;
+                runtime.set_permission_mode(mode).await;
                 chat.push(sys(format!(
                     "permission mode → {} ({}) for this session",
                     mode.as_str(),
@@ -5132,6 +5147,9 @@ async fn choose_model(
 }
 
 /// Status line after the reasoning effort changes.
+/// Footer banner while every tool call runs without asking.
+const FULL_ACCESS_BANNER: &str = "⚠ full access · tools run without approval";
+
 fn effort_status(runtime: &CliRuntime) -> String {
     match runtime.active_model_label() {
         Some(label) if !runtime.is_native() => format!("ready · {label}"),

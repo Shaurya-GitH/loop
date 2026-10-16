@@ -171,6 +171,9 @@ pub struct FooterOpts<'a> {
     pub model_line: &'a str,
     /// Right of the bottom status row (e.g. `12,345 · 23% · 29,440/128,000`).
     pub usage_line: &'a str,
+    /// Shown in the error colour before the path while it is set, e.g. the
+    /// full-access warning.
+    pub warning: Option<&'a str>,
 }
 
 /// Whether a transcript item is finished and safe to flush into scrollback.
@@ -1239,11 +1242,14 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
+    let warning = opts.warning.map(|w| format!("{w}  ")).unwrap_or_default();
     let top = Line::from(vec![
+        Span::styled(warning.clone(), opts.theme.error()),
         Span::styled(opts.path_line.to_string(), opts.theme.muted()),
         Span::raw(" ".repeat(area.width.saturating_sub(
-            (UnicodeWidthStr::width(opts.path_line) + UnicodeWidthStr::width(opts.model_line))
-                as u16,
+            (UnicodeWidthStr::width(warning.as_str())
+                + UnicodeWidthStr::width(opts.path_line)
+                + UnicodeWidthStr::width(opts.model_line)) as u16,
         ) as usize)),
         Span::styled(opts.model_line.to_string(), opts.theme.muted()),
     ]);
@@ -1965,6 +1971,52 @@ mod tests {
             })
             .collect();
         assert_eq!(errors, ["error: HTTP 401 Unauthorized: Invalid API key"]);
+    }
+
+    #[test]
+    fn the_footer_shows_a_warning_in_the_error_color() {
+        let theme = Theme::dark();
+        let backend = ratatui::backend::TestBackend::new(100, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_footer(
+                    f,
+                    FooterOpts {
+                        theme: &theme,
+                        live_lines: &[],
+                        input: "",
+                        cursor: 0,
+                        working: false,
+                        spinner_frame: 0,
+                        status: "ready",
+                        picker: &PickerView::None,
+                        setup_mode: false,
+                        mask_input: false,
+                        setup_placeholder: "",
+                        path_line: "~/loop",
+                        model_line: "full access · soket/m",
+                        usage_line: "",
+                        warning: Some("⚠ full access"),
+                    },
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let y = rows
+            .iter()
+            .position(|row| row.contains("⚠ full access"))
+            .expect("banner drawn");
+        assert!(rows[y].contains("~/loop"));
+        let x = rows[y].chars().position(|c| c == '⚠').unwrap() as u16;
+        assert_eq!(buffer[(x, y as u16)].fg, theme.error().fg.unwrap());
     }
 
     #[test]

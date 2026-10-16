@@ -235,6 +235,7 @@ impl Runtime {
         let (backend, session) = self.agents.new_session(id, model).await?;
         self.adopt_agent(id, backend, session, model.map(str::to_owned));
         self.sync_agent_effort().await;
+        self.sync_agent_mode().await;
         Ok(())
     }
 
@@ -272,6 +273,7 @@ impl Runtime {
             Ok((backend, session)) => {
                 self.adopt_agent(&record.agent, backend, session, None);
                 self.sync_agent_effort().await;
+                self.sync_agent_mode().await;
                 Ok(())
             }
             Err(e) => {
@@ -574,9 +576,34 @@ impl Runtime {
         self.tool_gate.mode()
     }
 
-    /// Switch the permission mode for the rest of this run.
-    pub fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
+    /// Switch the permission mode for the rest of this run, including the
+    /// active subscription agent's own mode.
+    pub async fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
         self.tool_gate.set_mode(mode);
+        self.sync_agent_mode().await;
+    }
+
+    /// Set the active external agent's own mode from Loop's permission mode,
+    /// when the agent offers one. Returns the agent mode now in effect.
+    pub async fn sync_agent_mode(&mut self) -> Option<String> {
+        if self.is_native() {
+            return None;
+        }
+        let session = self.session_ref();
+        let control = self.backend.model_control()?;
+        let offered = control.modes(&session).await.ok()?;
+        let wanted = self
+            .permission_mode()
+            .agent_modes()
+            .iter()
+            .find(|m| offered.models.iter().any(|o| o.id == **m))?;
+        if offered.current.as_deref() != Some(*wanted) {
+            if let Err(e) = control.set_mode(&session, wanted).await {
+                tracing::warn!("could not set the agent's mode to {wanted}: {e}");
+                return offered.current;
+            }
+        }
+        Some((*wanted).to_owned())
     }
 
     /// Status of Loop's web tools, distinct from external agents' own tools.
@@ -1345,6 +1372,13 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     )?;
     tool_gate.set_mode(mode);
     startup_notices.extend(mode_notice);
+    if mode == crate::permissions::PermissionMode::FullAccess {
+        startup_notices.push(
+            "⚠ full access: every tool call runs without asking, including shell commands \
+             and file deletion (deny rules and hooks still apply)"
+                .into(),
+        );
+    }
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
         tracing::info!("extension: {n}");
