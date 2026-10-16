@@ -373,6 +373,9 @@ impl AgentBackend for NativeBackend {
             let result = harness.prompt(input).await;
             drop(slot);
             let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
+            // A run that returned a message already ended its turn on the
+            // stream, even when the message is an error.
+            let ran = result.is_ok();
             let outcome = match result {
                 Ok(message) => match message.as_assistant().map(turn_outcome) {
                     Some((StopReason::Cancelled, _)) => TurnOutcome::Cancelled,
@@ -399,7 +402,7 @@ impl AgentBackend for NativeBackend {
                 TurnOutcome::Failed(info) if rejected_busy => {
                     let _ = updates.send(error_notice(&instance, &stream, info));
                 }
-                TurnOutcome::Failed(info) => {
+                TurnOutcome::Failed(info) if !ran => {
                     for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
                         let _ = updates.send(envelope);
                     }
