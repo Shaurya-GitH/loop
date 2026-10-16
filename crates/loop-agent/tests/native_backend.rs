@@ -298,3 +298,39 @@ async fn a_busy_rejection_leaves_the_running_turn_open() {
         "only the direct turn ends, normally"
     );
 }
+
+#[tokio::test]
+async fn a_provider_error_is_reported_once() {
+    let backend = backend(
+        vec![FauxResponse::Error("HTTP 400 bad request".into())],
+        vec![],
+    )
+    .await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    let handle = backend.prompt(&session, text("hi")).await.unwrap();
+    assert!(matches!(handle.outcome().await, TurnOutcome::Failed(_)));
+    let mut updates: Vec<_> = collect_turn(&mut rx)
+        .await
+        .into_iter()
+        .map(|e| e.update)
+        .collect();
+    // Anything sent after the turn's end.
+    while let Ok(Ok(envelope)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+        updates.push(envelope.update);
+    }
+    let reports = updates
+        .iter()
+        .filter(|u| {
+            matches!(u, SessionUpdate::TurnEnded { error: Some(_), .. })
+                || matches!(
+                    u,
+                    SessionUpdate::Notice {
+                        level: loop_protocol::NoticeLevel::Error,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(reports, 1, "{updates:?}");
+}
