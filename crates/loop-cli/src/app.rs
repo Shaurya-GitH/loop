@@ -548,7 +548,7 @@ async fn run_loop(
 
         let model_line = match runtime.active_model_label() {
             Some(label) if !runtime.is_native() => label,
-            Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
+            Some(spec) => format!("{spec} · {}", runtime.native_effort()),
             None => NO_MODEL_LABEL.to_string(),
         };
 
@@ -5021,10 +5021,7 @@ async fn choose_model(
 fn effort_status(runtime: &CliRuntime) -> String {
     match runtime.active_model_label() {
         Some(label) if !runtime.is_native() => format!("ready · {label}"),
-        Some(spec) => format!(
-            "ready · {spec} · {}",
-            runtime.settings.default_thinking_level
-        ),
+        Some(spec) => format!("ready · {spec} · {}", runtime.native_effort()),
         None => "ready".into(),
     }
 }

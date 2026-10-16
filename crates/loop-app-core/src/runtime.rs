@@ -135,10 +135,21 @@ impl Runtime {
         }
     }
 
+    /// The reasoning effort Loop's own agent uses with the selected model:
+    /// the saved level, or `off` when the model does not accept it.
+    pub fn native_effort(&self) -> String {
+        let saved = self.settings.default_thinking_level.to_lowercase();
+        if native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS).contains(&saved) {
+            saved
+        } else {
+            "off".into()
+        }
+    }
+
     /// The reasoning effort levels on offer, and the current one.
     pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
         if self.is_native() {
-            let current = self.settings.default_thinking_level.to_lowercase();
+            let current = self.native_effort();
             return Ok((
                 native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS),
                 current,
@@ -191,7 +202,7 @@ impl Runtime {
                 self.selected_model.as_ref(),
                 &["off", "low", "medium", "high"],
             );
-            (levels, self.settings.default_thinking_level.to_lowercase())
+            (levels, self.native_effort())
         } else {
             self.efforts().await?
         };
