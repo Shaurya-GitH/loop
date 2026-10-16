@@ -42,6 +42,8 @@
 #![deny(missing_docs)]
 
 pub mod api;
+/// Whether a model's server rejected reasoning parameters in this process.
+pub use api::openai_completions::reasoning_rejected;
 pub mod auth;
 pub mod models;
 pub mod models_store;

@@ -1,6 +1,7 @@
-//! `/login` wizard: pick a provider, then enter its details and API key.
+//! `/login` wizard: pick an API-key provider and enter its key, or pick a
+//! subscription (such as ChatGPT Plus/Pro) and sign in to it.
 //!
-//! Pure state machine; the app connects the resulting [`ProviderLoginRequest`].
+//! Pure state machine; the app acts on the resulting [`LoginChoice`].
 
 use loop_ai::providers::{provider_preset, ProviderPreset, PROVIDER_PRESETS};
 use loop_app_core::config::providers::slugify;
@@ -46,13 +47,37 @@ impl PartialEq for LoginTarget {
 
 impl Eq for LoginTarget {}
 
+/// A subscription offered in `/login`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    /// Subscription id (the provider id in `provider/model`).
+    pub id: String,
+    /// Row label, such as "ChatGPT Plus/Pro (Codex subscription)".
+    pub label: String,
+    /// Already signed in.
+    pub configured: bool,
+}
+
+/// What the finished wizard asks the app to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginChoice {
+    /// Connect an API-key provider.
+    Provider(ProviderLoginRequest),
+    /// Sign in to a subscription.
+    Subscription(AgentRow),
+}
+
 /// Current step of the wizard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSetup {
-    /// Choose a preset or Custom.
+    /// Choose a provider, a subscription or Custom.
     Choose {
         /// Highlighted row.
         selected: usize,
+        /// Subscriptions listed after the API-key presets.
+        agents: Vec<AgentRow>,
+        /// Preset ids that already have a key.
+        connected: Vec<String>,
     },
     /// Custom provider name.
     CustomName,
@@ -69,19 +94,39 @@ pub enum ProviderSetup {
 }
 
 /// Result of submitting an answer to the login wizard.
-pub type Transition = crate::wizard::Transition<ProviderSetup, ProviderLoginRequest>;
+pub type Transition = crate::wizard::Transition<ProviderSetup, LoginChoice>;
 
 impl ProviderSetup {
-    /// Start the wizard; `provider` (`/login openrouter`, `/login custom`) skips the picker.
-    pub fn start(provider: Option<&str>) -> Result<Self, String> {
+    /// Start the wizard; `provider` (`/login openrouter`, `/login custom`)
+    /// skips the picker, and a subscription id (`/login chatgpt`) highlights
+    /// it. `connected` lists preset ids that already have a key.
+    pub fn start(
+        provider: Option<&str>,
+        agents: Vec<AgentRow>,
+        connected: Vec<String>,
+    ) -> Result<Self, String> {
         match provider.map(str::trim).filter(|p| !p.is_empty()) {
-            None => Ok(Self::Choose { selected: 0 }),
+            None => Ok(Self::Choose {
+                selected: 0,
+                agents,
+                connected,
+            }),
             Some(p) if p.eq_ignore_ascii_case(CUSTOM_PROVIDER) => Ok(Self::CustomName),
-            Some(p) => provider_preset(p)
-                .map(|preset| Self::ApiKey {
-                    target: LoginTarget::Preset(preset),
-                })
-                .ok_or_else(|| format!("unknown provider `{p}`. {}", login_usage())),
+            Some(p) => {
+                if let Some(preset) = provider_preset(p) {
+                    return Ok(Self::ApiKey {
+                        target: LoginTarget::Preset(preset),
+                    });
+                }
+                match agents.iter().position(|a| a.id.eq_ignore_ascii_case(p)) {
+                    Some(i) => Ok(Self::Choose {
+                        selected: PROVIDER_PRESETS.len() + i,
+                        agents,
+                        connected,
+                    }),
+                    None => Err(format!("unknown provider `{p}`. {}", login_usage(&agents))),
+                }
+            }
         }
     }
 
@@ -90,7 +135,13 @@ impl ProviderSetup {
         let target = match request {
             ProviderLoginRequest::Preset { id, .. } => match provider_preset(id) {
                 Some(preset) => LoginTarget::Preset(preset),
-                None => return Self::Choose { selected: 0 },
+                None => {
+                    return Self::Choose {
+                        selected: 0,
+                        agents: Vec::new(),
+                        connected: Vec::new(),
+                    }
+                }
             },
             ProviderLoginRequest::Custom { name, base_url, .. } => LoginTarget::Custom {
                 name: name.clone(),
@@ -100,20 +151,27 @@ impl ProviderSetup {
         Self::ApiKey { target }
     }
 
-    fn row_count() -> usize {
-        PROVIDER_PRESETS.len() + 1
+    fn row_count(agents: &[AgentRow]) -> usize {
+        PROVIDER_PRESETS.len() + agents.len() + 1
     }
 
     /// Submit the input line at the current step.
     pub fn submit(self, input: &str) -> Transition {
         let value = input.trim().to_string();
         match self {
-            Self::Choose { selected } => {
+            Self::Choose {
+                selected, agents, ..
+            } => {
                 let step = match PROVIDER_PRESETS.get(selected) {
                     Some(preset) => Self::ApiKey {
                         target: LoginTarget::Preset(preset),
                     },
-                    None => Self::CustomName,
+                    None => match agents.get(selected - PROVIDER_PRESETS.len()) {
+                        Some(agent) => {
+                            return Transition::Done(LoginChoice::Subscription(agent.clone()))
+                        }
+                        None => Self::CustomName,
+                    },
                 };
                 Transition::Next {
                     step,
@@ -155,17 +213,17 @@ impl ProviderSetup {
             .retry(&format!("{} needs an API key", preset.name)),
             Self::ApiKey {
                 target: LoginTarget::Preset(preset),
-            } => Transition::Done(ProviderLoginRequest::Preset {
+            } => Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Preset {
                 id: preset.id.into(),
                 api_key: value,
-            }),
+            })),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, base_url },
-            } => Transition::Done(ProviderLoginRequest::Custom {
+            } => Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Custom {
                 name,
                 base_url,
                 api_key: (!value.is_empty()).then_some(value),
-            }),
+            })),
         }
     }
 
@@ -178,10 +236,11 @@ impl ProviderSetup {
 }
 
 /// Usage line for `/login`.
-pub fn login_usage() -> String {
+pub fn login_usage(agents: &[AgentRow]) -> String {
     let ids: Vec<&str> = PROVIDER_PRESETS
         .iter()
         .map(|p| p.id)
+        .chain(agents.iter().map(|a| a.id.as_str()))
         .chain([CUSTOM_PROVIDER])
         .collect();
     format!("Usage: /login [{}]", ids.join("|"))
@@ -190,7 +249,7 @@ pub fn login_usage() -> String {
 impl WizardView for ProviderSetup {
     fn title(&self) -> String {
         match self {
-            Self::Choose { .. } => "Connect a model provider".into(),
+            Self::Choose { .. } => "Connect a model provider or subscription".into(),
             Self::CustomName => "Connect a custom provider · step 1 of 3".into(),
             Self::CustomBaseUrl { .. } => "Connect a custom provider · step 2 of 3".into(),
             Self::ApiKey {
@@ -239,13 +298,36 @@ impl WizardView for ProviderSetup {
         }
     }
 
-    fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
+        let state = |configured: bool| {
+            if configured {
+                "configured"
+            } else {
+                "not configured"
+            }
+        };
         match self {
-            Self::Choose { selected } => Some((
+            Self::Choose {
+                selected,
+                agents,
+                connected,
+            } => Some((
                 PROVIDER_PRESETS
                     .iter()
-                    .map(|p| (p.name, p.description))
-                    .chain([(CUSTOM_LABEL, CUSTOM_DESCRIPTION)])
+                    .map(|p| {
+                        let configured = connected.iter().any(|c| c == p.id);
+                        (
+                            format!("{} · api key", p.name),
+                            format!("{} · {}", state(configured), p.description),
+                        )
+                    })
+                    .chain(agents.iter().map(|a| {
+                        (
+                            format!("{} · subscription", a.label),
+                            state(a.configured).to_owned(),
+                        )
+                    }))
+                    .chain([(CUSTOM_LABEL.to_owned(), CUSTOM_DESCRIPTION.to_owned())])
                     .collect(),
                 *selected,
             )),
@@ -263,8 +345,11 @@ impl WizardView for ProviderSetup {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if let Self::Choose { selected } = self {
-            *selected = wrap_selection(*selected, delta, Self::row_count());
+        if let Self::Choose {
+            selected, agents, ..
+        } = self
+        {
+            *selected = wrap_selection(*selected, delta, Self::row_count(agents));
         }
     }
 }
@@ -289,24 +374,43 @@ mod tests {
 
     #[test]
     fn picker_lists_presets_then_custom_with_soket_first() {
-        let step = ProviderSetup::start(None).unwrap();
+        let step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         let (rows, selected) = step.options().unwrap();
-        let labels: Vec<_> = rows.iter().map(|r| r.0).collect();
-        assert_eq!(labels, ["Soket", "OpenRouter", "OpenAI", "Custom"]);
+        let labels: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Soket · api key",
+                "OpenRouter · api key",
+                "OpenAI · api key",
+                "Custom"
+            ]
+        );
         assert_eq!(selected, 0);
         assert!(!step.masked());
     }
 
     #[test]
     fn selection_wraps_over_all_rows() {
-        let mut step = ProviderSetup::Choose { selected: 0 };
+        let mut step = ProviderSetup::Choose {
+            selected: 0,
+            agents: Vec::new(),
+            connected: Vec::new(),
+        };
         step.move_selection(-1);
-        assert_eq!(step, ProviderSetup::Choose { selected: 3 });
+        assert_eq!(
+            step,
+            ProviderSetup::Choose {
+                selected: 3,
+                agents: Vec::new(),
+                connected: Vec::new(),
+            }
+        );
     }
 
     #[test]
     fn openrouter_flow() {
-        let mut step = ProviderSetup::start(None).unwrap();
+        let mut step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         step.move_selection(1);
         let key = next(step.submit(""));
         assert!(key.masked());
@@ -316,16 +420,16 @@ mod tests {
         assert!(retry_error(key.clone().submit("  ")).contains("needs an API key"));
         assert_eq!(
             key.submit(" sk-or-1 "),
-            Transition::Done(ProviderLoginRequest::Preset {
+            Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Preset {
                 id: "openrouter".into(),
                 api_key: "sk-or-1".into(),
-            })
+            }))
         );
     }
 
     #[test]
     fn custom_flow_allows_empty_key_and_validates() {
-        let step = ProviderSetup::start(Some("custom")).unwrap();
+        let step = ProviderSetup::start(Some("custom"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(step, ProviderSetup::CustomName);
         assert!(retry_error(ProviderSetup::CustomName.submit("!!")).contains("letters"));
         assert!(retry_error(ProviderSetup::CustomName.submit("OpenAI")).contains("built-in"));
@@ -336,19 +440,19 @@ mod tests {
         assert_eq!(key.title(), "Connect LM Studio · step 3 of 3");
         assert_eq!(
             key.submit(""),
-            Transition::Done(ProviderLoginRequest::Custom {
+            Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Custom {
                 name: "LM Studio".into(),
                 base_url: "http://localhost:1234/v1".into(),
                 api_key: None,
-            })
+            }))
         );
     }
 
     #[test]
     fn start_with_argument_skips_the_picker() {
-        let step = ProviderSetup::start(Some("OpenAI")).unwrap();
+        let step = ProviderSetup::start(Some("OpenAI"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(step.title(), "Connect OpenAI");
-        let err = ProviderSetup::start(Some("groq")).unwrap_err();
+        let err = ProviderSetup::start(Some("groq"), Vec::new(), Vec::new()).unwrap_err();
         assert!(
             err.contains("Usage: /login [soket|openrouter|openai|custom]"),
             "{err}"
@@ -373,5 +477,35 @@ mod tests {
                 target: LoginTarget::Custom { .. }
             }
         ));
+    }
+
+    fn chatgpt(configured: bool) -> AgentRow {
+        AgentRow {
+            id: "chatgpt".into(),
+            label: "ChatGPT Plus/Pro (Codex subscription)".into(),
+            configured,
+        }
+    }
+
+    #[test]
+    fn subscriptions_are_rows_with_their_state_and_sign_in_directly() {
+        let step = ProviderSetup::start(None, vec![chatgpt(false)], vec!["openai".into()]).unwrap();
+        let (rows, _) = step.options().unwrap();
+        assert_eq!(rows[2].0, "OpenAI · api key");
+        assert!(rows[2].1.starts_with("configured"));
+        assert_eq!(
+            rows[3].0,
+            "ChatGPT Plus/Pro (Codex subscription) · subscription"
+        );
+        assert_eq!(rows[3].1, "not configured");
+        assert_eq!(rows[4].0, "Custom");
+
+        let step = ProviderSetup::start(Some("chatgpt"), vec![chatgpt(false)], Vec::new()).unwrap();
+        assert_eq!(
+            step.submit(""),
+            Transition::Done(LoginChoice::Subscription(chatgpt(false)))
+        );
+        let err = ProviderSetup::start(Some("nope"), vec![chatgpt(true)], Vec::new()).unwrap_err();
+        assert!(err.contains("openai|chatgpt|custom"), "{err}");
     }
 }

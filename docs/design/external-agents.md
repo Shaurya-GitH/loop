@@ -144,7 +144,7 @@ pub enum TurnOutcome { Completed(StopReason), Cancelled, Failed(ErrorInfo), Unce
 
 // Optional, typed service interfaces. A backend exposes the ones it supports. Callers ask
 // `backend.service::<dyn T>()`, not a capability flag, so a missing operation can't be called by accident.
-pub trait ModelControl  { async fn models(&self) -> Result<Vec<ModelInfo>>; async fn set_model(&self, s, m) -> Result<()>; async fn set_thinking(&self, s, lvl) -> Result<()>; }
+pub trait ModelControl  { async fn models(&self) -> Result<Vec<ModelInfo>>; async fn set_model(&self, s, m) -> Result<()>; async fn efforts(&self, s) -> Result<Vec<Effort>>; async fn set_effort(&self, s, lvl) -> Result<()>; }
 pub trait ModeControl   { async fn set_mode(&self, s, mode) -> Result<()>; }
 pub trait Compaction    { async fn compact(&self, s, instructions: Option<String>) -> Result<()>; }
 pub trait Forking       { async fn fork_points(&self, s) -> Result<Vec<ForkPoint>>; async fn fork(&self, s, at) -> Result<SessionRef>; }
@@ -173,14 +173,22 @@ pub struct SessionRef { backend: BackendId, native_id: String, cwd: PathBuf, met
   - **Crash restart.** It bumps `generation` and marks **every** session with a live turn as `Uncertain`, because one process may host several sessions. Answers and updates from an older generation are discarded.
   - **Cancel escalation.** It sends `session/cancel` and answers pending interactions with `cancelled`. If no prompt response arrives before a timeout, it kills the process tree, which escalates as above.
 
-### Registry: vendors are data
-Each backend is an entry in Loop settings (`agents`) and in built-in presets: `{id, name, command, args, env, auth_hint}`. Presets:
-- **codex**: `codex-acp` binary, or `npx @agentclientprotocol/codex-acp`.
-- **claude**: `npx @agentclientprotocol/claude-agent-acp`.
-- **gemini**: `gemini --acp`.
-- **hermes**, **opencode**: their ACP commands, verified when adding the presets.
+### Registry: subscriptions are providers
+To the user, an external agent is a **subscription provider**. It is not a separate mode to switch into: it's signed in with `/login`, next to the API-key providers, and its models appear in `/model` as `<subscription>/<model>`. Choosing one of its models starts its ACP agent and routes prompts there; choosing any other model switches back to Loop's own agent. This follows prime-agent, which lists "ChatGPT Plus/Pro (Codex Subscription) · subscription" among its providers.
 
-Users can add any ACP agent without a Loop release. `/login` and `/model` list registered agents and the auth methods each one advertises. The code never branches on a vendor name.
+**Each subscription is data** (`AgentEntry` in settings `agents`, global only):
+- command, args, env;
+- `label` for `/login`;
+- `authMethod`: the agent-handled ACP sign-in method, for ChatGPT `chat-gpt`. The `api-key` method is never used, because OpenAI API keys stay the separate "OpenAI · api key" provider;
+- `homeEnv`: for Codex `CODEX_HOME`, which Loop points at `<agent dir>/agents/<id>/home`, so a standalone Codex sign-in is never reused.
+
+**Built-in:** `chatgpt` (`npx -y @agentclientprotocol/codex-acp`).
+
+**Sign-in, models and sign-out:**
+- Sign-in runs ACP `authenticate` with the declared method, then reads the models from a session's `model` config option and caches them for `/model`.
+- `ModelControl` switches models with `session/set_config_option`.
+- `ModelControl` also sets the reasoning effort from the session's `thought_level` config option (for Codex: low … ultra). `/effort [level]` and Shift+Tab use it for subscriptions and Loop's own models alike; a subscription's last effort is saved in `<agent dir>/agents/<id>/effort` and applied to new sessions when the model offers it.
+- `/logout <id>` deletes the private home, the marker and the model cache.
 
 ### Sessions
 - A Loop session records the backend binding `{backend, native_id, meta}` in a `Custom` entry (`crates/loop-agent/src/session/types.rs:123`; a `PendingSessionWrite::Custom` variant needs adding). It also mirrors the canonical updates for display and `/session`.

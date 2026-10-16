@@ -11,10 +11,13 @@ use loop_agent::{
     AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult,
 };
 use loop_ai::{TextContent, ToolResultContent};
+use loop_protocol::HostServices;
 use parking_lot::Mutex as SyncMutex;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
+
+use crate::interaction::{native_decision, native_permission_request};
 
 /// Label prefix persisted on the session tree for auto-approve.
 pub const AUTO_APPROVE_LABEL_PREFIX: &str = "loop.toolApproval:auto:";
@@ -120,7 +123,7 @@ pub fn approval_group(tool: &str) -> Option<&'static str> {
 }
 
 /// User decision for a pending approval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     /// Accept this one call.
     Accept,
@@ -189,7 +192,7 @@ pub struct ToolApprovalBridge {
     permissions: Arc<SyncMutex<BTreeMap<String, ToolPermission>>>,
     /// Session auto-approve groups (`file`, `bash`, …).
     auto_approve: Arc<SyncMutex<HashSet<String>>>,
-    prompt_tx: mpsc::UnboundedSender<ApprovalPrompt>,
+    prompts: PromptSink,
     env: Arc<dyn ExecutionEnv>,
     diff_editor: Arc<Mutex<Option<String>>>,
     /// When false, skip spawning an external `--diff` editor (desktop reviews in-app).
@@ -197,6 +200,16 @@ pub struct ToolApprovalBridge {
     gate: Arc<Mutex<()>>,
     /// Persist auto-approve labels onto the session (optional).
     persist: Arc<SyncMutex<Option<PersistAutoApprove>>>,
+}
+
+/// Where approval prompts go.
+#[derive(Clone)]
+enum PromptSink {
+    /// Raw prompts for a surface that renders [`ApprovalPrompt`] itself.
+    Prompts(mpsc::UnboundedSender<ApprovalPrompt>),
+    /// Interaction requests through Loop's [`HostServices`], shared with
+    /// every other backend.
+    Host(Arc<dyn HostServices>),
 }
 
 /// Callback used to append a session label (and optionally notify).
@@ -215,19 +228,58 @@ impl ToolApprovalBridge {
     ) -> (Self, mpsc::UnboundedReceiver<ApprovalPrompt>) {
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         (
-            Self {
-                policy_active: Arc::new(std::sync::atomic::AtomicBool::new(policy_active)),
-                permissions: Arc::new(SyncMutex::new(permissions)),
-                auto_approve: Arc::new(SyncMutex::new(session_auto_approve)),
-                prompt_tx,
+            Self::with_sink(
                 env,
-                diff_editor: Arc::new(Mutex::new(diff_editor)),
-                open_external_diff: Arc::new(AtomicBool::new(true)),
-                gate: Arc::new(Mutex::new(())),
-                persist: Arc::new(SyncMutex::new(None)),
-            },
+                diff_editor,
+                policy_active,
+                permissions,
+                session_auto_approve,
+                PromptSink::Prompts(prompt_tx),
+            ),
             prompt_rx,
         )
+    }
+
+    /// Create a bridge that asks through `host` as
+    /// [`InteractionRequest::Permission`](loop_protocol::InteractionRequest)s
+    /// with the options in [`crate::interaction::native_options`].
+    pub fn with_host(
+        env: Arc<dyn ExecutionEnv>,
+        diff_editor: Option<String>,
+        policy_active: bool,
+        permissions: BTreeMap<String, ToolPermission>,
+        session_auto_approve: HashSet<String>,
+        host: Arc<dyn HostServices>,
+    ) -> Self {
+        Self::with_sink(
+            env,
+            diff_editor,
+            policy_active,
+            permissions,
+            session_auto_approve,
+            PromptSink::Host(host),
+        )
+    }
+
+    fn with_sink(
+        env: Arc<dyn ExecutionEnv>,
+        diff_editor: Option<String>,
+        policy_active: bool,
+        permissions: BTreeMap<String, ToolPermission>,
+        session_auto_approve: HashSet<String>,
+        prompts: PromptSink,
+    ) -> Self {
+        Self {
+            policy_active: Arc::new(std::sync::atomic::AtomicBool::new(policy_active)),
+            permissions: Arc::new(SyncMutex::new(permissions)),
+            auto_approve: Arc::new(SyncMutex::new(session_auto_approve)),
+            prompts,
+            env,
+            diff_editor: Arc::new(Mutex::new(diff_editor)),
+            open_external_diff: Arc::new(AtomicBool::new(true)),
+            gate: Arc::new(Mutex::new(())),
+            persist: Arc::new(SyncMutex::new(None)),
+        }
     }
 
     /// Whether file-edit review should spawn an external editor with `--diff`.
@@ -560,22 +612,35 @@ impl ToolApprovalBridge {
         detail: String,
         cancel: Option<&CancellationToken>,
     ) -> ApprovalDecision {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self
-            .prompt_tx
-            .send(ApprovalPrompt {
-                kind,
-                tool_name: tool_name.to_string(),
-                summary,
-                detail,
-                response_tx,
-            })
-            .is_err()
-        {
-            return ApprovalDecision::Reject {
-                reason: Some("approval UI unavailable".into()),
-            };
-        }
+        let response_rx = match &self.prompts {
+            PromptSink::Prompts(tx) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                if tx
+                    .send(ApprovalPrompt {
+                        kind,
+                        tool_name: tool_name.to_string(),
+                        summary,
+                        detail,
+                        response_tx,
+                    })
+                    .is_err()
+                {
+                    return ApprovalDecision::Reject {
+                        reason: Some("approval UI unavailable".into()),
+                    };
+                }
+                response_rx
+            }
+            PromptSink::Host(host) => {
+                let request = native_permission_request(kind, tool_name, summary, detail);
+                let host = Arc::clone(host);
+                let (response_tx, response_rx) = oneshot::channel();
+                tokio::spawn(async move {
+                    let _ = response_tx.send(native_decision(host.interact(request).await));
+                });
+                response_rx
+            }
+        };
 
         tokio::select! {
             biased;

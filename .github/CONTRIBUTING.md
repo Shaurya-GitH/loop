@@ -61,10 +61,12 @@ Loop is a Cargo workspace. Put changes in the narrowest crate that fits.
 
 | Crate | Responsibility |
 |---|---|
+| `loop-protocol` | Versioned event model and `AgentBackend` interface every backend and surface shares |
 | `loop-ai` | Unified LLM provider API (Soket, OpenAI-compatible, OpenRouter, faux test provider) |
 | `loop-agent` | Agent loop, `AgentHarness`, tools, sessions, skills, execution environments, sandbox backends |
 | `loop-orchestration` | Multi-agent orchestration |
 | `loop-mcp` | Model Context Protocol client/server integration |
+| `loop-acp` | Runs any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 | `loop-app-core` | Shared application runtime: config, tool approval, settings |
 | `loop-cli` | The `loop` binary and its ratatui TUI |
 | `loop-desktop` | GPUI desktop app (experimental, nightly toolchain) |
@@ -73,7 +75,9 @@ Loop is a Cargo workspace. Put changes in the narrowest crate that fits.
 
 Dependencies flow one way:
 
-- `loop-ai` is the base.
+- `loop-protocol` is the base for backends and surfaces; it depends on no other Loop crate.
+- `loop-acp` depends only on `loop-protocol`.
+- `loop-ai` is the base of Loop's own agent.
 - `loop-mcp`, `loop-orchestration`, and `loop-telemetry` depend only on `loop-ai`.
 - `loop-agent` composes them, through optional features.
 - `loop-app-core` builds on `loop-agent`.
@@ -86,7 +90,7 @@ Lower crates must not depend on higher ones, and a library crate must never depe
 | Tool | Requirement |
 |---|---|
 | Rust | Latest **stable** via [rustup](https://rustup.rs/), with `rustfmt` and `clippy` components |
-| MSRV | **1.85** (`rust-version` in the root `Cargo.toml`). Do not use language or `std` features newer than this without raising the MSRV in a dedicated PR. |
+| MSRV | **1.88** (`rust-version` in the root `Cargo.toml`). Do not use language or `std` features newer than this without raising the MSRV in a dedicated PR. |
 | Git | 2.30+ (for `rebase --signoff`) |
 | Podman | Optional. Linux only, needed to work on or test the podman/krun sandbox backends |
 

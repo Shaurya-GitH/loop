@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+pub mod backend;
 mod capabilities;
 mod content;
 mod error;
@@ -13,12 +14,19 @@ mod ids;
 mod interaction;
 mod update;
 
+pub use backend::{
+    AgentBackend, BackendError, BackendResult, Compaction, CompactionReport, HostFileSystem,
+    HostServices, HostTerminals, LocalShell, ModelChoice, ModelChoices, ModelControl, SessionRef,
+    SessionSpec, SessionStats, ShellResult, StatsSummary, TerminalExit, TerminalOutput,
+    TerminalRequest, TurnHandle, TurnOutcome,
+};
 pub use capabilities::Capabilities;
 pub use content::ContentBlock;
 pub use error::{ErrorCategory, ErrorInfo};
 pub use ids::{BackendInstanceId, InteractionId, MessageId, SessionKey, ToolCallId, TurnId};
 pub use interaction::{
     Choice, InteractionOutcome, InteractionRequest, PermissionKind, PermissionOption,
+    DECLINE_CHOICE,
 };
 pub use update::{
     NoticeLevel, Origin, PlanEntry, PlanEntryStatus, Role, SessionUpdate, StopReason, ToolCall,

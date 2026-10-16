@@ -107,17 +107,6 @@ pub struct McpServerListing {
     pub disabled: bool,
 }
 
-/// Error line for an assistant message that ended in an error. Aborts (the user's own
-/// esc) stay quiet.
-pub fn assistant_error_item(message: &loop_ai::AssistantMessage) -> Option<ChatItem> {
-    if message.stop_reason != loop_ai::StopReason::Error {
-        return None;
-    }
-    message.failure().map(|error| ChatItem::Error {
-        text: format!("error: {error}"),
-    })
-}
-
 /// One row in a navigable picker (commands / models).
 #[derive(Debug, Clone)]
 pub struct PickerRow {
@@ -150,6 +139,7 @@ pub enum PickerView {
         path: String,
         /// 0 = Accept, 1 = Accept all (session), 2 = Reject.
         selected: usize,
+        accept_label: String,
         accept_all_label: String,
         reason: String,
         reason_focused: bool,
@@ -230,6 +220,7 @@ pub fn welcome_lines(
     theme: &Theme,
     version: &str,
     model: Option<&loop_ai::Model>,
+    agent: Option<&str>,
     model_note: Option<&str>,
     endpoint: &str,
     session_id: &str,
@@ -271,19 +262,31 @@ pub fn welcome_lines(
 
     // Info card
     let border = theme.style("border");
-    let rows: Vec<(&str, String)> = match model {
-        Some(model) => vec![
+    let rows: Vec<(&str, String)> = match (agent, model) {
+        (Some(agent), _) => vec![
+            ("Model", format!("{agent} · subscription")),
+            (
+                "Session",
+                "opens when the subscription is ready".to_string(),
+            ),
+        ],
+        (None, Some(model)) => vec![
             ("Provider", model.provider.clone()),
             ("Model", model.id.clone()),
             ("Endpoint", endpoint.to_string()),
             ("Session", session_id.to_string()),
         ],
-        None => vec![
+        (None, None) => vec![
             ("Model", "none — run /model".to_string()),
             ("Session", session_id.to_string()),
         ],
     };
-    let (dot_style, status_text) = if needs_setup {
+    let (dot_style, status_text) = if let Some(agent) = agent {
+        (
+            theme.style("success"),
+            format!("starting {agent} — /model switches models or providers"),
+        )
+    } else if needs_setup {
         (
             theme.style("warning"),
             "setup — connect a model provider to begin (/login)".to_string(),
@@ -1051,6 +1054,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
         PickerView::FileReview {
             path,
             selected,
+            accept_label,
             accept_all_label,
             reason,
             reason_focused,
@@ -1082,7 +1086,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                         theme.style("text").add_modifier(Modifier::BOLD),
                     ),
                 ]),
-                opt(0, "Accept", "success"),
+                opt(0, accept_label, "success"),
                 opt(1, accept_all_label, "success"),
                 opt(2, "Reject", "error"),
                 Line::from(Span::styled(reason_line, theme.muted())),
@@ -1116,6 +1120,13 @@ fn setup_lines(
         )),
     ];
     if let Some((rows, selected)) = prompt.options() {
+        let width = rows
+            .iter()
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(14)
+            + 2;
         for (i, (label, description)) in rows.into_iter().enumerate() {
             let (marker, label_style) = if i == selected {
                 ("  ▸ ", theme.accent().add_modifier(Modifier::BOLD))
@@ -1124,7 +1135,7 @@ fn setup_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(marker.to_string(), theme.accent()),
-                Span::styled(format!("{label:<16}"), label_style),
+                Span::styled(format!("{label:<width$}"), label_style),
                 Span::styled(description.to_string(), theme.dim()),
             ]));
         }
@@ -1635,177 +1646,6 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
-fn user_message_text(u: &loop_ai::UserMessage) -> String {
-    use loop_ai::{UserContent, UserMessageContent};
-    match &u.content {
-        UserMessageContent::Text(s) => s.clone(),
-        UserMessageContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-fn tool_result_text(tr: &loop_ai::ToolResultMessage) -> String {
-    use loop_ai::ToolResultContent;
-    tr.content
-        .iter()
-        .filter_map(|c| match c {
-            ToolResultContent::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Rebuild the TUI transcript from persisted session messages (for `--resume`).
-pub fn chat_items_from_agent_messages(
-    messages: &[loop_agent::types::AgentMessage],
-) -> Vec<ChatItem> {
-    use loop_agent::types::{AgentMessage, CustomAgentMessage};
-    use loop_ai::{AssistantContent, Message};
-
-    let mut chat = Vec::new();
-    for msg in messages {
-        match msg {
-            AgentMessage::Llm(Message::User(u)) => {
-                let text = user_message_text(u);
-                if !text.is_empty() {
-                    chat.push(ChatItem::User { text });
-                }
-            }
-            AgentMessage::Llm(Message::Assistant(a)) => {
-                for block in &a.content {
-                    match block {
-                        AssistantContent::Thinking(t) => {
-                            if !t.thinking.is_empty() {
-                                chat.push(ChatItem::Thinking {
-                                    text: t.thinking.clone(),
-                                    done: true,
-                                });
-                            }
-                        }
-                        AssistantContent::Text(t) => {
-                            if !t.text.is_empty() {
-                                chat.push(ChatItem::Assistant {
-                                    text: t.text.clone(),
-                                });
-                            }
-                        }
-                        AssistantContent::ToolCall(tc) => {
-                            let detail =
-                                serde_json::to_string_pretty(&tc.arguments).unwrap_or_default();
-                            let summary = tool_args_summary(&tc.name, &tc.arguments);
-                            chat.push(ChatItem::Tool {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                summary,
-                                detail,
-                                status: CardStatus::Pending,
-                            });
-                        }
-                    }
-                }
-                chat.extend(assistant_error_item(a));
-            }
-            AgentMessage::Llm(Message::ToolResult(tr)) => {
-                let result_text = tool_result_text(tr);
-                let st = if tr.is_error {
-                    CardStatus::Error
-                } else {
-                    CardStatus::Success
-                };
-                if let Some(idx) = find_tool_index(&chat, &tr.tool_call_id) {
-                    if let Some(ChatItem::Tool {
-                        name,
-                        detail,
-                        status,
-                        summary,
-                        ..
-                    }) = chat.get_mut(idx)
-                    {
-                        *name = tr.tool_name.clone();
-                        *status = st;
-                        if !result_text.is_empty() {
-                            if detail.is_empty() {
-                                *detail = result_text;
-                            } else {
-                                detail.push_str("\n---\n");
-                                detail.push_str(&result_text);
-                            }
-                        }
-                        if summary.is_empty() {
-                            *summary = if tr.is_error {
-                                "error".into()
-                            } else {
-                                "done".into()
-                            };
-                        }
-                    }
-                } else {
-                    chat.push(ChatItem::Tool {
-                        id: tr.tool_call_id.clone(),
-                        name: tr.tool_name.clone(),
-                        summary: if tr.is_error {
-                            "error".into()
-                        } else {
-                            "done".into()
-                        },
-                        detail: result_text,
-                        status: st,
-                    });
-                }
-            }
-            AgentMessage::Custom(CustomAgentMessage::CompactionSummary { summary, .. }) => {
-                chat.push(ChatItem::System {
-                    text: format!("compaction summary\n{summary}"),
-                });
-            }
-            AgentMessage::Custom(CustomAgentMessage::BranchSummary { summary, .. }) => {
-                chat.push(ChatItem::System {
-                    text: format!("branch summary\n{summary}"),
-                });
-            }
-            AgentMessage::Custom(CustomAgentMessage::BashExecution {
-                command,
-                output,
-                exit_code,
-                ..
-            }) => {
-                let mut summary: String = command.chars().take(48).collect();
-                if command.chars().count() > 48 {
-                    summary.push('…');
-                }
-                let status = match exit_code {
-                    Some(0) | None => CardStatus::Success,
-                    Some(_) => CardStatus::Error,
-                };
-                chat.push(ChatItem::Tool {
-                    id: format!("bash-exec-{}", chat.len()),
-                    name: "bash".into(),
-                    summary,
-                    detail: format!("$ {command}\n{output}"),
-                    status,
-                });
-            }
-            AgentMessage::Custom(CustomAgentMessage::Custom {
-                custom_type,
-                content,
-                ..
-            }) => {
-                chat.push(ChatItem::System {
-                    text: format!("{custom_type}: {content}"),
-                });
-            }
-        }
-    }
-    chat
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,7 +1707,8 @@ mod tests {
             })),
         ];
 
-        let items = chat_items_from_agent_messages(&messages);
+        let items =
+            crate::app::chat_from_transcript(loop_agent::protocol_events::replay(&messages));
         assert!(matches!(&items[0], ChatItem::User { text } if text == "list files"));
         assert!(
             matches!(&items[1], ChatItem::Thinking { text, done: true } if text == "I should use bash")
@@ -2060,6 +1901,7 @@ mod tests {
             &Theme::dark(),
             "v",
             model,
+            None,
             note,
             "http://e",
             "sess",
@@ -2111,10 +1953,10 @@ mod tests {
         aborted.stop_reason = StopReason::Aborted;
         aborted.error_message = Some("Operation aborted".into());
 
-        let chat = chat_items_from_agent_messages(&[
+        let chat = crate::app::chat_from_transcript(loop_agent::protocol_events::replay(&[
             AgentMessage::assistant(failed),
             AgentMessage::assistant(aborted),
-        ]);
+        ]));
         let errors: Vec<_> = chat
             .iter()
             .filter_map(|c| match c {
@@ -2156,9 +1998,12 @@ mod tests {
         let host = TracingSetup::LangfuseHost;
         let otlp = TracingSetup::OtlpEndpoint;
         for prompt in [
-            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(None).unwrap()),
             SetupPrompt::Provider(
-                crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap(),
+                crate::provider_setup::ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap(),
+            ),
+            SetupPrompt::Provider(
+                crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                    .unwrap(),
             ),
             SetupPrompt::Tracing(picker),
             SetupPrompt::Tracing(host),
@@ -2217,9 +2062,13 @@ mod tests {
             public_key: "p".into(),
         };
         assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
-        let key = crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap();
+        let key =
+            crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(key)).contains("enter save"));
-        let name = crate::provider_setup::ProviderSetup::start(Some("custom")).unwrap();
+        let name =
+            crate::provider_setup::ProviderSetup::start(Some("custom"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(name)).contains("enter next"));
     }
 

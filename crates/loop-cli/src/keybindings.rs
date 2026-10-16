@@ -352,7 +352,7 @@ pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
         ("cmd/super+delete", "Delete entire line"),
         ("ctrl+l", "Select model"),
         ("ctrl+p / ctrl+shift+p", "Cycle models"),
-        ("shift+tab", "Cycle thinking level"),
+        ("shift+tab", "Cycle reasoning effort"),
         ("ctrl+t", "Toggle thinking visibility"),
         ("ctrl+o", "Expand/collapse tool output & reasoning"),
         ("↑↓", "Previous/next command; lists"),

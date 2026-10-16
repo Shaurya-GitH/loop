@@ -1,5 +1,6 @@
 //! The TUI setup box: whichever wizard is currently collecting input.
 
+use crate::agent_question::AgentQuestion;
 use crate::provider_setup::ProviderSetup;
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
@@ -13,6 +14,8 @@ pub enum SetupPrompt {
     /// `/tracing setup`.
     #[cfg(feature = "telemetry")]
     Tracing(TracingSetup),
+    /// A question, form or link from the agent.
+    Question(AgentQuestion),
 }
 
 impl SetupPrompt {
@@ -21,6 +24,7 @@ impl SetupPrompt {
             Self::Provider(step) => step,
             #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step,
+            Self::Question(step) => step,
         }
     }
 
@@ -29,6 +33,7 @@ impl SetupPrompt {
             Self::Provider(_) => "login",
             #[cfg(feature = "telemetry")]
             Self::Tracing(_) => "tracing setup",
+            Self::Question(_) => "agent question",
         }
     }
 
@@ -48,7 +53,7 @@ impl SetupPrompt {
     }
 
     /// Picker rows and the highlighted row, on choice steps.
-    pub fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    pub fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
         self.view().options()
     }
 
@@ -68,6 +73,7 @@ impl SetupPrompt {
             Self::Provider(step) => step.move_selection(delta),
             #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.move_selection(delta),
+            Self::Question(step) => step.move_selection(delta),
         }
     }
 
@@ -95,7 +101,18 @@ impl SetupPrompt {
 
     /// Status line after esc.
     pub fn cancelled_message(&self) -> String {
-        format!("{} cancelled", self.label())
+        match self {
+            Self::Question(_) => "question dismissed; the agent was told".into(),
+            _ => format!("{} cancelled", self.label()),
+        }
+    }
+
+    /// The agent's interaction this prompt answers, if it is one.
+    pub fn interaction(&self) -> Option<&loop_protocol::InteractionId> {
+        match self {
+            Self::Question(step) => Some(step.id()),
+            _ => None,
+        }
     }
 
     /// Whether esc quits the app (first-run provider setup) instead of cancelling.
@@ -110,8 +127,9 @@ mod tests {
 
     #[test]
     fn provider_prompt_delegates_to_login_wizard() {
-        let prompt = SetupPrompt::Provider(ProviderSetup::start(None).unwrap());
-        assert_eq!(prompt.title(), "Connect a model provider");
+        let prompt =
+            SetupPrompt::Provider(ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap());
+        assert_eq!(prompt.title(), "Connect a model provider or subscription");
         assert!(prompt.options().is_some());
         assert!(prompt.esc_quits(true));
         assert!(!prompt.esc_quits(false));
@@ -119,7 +137,9 @@ mod tests {
         assert!(prompt.status_hint(false).starts_with("login · ↑↓ choose"));
         assert!(prompt.status_hint(true).ends_with("esc quit"));
 
-        let key = SetupPrompt::Provider(ProviderSetup::start(Some("openai")).unwrap());
+        let key = SetupPrompt::Provider(
+            ProviderSetup::start(Some("openai"), Vec::new(), Vec::new()).unwrap(),
+        );
         assert!(key.masked());
         assert_eq!(key.env_hint(), None);
         assert!(key.status_hint(false).contains("enter save"));

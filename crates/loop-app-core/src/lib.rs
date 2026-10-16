@@ -1,8 +1,10 @@
 //! Shared bootstrap, configuration, and runtime wiring for Loop CLI and desktop.
 
+pub mod agents;
 pub mod config;
 pub mod extensions;
 pub mod hooks_load;
+pub mod interaction;
 pub mod model_selection;
 pub mod resources;
 pub mod runtime;

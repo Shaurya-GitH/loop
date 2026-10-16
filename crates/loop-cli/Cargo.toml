@@ -21,6 +21,7 @@ telemetry = ["loop-agent/telemetry", "loop-app-core/telemetry", "dep:loop-teleme
 loop-app-core = { workspace = true }
 loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp"] }
+loop-protocol = { workspace = true }
 loop-orchestration = { workspace = true, optional = true }
 loop-mcp = { workspace = true }
 loop-update = { workspace = true }

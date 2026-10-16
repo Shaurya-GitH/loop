@@ -43,6 +43,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[provider/model]"),
         },
         SlashCommand {
+            name: "effort",
+            description: "Show or set the reasoning effort (shift+tab cycles)",
+            args_hint: Some("[level]"),
+        },
+        SlashCommand {
             name: "scoped-models",
             description: "Manage models for Ctrl+P cycling",
             args_hint: None,
@@ -315,6 +320,8 @@ pub enum CommandEffect {
     SetTheme(String),
     /// Open model picker (empty = picker, Some = set).
     SelectModel(Option<String>),
+    /// Show the reasoning effort levels (None) or set one.
+    Effort(Option<String>),
     /// Sandbox mode change.
     SetSandbox(String),
     /// Langfuse tracing control.
@@ -522,6 +529,11 @@ pub fn dispatch(
             Err(usage) => CommandEffect::Status(usage),
         },
         "model" => CommandEffect::SelectModel(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.clone())
+        }),
+        "effort" => CommandEffect::Effort(if cmd.args.is_empty() {
             None
         } else {
             Some(cmd.args.clone())

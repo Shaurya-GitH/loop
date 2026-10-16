@@ -65,6 +65,7 @@ fn tool_call_and_update() {
     roundtrip(
         &SessionUpdate::ToolCall(ToolCall {
             id: "c1".into(),
+            name: None,
             title: "edit src/main.rs".into(),
             kind: ToolKind::Edit,
             status: ToolCallStatus::InProgress,
@@ -137,6 +138,7 @@ fn permission_keeps_native_ids() {
             id: "p1".into(),
             outcome: InteractionOutcome::Selected {
                 native_id: "approved-for-session".into(),
+                note: None,
             },
         },
         json!({

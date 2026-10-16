@@ -115,6 +115,10 @@ pub struct Choice {
     pub label: String,
 }
 
+/// The [`InteractionOutcome::Selected`] id a surface sends when the user
+/// declines a [`InteractionRequest::Form`] or [`InteractionRequest::Url`].
+pub const DECLINE_CHOICE: &str = "decline";
+
 /// The user's answer to an interaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -123,6 +127,9 @@ pub enum InteractionOutcome {
     Selected {
         /// The chosen native id.
         native_id: String,
+        /// Optional note from the user, such as why they rejected a call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// A free-text or form answer.
     Answered {

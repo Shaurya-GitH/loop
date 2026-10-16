@@ -200,12 +200,12 @@ impl WizardView for TracingSetup {
     }
 
     /// Picker rows `(label, description)` and the highlighted index, at the first step.
-    fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
         match self {
             Self::Choose { selected } => Some((
                 TracingBackend::ALL
                     .iter()
-                    .map(|b| (b.label(), b.description()))
+                    .map(|b| (b.label().to_owned(), b.description().to_owned()))
                     .collect(),
                 *selected,
             )),
@@ -248,7 +248,7 @@ mod tests {
         let (step, prefill) = TracingSetup::start(None, &TracingSettings::default());
         let (rows, selected) = step.options().unwrap();
         assert_eq!(
-            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
             ["Langfuse", "OTLP endpoint"]
         );
         assert_eq!(selected, 0);

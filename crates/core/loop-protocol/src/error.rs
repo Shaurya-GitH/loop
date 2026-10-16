@@ -50,6 +50,38 @@ impl ErrorInfo {
             message: message.into(),
         }
     }
+
+    /// Best-effort category for a failure only known as text, such as a
+    /// provider's HTTP error line.
+    pub fn from_message(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let lower = message.to_ascii_lowercase();
+        let has = |needle: &str| lower.contains(needle);
+        let category = if has("http 401")
+            || has("http 403")
+            || has("unauthorized")
+            || has("api key")
+            || has("not logged in")
+            || has("authentication")
+        {
+            ErrorCategory::Auth
+        } else if has("insufficient_quota") || has("quota") || has("billing") || has("usage limit")
+        {
+            ErrorCategory::Quota
+        } else if has("http 429") || has("rate limit") || has("too many requests") {
+            ErrorCategory::RateLimit
+        } else if has("http 5")
+            || has("timed out")
+            || has("timeout")
+            || has("connection")
+            || has("network")
+        {
+            ErrorCategory::Network
+        } else {
+            ErrorCategory::Agent
+        };
+        Self::new(category, message)
+    }
 }
 
 impl fmt::Display for ErrorInfo {

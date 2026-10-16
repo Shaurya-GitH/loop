@@ -7,12 +7,16 @@ use std::future::Future;
 
 use loop_agent::AgentMessage;
 use loop_ai::{AssistantContent, Message};
+use loop_protocol::{
+    AgentBackend, ContentBlock, Role, SessionRef, SessionUpdate, StopReason, TurnOutcome,
+};
 #[cfg(feature = "telemetry")]
 use loop_telemetry::{obs, ObservationExt, TelemetryHandle, TraceAttrs};
+use tokio::sync::broadcast::error::RecvError;
 #[cfg(feature = "telemetry")]
 use tracing::Instrument;
 
-use crate::CliRuntime;
+use crate::{CliRuntime, PendingAgent};
 
 /// Name of the root observation of a print-mode trace.
 #[cfg(feature = "telemetry")]
@@ -98,10 +102,10 @@ pub async fn traced_print<F, Fut>(
 ) -> PrintOutcome
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = anyhow::Result<AgentMessage>>,
+    Fut: Future<Output = anyhow::Result<String>>,
 {
     PrintOutcome {
-        result: run().await.and_then(|message| final_text(&message)),
+        result: run().await,
         trace_id: None,
     }
 }
@@ -116,7 +120,7 @@ pub async fn traced_print<F, Fut>(
 ) -> PrintOutcome
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = anyhow::Result<AgentMessage>>,
+    Fut: Future<Output = anyhow::Result<String>>,
 {
     let root = obs::span(ROOT_SPAN_NAME);
     if let Some(parent) = &trace.parent {
@@ -127,10 +131,7 @@ where
     root.record_trace(&trace.trace_attrs(default_session));
     root.record_input(prompt);
 
-    let result = run()
-        .instrument(root.clone())
-        .await
-        .and_then(|message| final_text(&message));
+    let result = run().instrument(root.clone()).await;
     match &result {
         Ok(text) => root.record_output(text),
         Err(err) => root.record_error(&format!("{err:#}")),
@@ -143,14 +144,22 @@ where
 
 /// `loop --print`: run one prompt, print the answer, report the trace id on stderr.
 pub async fn run_print(
-    runtime: &CliRuntime,
+    runtime: &mut CliRuntime,
     prompt: String,
     trace: &TraceArgs,
 ) -> anyhow::Result<()> {
-    let harness = runtime.harness.clone();
+    // No one can approve anything here: external agents get the default
+    // host, which rejects every request, so they decline the action.
+    match runtime.pending_agent.take() {
+        Some(PendingAgent::New { id, model }) => runtime.use_agent(&id, model.as_deref()).await?,
+        Some(PendingAgent::Resume(record)) => runtime.resume_agent(&record).await?,
+        None => {}
+    }
+    let backend = runtime.backend.clone();
+    let session = runtime.session_ref();
     let input = prompt.clone();
     let outcome = traced_print(&input, trace, &runtime.session_id, || async move {
-        Ok(harness.prompt(prompt).await?)
+        print_turn(backend.as_ref(), &session, prompt).await
     })
     .await;
     if let Some(trace_id) = &outcome.trace_id {
@@ -169,6 +178,66 @@ pub async fn shutdown_telemetry(telemetry: &TelemetryHandle) {
     let _ = tokio::task::spawn_blocking(move || handle.shutdown()).await;
     if let Some(err) = telemetry.status().last_error {
         eprintln!("loop: trace export failed: {err}");
+    }
+}
+
+/// Run one turn and return the text of the agent's last message, or why the
+/// turn failed.
+pub async fn print_turn(
+    backend: &dyn AgentBackend,
+    session: &SessionRef,
+    prompt: String,
+) -> anyhow::Result<String> {
+    // Subscribe before prompting so no update of this turn is missed.
+    let mut updates = backend.subscribe();
+    let turn = backend
+        .prompt(session, vec![ContentBlock::text(prompt)])
+        .await?;
+    let mut last_text = String::new();
+    loop {
+        let envelope = match updates.recv().await {
+            Ok(envelope) => envelope,
+            Err(RecvError::Lagged(missed)) => {
+                anyhow::bail!("missed {missed} updates from the agent")
+            }
+            Err(RecvError::Closed) => break,
+        };
+        if envelope.session != session.key {
+            continue;
+        }
+        match envelope.update {
+            SessionUpdate::MessageStarted {
+                role: Role::Agent, ..
+            } => last_text.clear(),
+            SessionUpdate::MessageChunk {
+                role: Role::Agent,
+                content,
+                ..
+            } => {
+                if let Some(text) = content.as_text() {
+                    last_text.push_str(text);
+                }
+            }
+            SessionUpdate::TurnEnded { stop, error, .. } => {
+                if let Some(error) = error {
+                    anyhow::bail!("{}", error.message);
+                }
+                if stop == StopReason::Cancelled {
+                    anyhow::bail!("the turn was cancelled");
+                }
+                return Ok(last_text);
+            }
+            _ => {}
+        }
+    }
+    // The stream closed without a turn end; the turn's outcome decides.
+    match turn.outcome().await {
+        TurnOutcome::Completed(_) => Ok(last_text),
+        TurnOutcome::Cancelled => anyhow::bail!("the turn was cancelled"),
+        TurnOutcome::Failed(error) => anyhow::bail!("{}", error.message),
+        TurnOutcome::Uncertain => {
+            anyhow::bail!("lost contact with the agent; the turn may be incomplete")
+        }
     }
 }
 

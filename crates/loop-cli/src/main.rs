@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long, short = 'c', global = true)]
     no_context_files: bool,
 
-    /// Resume a session by id.
+    /// Resume a session by id (Loop's own or an external agent's).
     #[arg(long, global = true)]
     resume: Option<String>,
 
@@ -226,18 +226,68 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let interactive = cli.print.is_none() && !cli.serve_mcp;
+    let agent_dir = config::paths::get_agent_dir();
+    // `--resume` may name a session Loop opened with a subscription, and
+    // `--provider` may name a subscription (such as `chatgpt`).
+    let agent_resume = cli
+        .resume
+        .as_deref()
+        .and_then(|id| loop_app_core::agents::find_recorded_session(&agent_dir, id));
+    let subscription = cli
+        .provider
+        .clone()
+        .filter(|p| loop_app_core::agents::subscription_ids(&agent_dir).contains(p));
+    let pending_agent = match (&agent_resume, &subscription) {
+        (Some(record), _) => Some(loop_cli::PendingAgent::Resume(record.clone())),
+        (None, Some(id)) => Some(loop_cli::PendingAgent::New {
+            id: id.clone(),
+            model: cli.model.clone(),
+        }),
+        (None, None) => None,
+    };
+    let (provider, model) = if subscription.is_some() {
+        (None, None)
+    } else {
+        (cli.provider, cli.model)
+    };
+    let explicit_model = provider.is_some() || model.is_some() || cli.resume.is_some();
+    if cli.serve_mcp && pending_agent.is_some() {
+        anyhow::bail!("--serve-mcp serves Loop's own tools; it cannot run with an external agent");
+    }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
-        provider: cli.provider,
-        model: cli.model,
+        provider,
+        model,
         theme: cli.theme,
         system_prompt: cli.system_prompt,
         append_system_prompt: cli.append_system_prompt,
         no_context_files: cli.no_context_files,
         interactive,
-        session_id: cli.resume,
+        session_id: if agent_resume.is_some() {
+            None
+        } else {
+            cli.resume
+        },
+        agent: pending_agent.as_ref().map(|pending| match pending {
+            loop_cli::PendingAgent::New { id, .. } => id.clone(),
+            loop_cli::PendingAgent::Resume(record) => record.agent.clone(),
+        }),
     })
     .await?;
+    // With no model asked for, a saved subscription model starts as before.
+    let saved_subscription = (pending_agent.is_none() && !explicit_model)
+        .then(|| {
+            runtime
+                .settings
+                .selected_model()
+                .filter(|(p, _)| runtime.is_subscription(p))
+                .map(|(p, m)| loop_cli::PendingAgent::New {
+                    id: p.to_owned(),
+                    model: Some(m.to_owned()),
+                })
+        })
+        .flatten();
+    runtime.pending_agent = pending_agent.or(saved_subscription);
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
     #[cfg(feature = "telemetry")]
@@ -254,7 +304,9 @@ async fn real_main() -> anyhow::Result<()> {
         )
         .await
     } else if let Some(prompt) = cli.print {
-        print_mode::run_print(&runtime, prompt, &cli.trace).await
+        let result = print_mode::run_print(&mut runtime, prompt, &cli.trace).await;
+        runtime.agents.shutdown().await;
+        result
     } else {
         loop_cli::app::run(runtime).await
     };

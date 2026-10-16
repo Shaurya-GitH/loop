@@ -2,6 +2,7 @@
 
 #![allow(missing_docs)]
 
+pub mod agent_question;
 pub mod app;
 pub mod clipboard;
 pub mod commands;
@@ -32,6 +33,28 @@ pub struct CliRuntime {
     pub debug: bool,
     /// Path to the active debug log file, if any.
     pub debug_log_path: Option<std::path::PathBuf>,
+    /// External agent to start once the surface is ready.
+    pub pending_agent: Option<PendingAgent>,
+    /// Subscription being started (`id` or `id/model`), until it is ready or fails.
+    pub starting_agent: Option<String>,
+    /// Subscription being signed in to from `/login`, until it finishes.
+    pub signing_in: Option<String>,
+    /// Backend instances whose updates are already forwarded to the surface.
+    pub forwarded: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// An external agent to start when the surface is ready.
+#[derive(Debug, Clone)]
+pub enum PendingAgent {
+    /// Open a new session with this subscription, on this model.
+    New {
+        /// Subscription id.
+        id: String,
+        /// Model id; `None` keeps the agent's default.
+        model: Option<String>,
+    },
+    /// Reopen this recorded session.
+    Resume(loop_app_core::agents::AgentSessionRecord),
 }
 
 impl std::ops::Deref for CliRuntime {
@@ -58,5 +81,9 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         keybindings,
         debug: false,
         debug_log_path: None,
+        pending_agent: None,
+        starting_agent: None,
+        signing_in: None,
+        forwarded: Default::default(),
     })
 }

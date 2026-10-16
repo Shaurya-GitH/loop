@@ -25,6 +25,8 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-agent** | [`crates/loop-agent`](crates/loop-agent) | Agent loop, AgentHarness, tools, sessions, sandbox, skills |
 | **loop-cli** | [`crates/loop-cli`](crates/loop-cli) | Interactive `loop` TUI (ratatui) |
 | **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
+| **loop-protocol** | [`crates/core/loop-protocol`](crates/core/loop-protocol) | Versioned event model and backend interface shared by every agent and surface |
+| **loop-acp** | [`crates/extend/loop-acp`](crates/extend/loop-acp) | Run any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 
 ## Quick start
 
@@ -70,7 +72,7 @@ Build from source:
 cargo run -p loop-cli
 ```
 
-First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
+First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). `/login` also signs in to a **ChatGPT Plus/Pro subscription** (served by Codex through `codex-acp`, which needs Node.js); its models then appear in `/model` as `chatgpt/<model>`. Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
 
 ### Supported platforms
 
