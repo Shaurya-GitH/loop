@@ -329,19 +329,18 @@ impl ToolApprovalBridge {
             .unwrap_or(ToolPermission::Allow)
     }
 
-    /// Whether to prompt for this tool now: not when settings allow it, or
+    /// Whether to prompt for a call the gate routed here as "ask": not when
     /// the session already accepted its group.
     pub fn should_ask(&self, tool: &str) -> bool {
         if !interactive_tools().contains(&tool) {
             return false;
         }
-        match self.permission_for(tool) {
-            ToolPermission::Allow => false,
-            ToolPermission::Deny => false, // handled as hard block separately
-            ToolPermission::Ask => {
-                approval_group(tool).is_none_or(|group| !self.auto_approve.lock().contains(group))
-            }
+        // The tool gate decides allow / ask / deny (modes, pattern rules)
+        // and only hands "ask" calls here; a deny never reaches the prompt.
+        if self.permission_for(tool) == ToolPermission::Deny {
+            return false;
         }
+        approval_group(tool).is_none_or(|group| !self.auto_approve.lock().contains(group))
     }
 
     /// Whether the tool is hard-denied by config.

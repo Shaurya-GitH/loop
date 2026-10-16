@@ -137,24 +137,17 @@ impl ToolGate {
             .unwrap_or_default()
     }
 
-    /// The `toolPermissions` entry for `tool`; tools without one are allowed.
-    fn permission_for(&self, tool: &str) -> ToolPermission {
-        self.permissions
-            .lock()
-            .get(tool)
-            .copied()
-            .unwrap_or(ToolPermission::Allow)
-    }
-
     /// What the mode says about a call, before hooks and the approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
+        let workspace = self.workspace();
+        let rule = crate::permissions::rule_for(&self.permissions.lock(), tool, args, &workspace);
         crate::permissions::decide(
             self.mode(),
-            self.permission_for(tool),
+            rule,
             tool,
             self.kind(tool).await,
             args,
-            &self.workspace(),
+            &workspace,
         )
     }
 
@@ -223,9 +216,9 @@ impl ToolGate {
         self.approver.lock().clone()
     }
 
-    /// Why `tool` may not run at all, or `None`.
+    /// Why `tool` may not run at all, by its plain `toolPermissions` rule.
     pub fn denied(&self, tool: &str) -> Option<String> {
-        (self.permission_for(tool) == ToolPermission::Deny)
+        (self.permissions.lock().get(tool) == Some(&ToolPermission::Deny))
             .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
     }
 
