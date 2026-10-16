@@ -2,12 +2,20 @@
 //!
 //! Bootstrap installs the gate into the harness's before/after tool slots, so
 //! `--print`, the TUI, the desktop app and workflow tasks all go through it.
-//! Each call passes, in order: `toolPermissions` deny rules, then hooks
-//! (`tool_call`: allow or block), then the interactive approver when a
-//! surface attached one. After the call, the approver's file review runs,
-//! then `tool_result` hooks, which may add context for the model.
+//! Each call passes, in order:
+//!
+//! 1. `toolPermissions` deny rules and the `read-only` ceiling: refused;
+//! 2. hooks (`tool_call`): a block refuses, an allow runs it without asking;
+//! 3. the permission mode ([`crate::permissions`]): allow, or ask;
+//! 4. "ask": the interactive approver when a surface attached one; with
+//!    nobody to ask (`--print`, `mcp serve`) the call is refused.
+//!
+//! After the call, the approver's file review runs (unless step 2 or 3
+//! allowed the call), then `tool_result` hooks, which may add context for
+//! the model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use loop_agent::harness::{
@@ -17,6 +25,7 @@ use loop_agent::{AfterToolCallFn, BeforeToolCallFn, BeforeToolCallResult, ToolCa
 use loop_ai::{TextContent, ToolResultContent};
 use parking_lot::Mutex;
 
+use crate::permissions::{Decision, PermissionMode};
 use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
 
 /// Largest tool output passed to `tool_result` hooks.
@@ -29,6 +38,10 @@ pub struct ToolGate {
     approver: Mutex<Option<Arc<ToolApprovalBridge>>>,
     hooks: Mutex<Option<HookRegistry>>,
     harness: Mutex<Weak<AgentHarness>>,
+    mode: Mutex<PermissionMode>,
+    workspace: Mutex<Option<PathBuf>>,
+    /// Calls allowed without asking; their after-call review is skipped.
+    allowed: Mutex<HashSet<String>>,
 }
 
 impl ToolGate {
@@ -42,10 +55,58 @@ impl ToolGate {
 
     /// Install the gate into `harness`'s tool slots and run its hooks.
     pub fn install(self: &Arc<Self>, harness: &Arc<AgentHarness>) {
+        self.workspace
+            .lock()
+            .get_or_insert_with(|| crate::permissions::workspace_root(&harness.cwd()));
         *self.hooks.lock() = Some(harness.hooks());
         *self.harness.lock() = Arc::downgrade(harness);
         harness.set_before_tool_call(Some(self.before_hook()));
         harness.set_after_tool_call(Some(self.after_hook()));
+    }
+
+    /// The active permission mode.
+    pub fn mode(&self) -> PermissionMode {
+        *self.mode.lock()
+    }
+
+    /// Switch the permission mode; applies to the next call.
+    pub fn set_mode(&self, mode: PermissionMode) {
+        *self.mode.lock() = mode;
+    }
+
+    /// The directory `accept-edits` may edit (default: the git root of the
+    /// harness's cwd).
+    pub fn set_workspace(&self, workspace: PathBuf) {
+        *self.workspace.lock() = Some(workspace);
+    }
+
+    fn workspace(&self) -> PathBuf {
+        self.workspace
+            .lock()
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+
+    /// The `toolPermissions` entry for `tool`; tools without one are allowed.
+    fn permission_for(&self, tool: &str) -> ToolPermission {
+        self.permissions
+            .lock()
+            .get(tool)
+            .copied()
+            .unwrap_or(ToolPermission::Allow)
+    }
+
+    /// What the mode says about a call, before hooks and the approver.
+    pub fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
+        crate::permissions::decide(
+            self.mode(),
+            self.permission_for(tool),
+            tool,
+            loop_agent::protocol_events::tool_kind(tool),
+            args,
+            &self.workspace(),
+        )
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
@@ -88,6 +149,7 @@ impl ToolGate {
             call_id: tool_call.id.clone(),
             session_id,
             cwd,
+            mode: Some(self.mode().as_str().to_owned()),
         }
     }
 
@@ -113,8 +175,12 @@ impl ToolGate {
 
     /// Why `tool` may not run at all, or `None`.
     pub fn denied(&self, tool: &str) -> Option<String> {
-        (self.permissions.lock().get(tool) == Some(&ToolPermission::Deny))
+        (self.permission_for(tool) == ToolPermission::Deny)
             .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
+    }
+
+    fn mark_allowed(&self, call_id: &str) {
+        self.allowed.lock().insert(call_id.to_owned());
     }
 
     /// The gate's before-call check, for callers outside the harness
@@ -124,11 +190,15 @@ impl ToolGate {
         Arc::new(move |ctx, cancel| {
             let gate = Arc::clone(&gate);
             Box::pin(async move {
-                if let Some(reason) = gate.denied(&ctx.tool_call.name) {
-                    return Some(BeforeToolCallResult {
+                let block = |reason: String| {
+                    Some(BeforeToolCallResult {
                         block: true,
                         reason: Some(reason),
-                    });
+                    })
+                };
+                let decision = gate.decide(&ctx.tool_call.name, &ctx.args);
+                if let Decision::Deny(reason) = decision {
+                    return block(reason);
                 }
                 if let Some(hooks) = gate.hooks() {
                     let info = gate.call_info(&ctx.tool_call, &ctx.args).await;
@@ -138,29 +208,32 @@ impl ToolGate {
                     let outcome = match &cancel {
                         Some(cancel) => tokio::select! {
                             outcome = emit => outcome,
-                            () = cancel.cancelled() => {
-                                return Some(BeforeToolCallResult {
-                                    block: true,
-                                    reason: Some("Operation aborted".into()),
-                                });
-                            }
+                            () = cancel.cancelled() => return block("Operation aborted".into()),
                         },
                         None => emit.await,
                     };
                     match outcome.decision {
-                        Some(ToolDecision::Block { reason }) => {
-                            return Some(BeforeToolCallResult {
-                                block: true,
-                                reason: Some(reason),
-                            });
+                        Some(ToolDecision::Block { reason }) => return block(reason),
+                        Some(ToolDecision::Allow) => {
+                            gate.mark_allowed(&ctx.tool_call.id);
+                            return None;
                         }
-                        Some(ToolDecision::Allow) => return None,
                         None => {}
                     }
                 }
+                if decision == Decision::Allow {
+                    gate.mark_allowed(&ctx.tool_call.id);
+                    return None;
+                }
                 match gate.approver() {
                     Some(approver) => approver.review_before_tool(ctx, cancel).await,
-                    None => None,
+                    None => block(format!(
+                        "`{}` needs approval in {} mode, and nobody can approve it in this \
+                         run. Rerun with --permission-mode accept-edits or full-access, or \
+                         allow the tool in settings.toolPermissions.",
+                        ctx.tool_call.name,
+                        gate.mode().as_str()
+                    )),
                 }
             })
         })
@@ -172,9 +245,12 @@ impl ToolGate {
         Arc::new(move |ctx, cancel| {
             let gate = Arc::clone(&gate);
             Box::pin(async move {
+                let allowed = gate.allowed.lock().remove(&ctx.tool_call.id);
                 let patch = match gate.approver() {
-                    Some(approver) => approver.review_after_file_tool(ctx.clone(), cancel).await,
-                    None => None,
+                    Some(approver) if !allowed => {
+                        approver.review_after_file_tool(ctx.clone(), cancel).await
+                    }
+                    _ => None,
                 };
                 let Some(hooks) = gate.hooks() else {
                     return patch;
@@ -258,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_gate_blocks_denied_tools_only() {
+    async fn headless_gate_refuses_what_needs_approval() {
         let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
             &BTreeMap::from([
                 ("bash".into(), "deny".into()),
@@ -269,10 +345,13 @@ mod tests {
         let blocked = before(call("bash"), None).await.expect("bash is denied");
         assert!(blocked.block);
         assert!(blocked.reason.unwrap().contains("denied"));
-        assert!(
-            before(call("write"), None).await.is_none(),
-            "ask runs when nobody can be asked (until permission modes land)"
-        );
+        let refused = before(call("write"), None)
+            .await
+            .expect("nobody can approve");
+        assert!(refused
+            .reason
+            .unwrap()
+            .contains("needs approval in ask mode"));
         assert!(before(call("read"), None).await.is_none());
     }
 
@@ -403,5 +482,57 @@ mod tests {
             text_signature: None,
         })]);
         assert!(text.len() <= HOOK_OUTPUT_CAP);
+    }
+
+    #[tokio::test]
+    async fn read_only_is_a_ceiling_even_for_hook_allow() {
+        let (gate, _prompts) = gate_with_approver(&[]);
+        gate.set_mode(PermissionMode::ReadOnly);
+        let (_dir, registry) = hooks(&[serde_json::json!(
+            {"on": "tool_call", "action": {"allow": true}}
+        )]);
+        gate.set_hooks(registry);
+        let result = gate.before_hook()(call("bash"), None).await.unwrap();
+        assert!(result.reason.unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn full_access_skips_the_prompt_and_the_edit_review() {
+        let (gate, mut prompts) = gate_with_approver(&[("bash", "ask"), ("write", "ask")]);
+        gate.set_mode(PermissionMode::FullAccess);
+        assert!(gate.before_hook()(call("bash"), None).await.is_none());
+        assert!(prompts.try_recv().is_err());
+
+        let before = call("write");
+        let id = before.tool_call.id.clone();
+        assert!(gate.before_hook()(before.clone(), None).await.is_none());
+        assert!(gate.allowed.lock().contains(&id));
+        let ctx = loop_agent::AfterToolCallContext {
+            assistant_message: before.assistant_message,
+            tool_call: before.tool_call,
+            args: before.args,
+            result: loop_agent::AgentToolResult::text("wrote"),
+            is_error: false,
+            context: Default::default(),
+        };
+        assert!(gate.after_hook()(ctx, None).await.is_none());
+        assert!(
+            prompts.try_recv().is_err(),
+            "no review after an allowed edit"
+        );
+        assert!(gate.allowed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hooks_see_the_mode() {
+        let gate = ToolGate::new(BTreeMap::new());
+        gate.set_mode(PermissionMode::AcceptEdits);
+        let (_dir, registry) = hooks(&[serde_json::json!(
+            {"on": "tool_call", "match": {"mode": "accept-edits"},
+             "action": {"block": true, "reason": "seen"}}
+        )]);
+        gate.set_hooks(registry);
+        let result = gate.before_hook()(call("read"), None).await.unwrap();
+        assert!(result.reason.unwrap().contains("seen"));
     }
 }

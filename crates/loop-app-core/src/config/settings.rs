@@ -175,6 +175,11 @@ pub struct Settings {
     /// tool is only registered when the backend's API key resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<loop_agent::harness::WebSearchConfig>,
+    /// Permission mode at startup: `read-only`, `ask` (default),
+    /// `accept-edits` or `full-access`. A project file may only choose a
+    /// stricter mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// When to prompt for `ask`-mode tools: `newSession`, `always`, or `never`.
     #[serde(default = "default_file_edit_review")]
     pub file_edit_review: String,
@@ -262,6 +267,7 @@ impl Default for Settings {
             sandbox: SandboxSettings::default(),
             web_fetch: None,
             web_search: None,
+            permission_mode: None,
             file_edit_review: default_file_edit_review(),
             diff_editor: None,
             tool_permissions: default_tool_permissions_settings(),
@@ -387,6 +393,21 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             ..global
         });
     }
+    // A project may tighten the permission mode, never loosen it.
+    if let Some(project_mode) = project
+        .permission_mode
+        .as_deref()
+        .and_then(crate::permissions::PermissionMode::parse)
+    {
+        let global = base
+            .permission_mode
+            .as_deref()
+            .and_then(crate::permissions::PermissionMode::parse)
+            .unwrap_or_default();
+        if project_mode < global {
+            base.permission_mode = Some(project_mode.as_str().to_owned());
+        }
+    }
     base.file_edit_review = project.file_edit_review;
     if project.diff_editor.is_some() {
         base.diff_editor = project.diff_editor;
@@ -470,6 +491,25 @@ mod tests {
         };
         global.merge_project(project);
         assert_eq!(global.disabled_mcp_servers, ["filesystem", "remote"]);
+    }
+
+    #[test]
+    fn a_project_can_only_tighten_the_permission_mode() {
+        let with_mode = |mode: &str| Settings {
+            permission_mode: Some(mode.into()),
+            ..Default::default()
+        };
+        let mut global = with_mode("accept-edits");
+        global.merge_project(with_mode("full-access"));
+        assert_eq!(global.permission_mode.as_deref(), Some("accept-edits"));
+        global.merge_project(with_mode("read-only"));
+        assert_eq!(global.permission_mode.as_deref(), Some("read-only"));
+
+        let mut default = Settings::default();
+        default.merge_project(with_mode("accept-edits"));
+        assert_eq!(default.permission_mode, None, "looser than the default ask");
+        default.merge_project(Settings::default());
+        assert_eq!(default.permission_mode, None);
     }
 
     #[test]

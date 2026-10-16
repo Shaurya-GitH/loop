@@ -60,6 +60,7 @@ use crate::tui::{
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
 use crate::{build_tools, CliRuntime, PendingAgent};
+use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
     UpdateAvailable(String),
@@ -415,7 +416,7 @@ async fn run_loop(
             Vec::new()
         }
     };
-    for notice in std::mem::take(&mut runtime.hook_notices) {
+    for notice in std::mem::take(&mut runtime.startup_notices) {
         chat.push(sys(notice));
     }
     // An agent that needs a sign-in opens /login instead of failing.
@@ -550,6 +551,7 @@ async fn run_loop(
             Some(spec) => format!("{spec} · {}", runtime.native_effort()),
             None => NO_MODEL_LABEL.to_string(),
         };
+        let model_line = format!("{} · {model_line}", runtime.permission_mode().label());
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
@@ -4330,6 +4332,35 @@ async fn apply_effect(
                 Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
+        CommandEffect::Permissions(None) => {
+            let current = runtime.permission_mode();
+            let mut lines = vec![format!(
+                "permission mode: {} — /permissions <mode> to switch",
+                current.as_str()
+            )];
+            for mode in PermissionMode::ALL {
+                let mark = if mode == current { "●" } else { " " };
+                lines.push(format!(
+                    "  {mark} {:<13} {}",
+                    mode.as_str(),
+                    mode.description()
+                ));
+            }
+            chat.push(sys(lines.join("\n")));
+        }
+        CommandEffect::Permissions(Some(arg)) => match PermissionMode::parse(&arg) {
+            Some(mode) => {
+                runtime.set_permission_mode(mode);
+                chat.push(sys(format!(
+                    "permission mode → {} ({}) for this session",
+                    mode.as_str(),
+                    mode.description()
+                )));
+            }
+            None => chat.push(error_item(format!(
+                "unknown mode `{arg}`: use read-only, ask, accept-edits or full-access"
+            ))),
+        },
         CommandEffect::WebSearch(arg) => {
             let result = match arg.as_deref() {
                 None => Ok(runtime.web_status()),

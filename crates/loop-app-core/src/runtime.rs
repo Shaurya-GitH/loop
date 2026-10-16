@@ -92,8 +92,8 @@ pub struct Runtime {
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
     /// The check every tool call passes; surfaces attach their approver to it.
     pub tool_gate: std::sync::Arc<crate::tool_gate::ToolGate>,
-    /// Problems found while loading hooks, shown once at startup.
-    pub hook_notices: Vec<String>,
+    /// Problems found at startup (hooks, permission mode), shown once.
+    pub startup_notices: Vec<String>,
     /// MCP client manager for external tool servers.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
@@ -569,6 +569,16 @@ impl Runtime {
         )
     }
 
+    /// The active permission mode.
+    pub fn permission_mode(&self) -> crate::permissions::PermissionMode {
+        self.tool_gate.mode()
+    }
+
+    /// Switch the permission mode for the rest of this run.
+    pub fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
+        self.tool_gate.set_mode(mode);
+    }
+
     /// Status of Loop's web tools, distinct from external agents' own tools.
     pub fn web_status(&self) -> String {
         let mut status = format!("Loop's {}", self.web_tools().status());
@@ -811,6 +821,48 @@ pub struct ConnectedProvider {
     pub model_count: usize,
 }
 
+/// The mode to start in, from `--permission-mode` (`flag`) or the
+/// `permissionMode` setting, and a notice when a setting was ignored.
+///
+/// Without a terminal (`--print`, `mcp serve`) nobody sees a warning, so
+/// `full-access` must be asked for with the flag; from settings alone it
+/// falls back to `ask`.
+pub fn startup_permission_mode(
+    flag: Option<&str>,
+    setting: Option<&str>,
+    interactive: bool,
+) -> anyhow::Result<(crate::permissions::PermissionMode, Option<String>)> {
+    use crate::permissions::PermissionMode;
+    if let Some(value) = flag {
+        let mode = PermissionMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown --permission-mode `{value}`: use read-only, ask, accept-edits or full-access"
+            )
+        })?;
+        return Ok((mode, None));
+    }
+    let Some(value) = setting else {
+        return Ok((PermissionMode::default(), None));
+    };
+    match PermissionMode::parse(value) {
+        Some(PermissionMode::FullAccess) if !interactive => Ok((
+            PermissionMode::Ask,
+            Some(
+                "permissionMode full-access from settings is ignored without a terminal; \
+                 pass --permission-mode full-access to run unattended"
+                    .into(),
+            ),
+        )),
+        Some(mode) => Ok((mode, None)),
+        None => Ok((
+            PermissionMode::default(),
+            Some(format!(
+                "unknown permissionMode `{value}` in settings; using ask"
+            )),
+        )),
+    }
+}
+
 /// CLI bootstrap flags affecting runtime.
 pub struct BootstrapOpts {
     /// Working directory.
@@ -833,6 +885,8 @@ pub struct BootstrapOpts {
     pub session_id: Option<String>,
     /// `--no-web`: register no web tools this run.
     pub no_web: bool,
+    /// `--permission-mode`; overrides `permissionMode` in settings.
+    pub permission_mode: Option<String>,
     /// Start with this external agent. Loop's own provider is then optional.
     pub agent: Option<String>,
 }
@@ -1265,7 +1319,15 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     );
     tool_gate.install(&harness);
     agents.set_gate(Arc::clone(&tool_gate));
-    let hook_notices = crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
+    let mut startup_notices =
+        crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
+    let (mode, mode_notice) = startup_permission_mode(
+        opts.permission_mode.as_deref(),
+        settings.permission_mode.as_deref(),
+        opts.interactive,
+    )?;
+    tool_gate.set_mode(mode);
+    startup_notices.extend(mode_notice);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
         tracing::info!("extension: {n}");
@@ -1333,7 +1395,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         model_note,
         tool_approval: None,
         tool_gate,
-        hook_notices,
+        startup_notices,
         mcp_client,
         active_skills: Vec::new(),
         web_disabled_for_run: opts.no_web,
@@ -1420,5 +1482,41 @@ mod tests {
         model.reasoning = false;
         assert_eq!(native_efforts(Some(&model), &all), ["off"]);
         assert_eq!(native_efforts(None, &all), ["off", "low", "high"]);
+    }
+}
+
+#[cfg(test)]
+mod permission_mode_tests {
+    use super::startup_permission_mode;
+    use crate::permissions::PermissionMode::*;
+
+    #[test]
+    fn the_flag_wins_and_headless_full_access_needs_it() {
+        assert_eq!(startup_permission_mode(None, None, true).unwrap().0, Ask);
+        assert_eq!(
+            startup_permission_mode(Some("read-only"), Some("full-access"), false)
+                .unwrap()
+                .0,
+            ReadOnly
+        );
+        let (mode, notice) = startup_permission_mode(None, Some("full-access"), false).unwrap();
+        assert_eq!(mode, Ask);
+        assert!(notice.unwrap().contains("--permission-mode full-access"));
+        assert_eq!(
+            startup_permission_mode(Some("full-access"), None, false)
+                .unwrap()
+                .0,
+            FullAccess
+        );
+        assert_eq!(
+            startup_permission_mode(None, Some("full-access"), true)
+                .unwrap()
+                .0,
+            FullAccess
+        );
+        let (mode, notice) = startup_permission_mode(None, Some("yolo"), true).unwrap();
+        assert_eq!(mode, Ask);
+        assert!(notice.unwrap().contains("unknown permissionMode"));
+        assert!(startup_permission_mode(Some("yolo"), None, true).is_err());
     }
 }

@@ -130,6 +130,7 @@ fn agent_call_info(
         call_id,
         session_id: String::new(),
         cwd: cwd.to_path_buf(),
+        mode: None,
     }
 }
 

@@ -44,6 +44,10 @@ struct MatchRules {
     /// `native`, `mcp`, `mcp:<server>`, `agent` or `agent:<id>`.
     #[serde(default)]
     source: Option<String>,
+    /// Permission mode(s) the hook applies in, `|`-separated
+    /// (`read-only|ask`).
+    #[serde(default)]
+    mode: Option<String>,
     /// Argument key (or JSON pointer starting with `/`) → glob on its value.
     #[serde(default)]
     args: BTreeMap<String, String>,
@@ -252,6 +256,10 @@ impl Hook {
                 call.map(|c| c.session_id.clone()).unwrap_or_default(),
             ),
             ("LOOP_PROJECT_DIR", cwd.to_string_lossy().into_owned()),
+            (
+                "LOOP_PERMISSION_MODE",
+                call.and_then(|c| c.mode.clone()).unwrap_or_default(),
+            ),
         ];
         let timeout = self
             .action
@@ -309,6 +317,7 @@ impl MatchRules {
         self.tool.is_none()
             && self.kind.is_none()
             && self.source.is_none()
+            && self.mode.is_none()
             && self.args.is_empty()
             && self.args_contains.is_none()
     }
@@ -333,6 +342,12 @@ impl MatchRules {
         }
         if let Some(source) = &self.source {
             if !source_matches(source, &call.source) {
+                return false;
+            }
+        }
+        if let Some(modes) = &self.mode {
+            let current = call.mode.as_deref().unwrap_or_default();
+            if !modes.split('|').any(|m| m.trim() == current) {
                 return false;
             }
         }
@@ -559,6 +574,7 @@ mod tests {
             call_id: "c1".into(),
             session_id: "s1".into(),
             cwd: PathBuf::from("/tmp"),
+            mode: Some("ask".into()),
         }
     }
 
@@ -601,6 +617,8 @@ mod tests {
         assert!(rules(json!({"kind": "execute"})).matches(&force));
         assert!(!rules(json!({"kind": "edit"})).matches(&force));
         assert!(rules(json!({"source": "native"})).matches(&force));
+        assert!(rules(json!({"mode": "read-only|ask"})).matches(&force));
+        assert!(!rules(json!({"mode": "full-access"})).matches(&force));
         assert!(!rules(json!({"source": "mcp"})).matches(&force));
         assert!(rules(json!({"args": {"command": "*--force*"}})).matches(&force));
         assert!(rules(json!({"args": {"/command": "git *"}})).matches(&force));
