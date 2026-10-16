@@ -48,9 +48,24 @@ impl ToolGate {
         harness.set_after_tool_call(Some(self.after_hook()));
     }
 
-    #[cfg(test)]
-    fn set_hooks(&self, hooks: HookRegistry) {
+    /// Run `hooks` without a harness (tests, hosts that only gate agents).
+    pub fn set_hooks(&self, hooks: HookRegistry) {
         *self.hooks.lock() = Some(hooks);
+    }
+
+    /// The `tool_call` hooks' decision about an external agent's call.
+    /// Deny rules name Loop's own tools, so they do not apply here.
+    pub async fn review_agent_call(&self, info: ToolCallInfo) -> Option<ToolDecision> {
+        let hooks = self.hooks()?;
+        hooks.emit(HarnessHookEvent::ToolCall(info)).await.decision
+    }
+
+    /// Tell hooks about something that already happened; their answer is
+    /// ignored (an agent's finished tool call).
+    pub async fn observe(&self, event: HarnessHookEvent) {
+        if let Some(hooks) = self.hooks() {
+            let _ = hooks.emit(event).await;
+        }
     }
 
     /// The hook registry, when it has handlers.

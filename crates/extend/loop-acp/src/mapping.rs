@@ -212,6 +212,7 @@ pub fn tool_call_update(update: acp::ToolCallUpdate) -> ToolCallUpdate {
         .locations
         .map(|locations| locations.into_iter().map(location).collect());
     out.raw_output = fields.raw_output;
+    out.raw_input = fields.raw_input;
     out
 }
 
@@ -322,6 +323,19 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn tool_call_updates_keep_the_raw_input() {
+        let update: acp::ToolCallUpdate = serde_json::from_value(json!({
+            "toolCallId": "t1",
+            "kind": "execute",
+            "rawInput": {"command": "cargo test"}
+        }))
+        .unwrap();
+        let out = tool_call_update(update);
+        assert_eq!(out.raw_input, Some(json!({"command": "cargo test"})));
+        assert_eq!(out.kind, Some(ToolKind::Execute));
+    }
 
     #[test]
     fn chunks_get_message_boundaries() {
