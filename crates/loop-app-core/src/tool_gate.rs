@@ -102,7 +102,9 @@ impl ToolGate {
             .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
     }
 
-    fn before_hook(self: &Arc<Self>) -> BeforeToolCallFn {
+    /// The gate's before-call check, for callers outside the harness
+    /// (`mcp serve`).
+    pub fn before_hook(self: &Arc<Self>) -> BeforeToolCallFn {
         let gate = Arc::clone(self);
         Arc::new(move |ctx, cancel| {
             let gate = Arc::clone(&gate);
@@ -149,7 +151,8 @@ impl ToolGate {
         })
     }
 
-    fn after_hook(self: &Arc<Self>) -> AfterToolCallFn {
+    /// The gate's after-call step, for callers outside the harness.
+    pub fn after_hook(self: &Arc<Self>) -> AfterToolCallFn {
         let gate = Arc::clone(self);
         Arc::new(move |ctx, cancel| {
             let gate = Arc::clone(&gate);

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use loop_ai::{AssistantContent, AssistantMessage, Model, SimpleStreamOptions, ToolCall};
+use loop_ai::{AssistantContent, Model, SimpleStreamOptions, ToolCall};
 use loop_orchestration::planner::task_graph::{TaskKind, TaskNode};
 use loop_orchestration::scheduler::worker::{Worker, WorkerContext, WorkerError};
 use loop_orchestration::workflow::types::{Signal, TaskResult};
@@ -277,25 +277,8 @@ impl ShellWorker {
             arguments: serde_json::json!({ "command": command }),
             thought_signature: None,
         };
-        let assistant_message = AssistantMessage {
-            content: vec![AssistantContent::ToolCall(tool_call.clone())],
-            api: String::new(),
-            provider: String::new(),
-            model: String::new(),
-            response_model: None,
-            response_id: None,
-            usage: Default::default(),
-            stop_reason: loop_ai::StopReason::ToolUse,
-            error_message: None,
-            raw_stop_reason: None,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-        };
-        let context = BeforeToolCallContext {
-            assistant_message,
-            args: tool_call.arguments.clone(),
-            tool_call,
-            context: AgentContext::default(),
-        };
+        let args = tool_call.arguments.clone();
+        let context = BeforeToolCallContext::standalone(tool_call, args);
         match before(context, Some(cancel.clone())).await {
             Some(BeforeToolCallResult {
                 block: true,
