@@ -1323,7 +1323,7 @@ impl AgentHarness {
         >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use crate::harness::orchestration::{
-            agent_worker::{AgentWorker, ShellWorker},
+            agent_worker::{AgentWorker, ShellWorker, WorkflowToolHooks},
             WorkflowProgressEvent,
         };
         use loop_orchestration::memory::bus::create_memory_bus;
@@ -1361,20 +1361,28 @@ impl AgentHarness {
         let system_prompt = self.system_prompt.read().await.clone();
         let tools = self.tools.read().clone();
         let host_env = Arc::clone(&self.host_env);
+        // Workflow tasks get the same tool checks as the chat.
+        let hooks = WorkflowToolHooks {
+            before: self.before_tool_call.lock().clone(),
+            after: self.after_tool_call.lock().clone(),
+        };
         let thinking_level = *self.thinking_level.read().await;
         let mut stream_options = self.stream_options.read().await.clone();
         stream_options.reasoning = thinking_level.to_reasoning();
 
-        let agent_worker = Arc::new(AgentWorker::new(
-            Arc::clone(&self.stream_fn),
-            Arc::clone(&host_env),
-            tools,
-            model,
-            system_prompt,
-            stream_options,
-        ));
+        let agent_worker = Arc::new(
+            AgentWorker::new(
+                Arc::clone(&self.stream_fn),
+                Arc::clone(&host_env),
+                tools,
+                model,
+                system_prompt,
+                stream_options,
+            )
+            .with_tool_hooks(hooks.clone()),
+        );
 
-        let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&host_env)));
+        let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&host_env)).with_tool_hooks(hooks));
 
         let mut pool = WorkerPool::new(scheduler_config.max_concurrency);
         pool.register(agent_worker);

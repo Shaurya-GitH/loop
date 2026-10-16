@@ -17,7 +17,7 @@ Common settings in `settings.json`:
 | Key | Default | Purpose |
 |---|---|---|
 | `defaultProvider`, `defaultModel` | none | Provider and model at startup |
-| `toolPermissions` | `write`, `edit`, `bash`: `ask`; `read`: `allow` | Per-tool permission: `allow`, `ask` or `deny` |
+| `toolPermissions` | `write`, `edit`, `bash`, `web_fetch`, `web_search`: `ask`; `read`: `allow` | Per-tool permission: `allow`, `ask` or `deny`. `deny` applies everywhere, including `--print` and `/workflow` tasks; `ask` prompts only in the TUI and desktop app |
 | `fileEditReview` | `newSession` | When `ask` tools prompt: `newSession`, `always` or `never` |
 | `sandbox.mode` | `off` | `off` or `local` (Linux only) |
 | `compaction` | enabled | `reserveTokens`, `keepRecentTokens` for `/compact` |

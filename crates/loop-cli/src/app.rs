@@ -405,12 +405,7 @@ async fn run_loop(
             })
         }));
     }
-    runtime
-        .harness
-        .set_before_tool_call(Some(bridge.before_tool_hook()));
-    runtime
-        .harness
-        .set_after_tool_call(Some(bridge.after_tool_hook()));
+    runtime.tool_gate.set_approver(Some(Arc::clone(&bridge)));
     runtime.tool_approval = Some(Arc::clone(&bridge));
 
     let mut chat: Vec<ChatItem> = match runtime.backend.transcript(&runtime.session_ref()).await {
@@ -4569,10 +4564,10 @@ async fn apply_effect(
                 let enabled = policy.asks_for_session(!runtime.resumed);
                 if let Some(bridge) = &runtime.tool_approval {
                     bridge.set_policy_active(enabled);
-                    bridge.set_permissions(permissions_from_settings(
-                        &runtime.settings.tool_permissions,
-                    ));
                 }
+                runtime.tool_gate.set_permissions(permissions_from_settings(
+                    &runtime.settings.tool_permissions,
+                ));
                 let _ = runtime.save_settings();
                 chat.push(sys(format!(
                     "tool approval → {} (this session: {})",

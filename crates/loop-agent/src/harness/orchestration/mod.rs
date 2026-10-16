@@ -9,7 +9,7 @@ pub mod agent_worker;
 pub mod sub_workflow_worker;
 pub mod tools;
 
-pub use agent_worker::{create_spawn_task_tool, AgentWorker, ShellWorker};
+pub use agent_worker::{create_spawn_task_tool, AgentWorker, ShellWorker, WorkflowToolHooks};
 pub use sub_workflow_worker::SubWorkflowWorker;
 pub use tools::{create_memory_list_tool, create_memory_read_tool, create_memory_write_tool};
 

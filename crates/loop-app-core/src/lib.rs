@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod system_prompt;
 pub mod theme;
 pub mod tool_approval;
+pub mod tool_gate;
 pub mod web_tools;
 
 pub use config::*;

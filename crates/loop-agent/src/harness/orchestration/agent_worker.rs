@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use loop_ai::{AssistantContent, Model, SimpleStreamOptions};
+use loop_ai::{AssistantContent, AssistantMessage, Model, SimpleStreamOptions, ToolCall};
 use loop_orchestration::planner::task_graph::{TaskKind, TaskNode};
 use loop_orchestration::scheduler::worker::{Worker, WorkerContext, WorkerError};
 use loop_orchestration::workflow::types::{Signal, TaskResult};
@@ -14,8 +14,19 @@ use crate::harness::types::ExecutionEnv;
 use crate::messages::convert_to_llm;
 use crate::stream_fn::StreamFn;
 use crate::types::{
-    AgentContext, AgentEventSink, AgentLoopConfig, AgentMessage, AgentTool, AgentToolResult,
+    AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentMessage, AgentTool,
+    AgentToolResult, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult,
 };
+
+/// The host's tool-call hooks, applied to every tool a workflow task runs so
+/// that workflows get the same checks as the main chat.
+#[derive(Clone, Default)]
+pub struct WorkflowToolHooks {
+    /// Runs before each tool call; may block it.
+    pub before: Option<BeforeToolCallFn>,
+    /// Runs after each tool call; may patch the result.
+    pub after: Option<AfterToolCallFn>,
+}
 
 /// Worker that executes `AgentTurn` tasks by running the agent loop.
 pub struct AgentWorker {
@@ -25,6 +36,7 @@ pub struct AgentWorker {
     default_model: Model,
     system_prompt: String,
     stream_options: SimpleStreamOptions,
+    hooks: WorkflowToolHooks,
 }
 
 impl AgentWorker {
@@ -44,7 +56,14 @@ impl AgentWorker {
             default_model,
             system_prompt,
             stream_options,
+            hooks: WorkflowToolHooks::default(),
         }
+    }
+
+    /// Run `hooks` around every tool call this worker's agent makes.
+    pub fn with_tool_hooks(mut self, hooks: WorkflowToolHooks) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     fn build_system_prompt(&self, task: &TaskNode) -> String {
@@ -147,6 +166,8 @@ impl Worker for AgentWorker {
         config.stream_options = self.stream_options.clone();
         // Isolate parallel workers from the parent chat session and each other.
         config.stream_options.base.session_id = Some(format!("wf-task-{}", task.id));
+        config.before_tool_call = self.hooks.before.clone();
+        config.after_tool_call = self.hooks.after.clone();
 
         let signal_rx = Arc::new(tokio::sync::Mutex::new(ctx.signal_rx));
         let steer_rx = Arc::clone(&signal_rx);
@@ -220,12 +241,68 @@ impl Worker for AgentWorker {
 /// Worker that executes `ShellCommand` tasks.
 pub struct ShellWorker {
     host_env: Arc<dyn ExecutionEnv>,
+    hooks: WorkflowToolHooks,
 }
 
 impl ShellWorker {
     /// Create a new shell worker.
     pub fn new(host_env: Arc<dyn ExecutionEnv>) -> Self {
-        Self { host_env }
+        Self {
+            host_env,
+            hooks: WorkflowToolHooks::default(),
+        }
+    }
+
+    /// Check each command with `hooks.before`, as if it were a `bash` call.
+    pub fn with_tool_hooks(mut self, hooks: WorkflowToolHooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Why `command` may not run, or `None` when it may: the `bash` tool's
+    /// blocklist, then the host's before-tool hook.
+    async fn blocked(
+        &self,
+        task_id: &str,
+        command: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<String> {
+        if let Err(reason) = crate::harness::tools::check_command_policy(command, &[]) {
+            return Some(reason);
+        }
+        let before = self.hooks.before.as_ref()?;
+        let tool_call = ToolCall {
+            id: format!("wf-shell-{task_id}"),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": command }),
+            thought_signature: None,
+        };
+        let assistant_message = AssistantMessage {
+            content: vec![AssistantContent::ToolCall(tool_call.clone())],
+            api: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            response_model: None,
+            response_id: None,
+            usage: Default::default(),
+            stop_reason: loop_ai::StopReason::ToolUse,
+            error_message: None,
+            raw_stop_reason: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        let context = BeforeToolCallContext {
+            assistant_message,
+            args: tool_call.arguments.clone(),
+            tool_call,
+            context: AgentContext::default(),
+        };
+        match before(context, Some(cancel.clone())).await {
+            Some(BeforeToolCallResult {
+                block: true,
+                reason,
+            }) => Some(reason.unwrap_or_else(|| "Tool execution was blocked".into())),
+            _ => None,
+        }
     }
 }
 
@@ -245,6 +322,15 @@ impl Worker for ShellWorker {
         };
 
         use crate::harness::types::ShellExecOptions;
+
+        if let Some(reason) = self.blocked(&task.id, command, &ctx.cancel).await {
+            return Err(WorkerError::ExecutionFailed(format!(
+                "command blocked: {reason}"
+            )));
+        }
+        if ctx.cancel.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
 
         let options = ShellExecOptions {
             cancel: Some(ctx.cancel.clone()),
@@ -528,5 +614,51 @@ mod tests {
         let messages = vec![asst(Some("final"), Some("scratch"))];
         let out = extract_output_from_messages(&messages);
         assert_eq!(out.as_str(), Some("final"));
+    }
+
+    fn shell_worker(block: bool, seen: Arc<parking_lot::Mutex<Vec<String>>>) -> ShellWorker {
+        let env: Arc<dyn ExecutionEnv> =
+            Arc::new(crate::harness::HostExecutionEnv::new(std::env::temp_dir()));
+        let before: BeforeToolCallFn = Arc::new(move |ctx, _cancel| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                seen.lock().push(format!(
+                    "{} {}",
+                    ctx.tool_call.name,
+                    ctx.args["command"].as_str().unwrap_or_default()
+                ));
+                block.then(|| BeforeToolCallResult {
+                    block: true,
+                    reason: Some("denied by test".into()),
+                })
+            })
+        });
+        ShellWorker::new(env).with_tool_hooks(WorkflowToolHooks {
+            before: Some(before),
+            after: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn shell_tasks_go_through_the_before_tool_hook_as_bash() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let worker = shell_worker(true, Arc::clone(&seen));
+        let reason = worker.blocked("t1", "cargo build", &cancel).await;
+        assert_eq!(reason.as_deref(), Some("denied by test"));
+        assert_eq!(*seen.lock(), ["bash cargo build"]);
+
+        let worker = shell_worker(false, Arc::new(parking_lot::Mutex::new(Vec::new())));
+        assert!(worker.blocked("t1", "cargo build", &cancel).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_tasks_respect_the_bash_blocklist() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let worker = shell_worker(false, Arc::clone(&seen));
+        let reason = worker.blocked("t1", "rm -rf /", &cancel).await.unwrap();
+        assert!(reason.contains("blocked"), "{reason}");
+        assert!(seen.lock().is_empty(), "the blocklist runs before hooks");
     }
 }
