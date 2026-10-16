@@ -46,6 +46,10 @@ struct Cli {
     #[arg(long, global = true)]
     resume: Option<String>,
 
+    /// Run without the web_search and web_fetch tools.
+    #[arg(long, global = true)]
+    no_web: bool,
+
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
     print: Option<String>,
@@ -262,6 +266,7 @@ async fn real_main() -> anyhow::Result<()> {
         system_prompt: cli.system_prompt,
         append_system_prompt: cli.append_system_prompt,
         no_context_files: cli.no_context_files,
+        no_web: cli.no_web,
         interactive,
         session_id: if agent_resume.is_some() {
             None

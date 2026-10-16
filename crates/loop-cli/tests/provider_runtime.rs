@@ -24,6 +24,7 @@ async fn boot(cwd: &std::path::Path) -> CliRuntime {
         system_prompt: None,
         append_system_prompt: None,
         no_context_files: true,
+        no_web: false,
         interactive: false,
         session_id: None,
         agent: None,

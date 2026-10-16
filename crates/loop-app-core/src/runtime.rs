@@ -7,9 +7,9 @@ use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_write_tool, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
-    Sandbox, SandboxMode,
+    create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
+    AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
+    LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -29,7 +29,7 @@ use crate::model_selection::StartupModel;
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
     build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
-    BuildSystemPromptOptions,
+    BuildSystemPromptOptions, ContextFile,
 };
 use crate::theme::{theme_search_dirs, Theme};
 use loop_ai::CredentialStore;
@@ -40,6 +40,12 @@ pub struct Runtime {
     pub agent_dir: PathBuf,
     /// Cwd.
     pub cwd: PathBuf,
+    /// Custom system prompt loaded at startup, when configured.
+    pub custom_system_prompt: Option<String>,
+    /// Appended system prompt loaded at startup, when configured.
+    pub append_system_prompt: Option<String>,
+    /// Project and user context files loaded at startup.
+    pub context_files: Vec<ContextFile>,
     /// Settings.
     pub settings: Settings,
     /// Models collection.
@@ -88,6 +94,8 @@ pub struct Runtime {
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
     pub active_skills: Vec<String>,
+    /// Started with `--no-web`: no web tools this run (until `/websearch on`).
+    pub web_disabled_for_run: bool,
     /// Process telemetry, when the host application installed it.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<loop_telemetry::TelemetryHandle>,
@@ -417,7 +425,7 @@ impl Runtime {
         &mut self,
         request: &crate::config::ProviderLoginRequest,
     ) -> anyhow::Result<ConnectedProvider> {
-        use crate::config::providers::{replace_api_key, restore_api_key, upsert_custom_provider};
+        use crate::config::providers::upsert_custom_provider;
 
         request.validate()?;
         let (id, name) = (request.provider_id(), request.display_name());
@@ -427,50 +435,229 @@ impl Runtime {
                 .await
                 .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
         }
-        let previous_key = replace_api_key(self.credentials.as_ref(), &id, request.api_key());
         let entry = request.custom_entry();
-        let previous_provider = self.models.get_provider(&id);
-        if let Some(entry) = &entry {
-            self.models.set_provider(entry.provider());
-        }
-
-        let refresh = self
-            .models
-            .refresh(ModelsRefreshOptions {
-                allow_network: Some(true),
+        let provider = match &entry {
+            Some(entry) => Arc::new(entry.provider()),
+            None => self
+                .models
+                .get_provider(&id)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider {id}"))?,
+        };
+        let previous_models = provider.get_models();
+        // Validate without saving a candidate key or lifting explicit logout.
+        provider
+            .refresh_models(loop_ai::RefreshModelsContext {
+                api_key: request.api_key().map(str::to_owned),
+                store: Some(Arc::clone(self.models.models_store())),
+                allow_network: true,
                 force: true,
-                provider_id: Some(id.clone()),
             })
-            .await;
-        let model_count = self.models.get_models(Some(&id)).len();
-        let failure = refresh
-            .errors
-            .get(&id)
-            .cloned()
-            .or_else(|| (model_count == 0).then(|| "no models were listed".to_string()));
-        if let Some(err) = failure {
-            restore_api_key(self.credentials.as_ref(), &id, previous_key);
-            if entry.is_some() {
-                match previous_provider {
-                    Some(provider) => self.models.set_provider(provider),
-                    None => {
-                        self.models.remove_provider(&id);
-                    }
-                }
+            .await
+            .map_err(|e| anyhow::anyhow!("could not list {name} models: {e}"))?;
+        let model_count = provider.get_models().len();
+        if model_count == 0 {
+            anyhow::bail!("could not list {name} models: no models were listed");
+        }
+        let previous_custom = self.settings.providers.clone();
+        if let Some(entry) = &entry {
+            upsert_custom_provider(&mut self.settings.providers, entry.clone());
+            if let Err(error) = self.save_settings() {
+                self.settings.providers = previous_custom;
+                provider.set_models(previous_models);
+                return Err(error);
             }
-            anyhow::bail!("could not list {name} models: {err}");
         }
-
-        if let Some(entry) = entry {
-            upsert_custom_provider(&mut self.settings.providers, entry);
-            self.save_settings()?;
+        if let Err(error) = self
+            .credentials
+            .connect(&id, request.api_key().map(loop_ai::Credential::api_key))
+        {
+            provider.set_models(previous_models);
+            if entry.is_some() {
+                self.settings.providers = previous_custom;
+                self.save_settings()?;
+            }
+            return Err(error.context("could not save login"));
         }
+        self.models.set_provider(provider);
         self.needs_provider_setup = false;
+        if id == loop_ai::providers::SOKET_PROVIDER_ID {
+            // The Soket key also powers the default web search and fetch.
+            self.rebuild_tools().await.map_err(|e| {
+                anyhow::anyhow!("{name} connected, but web tools could not be refreshed: {e:#}")
+            })?;
+        }
         Ok(ConnectedProvider {
             id,
             name,
             model_count,
         })
+    }
+
+    /// `/login tavily|brave`: verify the key with a probe search, save it in the
+    /// credential store (auth.json), enable `webSearch` in settings and
+    /// register the `web_search` tool on the live harness. Nothing is kept if
+    /// the key is rejected.
+    pub async fn connect_web_search(
+        &mut self,
+        provider: &str,
+        api_key: &str,
+    ) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let name = crate::config::web_search_display_name(&provider);
+        if !crate::config::is_web_search_provider(&provider) {
+            anyhow::bail!("unknown web-search provider '{provider}'");
+        }
+        if api_key.trim().is_empty() {
+            anyhow::bail!("{name} needs an API key");
+        }
+        // Keep a same-backend baseUrl / private-address opt-in when re-logging in.
+        let mut config = match &self.settings.web_search {
+            Some(existing) if existing.provider_id() == provider => existing.clone(),
+            _ => WebSearchConfig::default(),
+        };
+        config.provider = Some(provider.clone());
+        config.enabled = true;
+        verify_web_search_key(&config, api_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
+
+        let previous_config = self.settings.web_search.replace(config);
+        if let Err(error) = self.save_settings() {
+            self.settings.web_search = previous_config;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .credentials
+            .connect(&provider, Some(loop_ai::Credential::api_key(api_key)))
+        {
+            self.settings.web_search = previous_config;
+            self.save_settings()?;
+            return Err(error.context("could not save login"));
+        }
+        self.rebuild_tools().await?;
+        Ok(name)
+    }
+
+    /// `/logout tavily|brave`: block this search backend until login.
+    /// Keep the selection so logout cannot silently switch search providers.
+    pub async fn disconnect_web_search(&mut self, provider: &str) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        if loop_agent::harness::web_search_backend(&provider)
+            .is_some_and(|backend| backend.shares_model_provider_key)
+        {
+            return self.disconnect_provider(&provider).await;
+        }
+        let name = crate::config::web_search_display_name(&provider);
+        if !crate::config::is_web_search_provider(&provider) {
+            anyhow::bail!("unknown search provider {provider}");
+        }
+        self.credentials.logout(&provider)?;
+        self.rebuild_tools().await?;
+        Ok(name)
+    }
+
+    /// The web tools this runtime should register.
+    pub fn web_tools(&self) -> crate::web_tools::WebTools {
+        crate::web_tools::WebTools::from_settings(
+            &self.settings,
+            Some(Arc::clone(&self.credentials)),
+            self.web_disabled_for_run,
+        )
+    }
+
+    /// Status of Loop's web tools, distinct from external agents' own tools.
+    pub fn web_status(&self) -> String {
+        let mut status = format!("Loop's {}", self.web_tools().status());
+        if let Some(agent) = self
+            .active_agent
+            .as_deref()
+            .and_then(|id| self.agents.entry(id))
+        {
+            status.push_str(&format!(
+                " · {} uses its own tools; Loop's web settings do not control them",
+                agent.display_name()
+            ));
+        }
+        status
+    }
+
+    /// `/websearch on|off`: persist `webSearch.enabled` and add or drop the
+    /// web tools on the live harness. `on` also lifts `--no-web`.
+    pub async fn set_web_enabled(&mut self, enabled: bool) -> anyhow::Result<String> {
+        self.settings
+            .web_search
+            .get_or_insert_with(Default::default)
+            .enabled = enabled;
+        if enabled {
+            self.web_disabled_for_run = false;
+        }
+        self.save_settings()?;
+        self.rebuild_tools().await?;
+        Ok(self.web_status())
+    }
+
+    /// `/websearch <provider>`: search with `provider` from now on.
+    pub async fn set_web_provider(&mut self, provider: &str) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        if loop_agent::harness::web_search_backend(&provider).is_none() {
+            let ids: Vec<&str> = loop_agent::harness::WEB_SEARCH_BACKENDS
+                .iter()
+                .map(|b| b.id)
+                .collect();
+            anyhow::bail!(
+                "unknown search provider `{provider}`; choose one of: {}",
+                ids.join(", ")
+            );
+        }
+        self.settings
+            .web_search
+            .get_or_insert_with(Default::default)
+            .provider = Some(provider);
+        self.save_settings()?;
+        self.rebuild_tools().await?;
+        Ok(self.web_status())
+    }
+
+    /// Swap the harness tool set for a freshly built one (keeps MCP tools).
+    pub async fn rebuild_tools(&self) -> anyhow::Result<()> {
+        let env = self
+            .harness
+            .tool_env()
+            .await
+            .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
+        let tools = build_tools(env, &self.web_tools());
+        self.harness
+            .set_tools(tools)
+            .await
+            .map_err(|e| anyhow::anyhow!("set tools: {e}"))?;
+        self.refresh_system_prompt().await;
+        self.refresh_mcp_tools().await
+    }
+
+    async fn refresh_system_prompt(&self) {
+        let tools = self.harness.get_tools().await;
+        let selected: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        let snippets = default_tool_snippets();
+        let prompt = build_system_prompt(BuildSystemPromptOptions {
+            custom_prompt: self.custom_system_prompt.as_deref(),
+            append_system_prompt: self.append_system_prompt.as_deref(),
+            cwd: &self.cwd,
+            selected_tools: &selected,
+            tool_snippets: &snippets,
+            context_files: &self.context_files,
+        });
+        self.harness.set_system_prompt(prompt).await;
+    }
+
+    /// Disconnect a model or search provider, respecting shared credentials.
+    pub async fn logout_provider(&mut self, provider: &str) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        match loop_agent::harness::web_search_backend(&provider) {
+            Some(backend) if !backend.shares_model_provider_key => {
+                self.disconnect_web_search(&provider).await
+            }
+            _ => self.disconnect_provider(&provider).await,
+        }
     }
 
     /// `/logout`: forget the provider's key; custom providers are removed entirely. A
@@ -479,11 +666,14 @@ impl Runtime {
         let id = id.trim().to_ascii_lowercase();
         let custom_index = self.settings.providers.iter().position(|p| p.id == id);
         let preset = loop_ai::providers::provider_preset(&id);
-        let had_key = self.credentials.get(&id).is_some();
-        if custom_index.is_none() && !had_key {
+        if custom_index.is_none()
+            && preset.is_none()
+            && self.models.get_provider(&id).is_none()
+            && self.credentials.get(&id).is_none()
+        {
             anyhow::bail!("{id} is not connected");
         }
-        self.credentials.remove(&id);
+        self.credentials.logout(&id)?;
         let name = match custom_index {
             Some(index) => {
                 let entry = self.settings.providers.remove(index);
@@ -506,6 +696,11 @@ impl Runtime {
             self.settings.clear_selected_model();
             self.save_settings()?;
         }
+        if id == loop_ai::providers::SOKET_PROVIDER_ID {
+            self.rebuild_tools().await.map_err(|e| {
+                anyhow::anyhow!("{name} disconnected, but web tools could not be refreshed: {e:#}")
+            })?;
+        }
         Ok(name)
     }
 
@@ -515,6 +710,9 @@ impl Runtime {
         provider: &str,
         id: &str,
     ) -> anyhow::Result<loop_ai::Model> {
+        if self.credentials.is_logged_out(provider) {
+            anyhow::bail!("{provider} is logged out; run /login {provider}");
+        }
         let model = self
             .models
             .get_model(provider, id)
@@ -629,18 +827,26 @@ pub struct BootstrapOpts {
     pub interactive: bool,
     /// Resume session id.
     pub session_id: Option<String>,
+    /// `--no-web`: register no web tools this run.
+    pub no_web: bool,
     /// Start with this external agent. Loop's own provider is then optional.
     pub agent: Option<String>,
 }
 
-/// Build the standard tool set bound to an execution environment.
-pub fn build_tools(env: Arc<dyn loop_agent::harness::ExecutionEnv>) -> Vec<AgentTool> {
-    vec![
+/// Build the standard tool set bound to an execution environment, plus the
+/// web tools `web` asks for (see [`crate::web_tools`]).
+pub fn build_tools(
+    env: Arc<dyn loop_agent::harness::ExecutionEnv>,
+    web: &crate::web_tools::WebTools,
+) -> Vec<AgentTool> {
+    let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool(env),
-    ]
+    ];
+    tools.extend(web.build());
+    tools
 }
 
 /// Ensure at least one LLM provider is connected, or defer to the TUI's `/login` wizard.
@@ -659,7 +865,7 @@ pub fn ensure_provider_connected(
     if !interactive {
         bail!(
             "No LLM provider connected. Set SOKET_API_KEY, OPENROUTER_API_KEY or OPENAI_API_KEY, \
-             or run `loop` and use /login."
+             or run `loop` and use /login. Logged-out providers must reconnect through /login."
         );
     }
     Ok(true)
@@ -901,6 +1107,16 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         StartupModel::Selected(model) => (Some(*model), None),
         StartupModel::NotSelected { reason } => (None, reason),
     };
+    if model
+        .as_ref()
+        .is_some_and(|m| credentials.is_logged_out(&m.provider))
+    {
+        if opts.provider.is_some() || opts.model.is_some() {
+            bail!("selected provider is logged out; run /login before selecting its model");
+        }
+        model = None;
+        model_note = Some("saved provider is logged out; use /login or /model".into());
+    }
     if let Some(m) = &model {
         settings.set_selected_model(&m.provider, &m.id);
     }
@@ -917,16 +1133,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         opts.system_prompt.as_deref(),
         opts.append_system_prompt.as_deref(),
     );
-    let snippets = default_tool_snippets();
-    let selected = ["read", "bash", "edit", "write"];
-    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
-        custom_prompt: custom.as_deref(),
-        append_system_prompt: append.as_deref(),
-        cwd: &opts.cwd,
-        selected_tools: &selected,
-        tool_snippets: &snippets,
-        context_files: &context_files,
-    });
 
     let sessions_db = sessions_db_path(&agent_dir);
     let store = create_sqlite_session_store(&sessions_db)
@@ -948,7 +1154,10 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         if let Ok(ctx) = session.build_context().await {
             if opts.provider.is_none() && opts.model.is_none() {
                 if let Some((p, m)) = &ctx.model {
-                    if let Some(resolved) = models.get_model(p, m) {
+                    if let Some(resolved) = models
+                        .get_model(p, m)
+                        .filter(|_| !credentials.is_logged_out(p))
+                    {
                         settings.set_selected_model(p, m);
                         model = Some(resolved);
                         model_note = None;
@@ -1003,7 +1212,25 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
             }
         };
 
-    let tools = build_tools(Arc::clone(&tool_env));
+    let web = crate::web_tools::WebTools::from_settings(
+        &settings,
+        Some(Arc::clone(&credentials)),
+        opts.no_web,
+    );
+    let tools = build_tools(Arc::clone(&tool_env), &web);
+
+    // The prompt lists the tools that were actually built (web_search may be
+    // unconfigured), so it can never promise a tool the agent cannot call.
+    let snippets = default_tool_snippets();
+    let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
+        custom_prompt: custom.as_deref(),
+        append_system_prompt: append.as_deref(),
+        cwd: &opts.cwd,
+        selected_tools: &selected,
+        tool_snippets: &snippets,
+        context_files: &context_files,
+    });
 
     let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
@@ -1072,6 +1299,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     Ok(Runtime {
         agent_dir,
         cwd: opts.cwd,
+        custom_system_prompt: custom,
+        append_system_prompt: append,
+        context_files,
         settings,
         models,
         credentials,
@@ -1095,6 +1325,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         tool_approval: None,
         mcp_client,
         active_skills: Vec::new(),
+        web_disabled_for_run: opts.no_web,
         #[cfg(feature = "telemetry")]
         telemetry: None,
     })

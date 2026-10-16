@@ -83,6 +83,7 @@ pub fn native_permission_request(
     tool_call.kind = Some(match kind {
         ApprovalKind::FileEdit => ToolKind::Edit,
         ApprovalKind::Bash => ToolKind::Execute,
+        ApprovalKind::Web => ToolKind::Fetch,
     });
     if !detail.is_empty() {
         tool_call.content = Some(vec![ToolContent::text(detail)]);
@@ -131,6 +132,7 @@ pub fn native_decision(outcome: InteractionOutcome) -> ApprovalDecision {
 pub fn approval_kind(kind: Option<ToolKind>) -> ApprovalKind {
     match kind {
         Some(ToolKind::Execute) => ApprovalKind::Bash,
+        Some(ToolKind::Fetch) => ApprovalKind::Web,
         _ => ApprovalKind::FileEdit,
     }
 }

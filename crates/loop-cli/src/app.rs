@@ -22,7 +22,7 @@ use loop_agent::harness::{
     SessionForkSelection,
 };
 use loop_ai::providers::SOKET_BASE_URL;
-use loop_ai::{calculate_context_tokens, ModelsRefreshOptions, Usage};
+use loop_ai::{calculate_context_tokens, CredentialStore, ModelsRefreshOptions, Usage};
 use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
@@ -36,6 +36,7 @@ use crate::commands::TracingCommand;
 use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, SkillsCommand};
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
+use crate::config::ProviderLoginRequest;
 use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
@@ -413,7 +414,7 @@ async fn run_loop(
     runtime.tool_approval = Some(Arc::clone(&bridge));
 
     let mut chat: Vec<ChatItem> = match runtime.backend.transcript(&runtime.session_ref()).await {
-        Ok(updates) => chat_from_transcript(updates),
+        Ok(updates) => chat_from_agent_transcript(updates, active_agent_name(runtime)),
         Err(e) => {
             tracing::warn!("failed to restore session transcript: {e}");
             Vec::new()
@@ -1383,6 +1384,15 @@ async fn drain_ui_events(
                     }
                 }
                 let UpdateEnvelope { update, origin, .. } = *envelope;
+                if origin == Origin::Live && runtime.is_native() {
+                    if let Some(model) = runtime.inner.selected_model.as_ref() {
+                        if let Some(notice) =
+                            take_reasoning_notice(model, &mut runtime.reasoning_notices)
+                        {
+                            push_before_queued(chat, sys(notice));
+                        }
+                    }
+                }
                 handle_update(
                     update,
                     origin,
@@ -1394,6 +1404,7 @@ async fn drain_ui_events(
                     working,
                     token_bar,
                     refresh_token_bar,
+                    active_agent_name(runtime),
                 );
             }
             UiEvent::AgentReady { id, model, result } => {
@@ -3606,6 +3617,7 @@ fn handle_update(
     working: &mut bool,
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
+    source: Option<&str>,
 ) {
     let live = origin == Origin::Live;
     match update {
@@ -3718,7 +3730,8 @@ fn handle_update(
             }
         }
         SessionUpdate::ToolCall(call) => {
-            let name = call.name.clone().unwrap_or_else(|| call.title.clone());
+            let raw_name = call.name.as_deref().unwrap_or(&call.title);
+            let name = tool_display_name(source, raw_name);
             if live {
                 *turn_step = format!("tool · {name}");
             }
@@ -3726,6 +3739,7 @@ fn handle_update(
             finish_thinking(chat, streaming_thinking);
             let summary = match (&call.name, &call.raw_input) {
                 (Some(tool), Some(input)) => tool_args_summary(tool, input),
+                _ if call.title == raw_name => String::new(),
                 _ => call.title.clone(),
             };
             let output = tool_text(&call.content);
@@ -3748,7 +3762,8 @@ fn handle_update(
                 card_status(call.status),
             );
         }
-        SessionUpdate::ToolCallUpdate(update) => {
+        SessionUpdate::ToolCallUpdate(mut update) => {
+            update.name = update.name.map(|name| tool_display_name(source, &name));
             apply_tool_update(update, live, chat, turn_step);
         }
         SessionUpdate::Usage(usage) => {
@@ -3915,8 +3930,41 @@ fn finish_thinking(chat: &mut [ChatItem], streaming_thinking: &mut Option<usize>
     }
 }
 
-/// Rebuild a transcript from a backend's history.
+fn active_agent_name(runtime: &CliRuntime) -> Option<&str> {
+    runtime
+        .active_agent
+        .as_deref()
+        .and_then(|id| runtime.agents.entry(id))
+        .map(|agent| agent.display_name())
+}
+
+fn take_reasoning_notice(
+    model: &loop_ai::Model,
+    reported: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    let spec = format!("{}/{}", model.provider, model.id);
+    if reported.contains(&spec) || !loop_ai::reasoning_rejected(model) {
+        return None;
+    }
+    reported.insert(spec.clone());
+    Some(format!(
+        "Reasoning settings are unavailable for {spec}. Continuing with reasoning off."
+    ))
+}
+
+fn tool_display_name(source: Option<&str>, name: &str) -> String {
+    match source {
+        Some(source) => format!("{source} · {name}"),
+        None => name.to_owned(),
+    }
+}
+
+/// Rebuild a transcript from a native backend's history.
 pub(crate) fn chat_from_transcript(updates: Vec<SessionUpdate>) -> Vec<ChatItem> {
+    chat_from_agent_transcript(updates, None)
+}
+
+fn chat_from_agent_transcript(updates: Vec<SessionUpdate>, source: Option<&str>) -> Vec<ChatItem> {
     let mut chat = Vec::new();
     let (mut status, mut step) = (String::new(), String::new());
     let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, false, false);
@@ -3937,6 +3985,7 @@ pub(crate) fn chat_from_transcript(updates: Vec<SessionUpdate>) -> Vec<ChatItem>
             &mut working,
             &mut token_bar,
             &mut refresh,
+            source,
         );
     }
     chat
@@ -4098,12 +4147,21 @@ async fn advance_provider_setup(
         }
     };
     *status = format!("login · connecting {}…", request.display_name());
-    match runtime.connect_provider(&request).await {
-        Ok(connected) => {
+    let connected = match &request {
+        ProviderLoginRequest::WebSearch { id, api_key } => {
+            runtime.connect_web_search(id, api_key).await.map(|name| {
+                chat.push(sys(format!("✓ Connected {name} · web_search enabled")));
+            })
+        }
+        _ => runtime.connect_provider(&request).await.map(|connected| {
             chat.push(sys(format!(
                 "✓ Connected {} · {} models — /model to choose one",
                 connected.name, connected.model_count
             )));
+        }),
+    };
+    match connected {
+        Ok(()) => {
             *status = "ready · /help for commands".into();
         }
         Err(err) => {
@@ -4118,7 +4176,18 @@ async fn advance_provider_setup(
 /// `/logout [provider]`: returns the line to show in the transcript.
 async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
     let Some(provider) = provider else {
-        let connected = runtime.connected_providers();
+        let mut connected = runtime.connected_providers();
+        if let Some(provider) = runtime
+            .settings
+            .web_search
+            .as_ref()
+            .and_then(|web| web.provider.clone())
+            .filter(|provider| !runtime.credentials.is_logged_out(provider))
+        {
+            if !connected.contains(&provider) {
+                connected.push(provider);
+            }
+        }
         return if connected.is_empty() {
             "Usage: /logout <provider> · no providers are connected".into()
         } else {
@@ -4128,6 +4197,7 @@ async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> Str
             )
         };
     };
+    let provider = provider.trim().to_ascii_lowercase();
     if runtime.is_subscription(&provider) {
         if runtime.active_agent.as_deref() == Some(provider.as_str()) {
             runtime.use_native().await;
@@ -4137,8 +4207,8 @@ async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> Str
             Err(err) => format!("logout: {err:#}"),
         };
     }
-    match runtime.disconnect_provider(&provider).await {
-        Ok(name) => format!("logged out: {name}"),
+    match runtime.logout_provider(&provider).await {
+        Ok(name) => format!("logged out: {name} · {}", runtime.web_status()),
         Err(err) => format!("logout: {err:#}"),
     }
 }
@@ -4262,6 +4332,18 @@ async fn apply_effect(
                 Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
+        CommandEffect::WebSearch(arg) => {
+            let result = match arg.as_deref() {
+                None => Ok(runtime.web_status()),
+                Some("on") => runtime.set_web_enabled(true).await,
+                Some("off") => runtime.set_web_enabled(false).await,
+                Some(provider) => runtime.set_web_provider(provider).await,
+            };
+            match result {
+                Ok(line) => chat.push(sys(line)),
+                Err(err) => chat.push(error_item(format!("{err:#}"))),
+            }
+        }
         CommandEffect::Effort(None) => match runtime.efforts().await {
             Ok((levels, current)) => {
                 let levels: Vec<String> = levels
@@ -4297,6 +4379,7 @@ async fn apply_effect(
             match parts.as_slice() {
                 ["off"] | ["disabled"] => {
                     let harness = Arc::clone(&runtime.harness);
+                    let web = runtime.web_tools();
                     let tx = tx.clone();
                     *working = true;
                     *status = "disabling sandbox…".into();
@@ -4310,7 +4393,7 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(build_tools(env))
+                                .set_tools(build_tools(env, &web))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -4330,6 +4413,7 @@ async fn apply_effect(
                     };
                     let harness = Arc::clone(&runtime.harness);
                     let cwd = runtime.cwd.clone();
+                    let web = runtime.web_tools();
                     let tx = tx.clone();
                     let iso_s = isolation.as_str().to_string();
                     let rt_s = oci_runtime.as_str().to_string();
@@ -4346,7 +4430,9 @@ async fn apply_effect(
                             ));
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
-                            if let Err(e) = harness.set_tools(build_tools(Arc::clone(&env))).await {
+                            if let Err(e) =
+                                harness.set_tools(build_tools(Arc::clone(&env), &web)).await
+                            {
                                 let _ = sb.destroy().await;
                                 return Err(format!("sandbox: {e}"));
                             }
@@ -5169,6 +5255,7 @@ mod tests {
                 &mut working,
                 &mut token_bar,
                 &mut refresh,
+                None,
             );
         }
         (chat, status)
@@ -5211,6 +5298,7 @@ mod tests {
                 &mut working,
                 &mut token_bar,
                 &mut refresh,
+                None,
             );
         }
         chat
@@ -5263,5 +5351,121 @@ mod tests {
         assert!(chat
             .iter()
             .any(|item| matches!(item, ChatItem::Assistant { text } if text == "hello")));
+    }
+}
+
+#[cfg(test)]
+mod external_tool_label_tests {
+    use super::*;
+    use loop_protocol::{ToolCall, ToolCallId, ToolCallUpdate, ToolKind};
+
+    #[test]
+    fn external_tool_cards_keep_their_source_through_updates_and_replay() {
+        let call = SessionUpdate::ToolCall(ToolCall {
+            id: ToolCallId("search-1".into()),
+            name: None,
+            title: "Web search".into(),
+            kind: ToolKind::Fetch,
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            locations: vec![],
+            raw_input: Some(serde_json::json!({"type":"webSearch","query":"example"})),
+        });
+        let initial = chat_from_agent_transcript(vec![call.clone()], Some("ChatGPT"));
+        for expanded in [false, true] {
+            let text =
+                crate::tui::format_item_lines(&initial[0], &Theme::dark(), expanded, false, 100)
+                    .iter()
+                    .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+                    .collect::<String>();
+            assert!(text.contains("ChatGPT · Web search"));
+            assert_eq!(text.matches("Web search").count(), 1, "{text}");
+        }
+        let mut done = ToolCallUpdate::new(ToolCallId("search-1".into()));
+        done.name = Some("web_search".into());
+        done.status = Some(ToolCallStatus::Completed);
+        let chat = chat_from_agent_transcript(
+            vec![call.clone(), SessionUpdate::ToolCallUpdate(done)],
+            Some("ChatGPT"),
+        );
+        assert!(
+            matches!(&chat[0], ChatItem::Tool { name, status: CardStatus::Success, .. } if name == "ChatGPT · web_search")
+        );
+        let native = chat_from_transcript(vec![call]);
+        assert!(matches!(&native[0], ChatItem::Tool { name, .. } if name == "Web search"));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_notice_tests {
+    use super::*;
+    use futures::StreamExt;
+    use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
+    use loop_ai::{
+        AssistantMessageEvent, Context, Message, Models, SimpleStreamOptions, ThinkingLevel,
+    };
+    use loop_test_support::{FakeHttpServer, FakeResponse};
+
+    #[tokio::test]
+    async fn rejected_reasoning_shows_one_plain_notice_and_keeps_the_answer() {
+        let server = FakeHttpServer::start(|request| {
+            if String::from_utf8_lossy(&request.body).contains("reasoning_effort") {
+                FakeResponse::new(
+                    400,
+                    "application/json",
+                    r#"{"error":{"message":"reasoning_effort is not supported for this model"}}"#,
+                )
+            } else {
+                FakeResponse::new(200, "text/event-stream", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+            }
+        });
+        let models = Models::new();
+        let mut spec = CustomModelSpec::new("test-model");
+        spec.reasoning = true;
+        models.set_provider(custom_provider(CustomProviderConfig {
+            id: "gentle-warning-test".into(),
+            name: None,
+            base_url: server.base_url().into(),
+            api_key_env: vec![],
+            models: vec![spec],
+            headers: None,
+        }));
+        let model = models
+            .get_model("gentle-warning-test", "test-model")
+            .unwrap();
+        let mut reported = Default::default();
+        assert!(take_reasoning_notice(&model, &mut reported).is_none());
+        let mut stream = models.stream_simple(
+            &model,
+            &Context {
+                messages: vec![Message::user_text("hi")],
+                ..Default::default()
+            },
+            SimpleStreamOptions::with_reasoning(ThinkingLevel::High),
+        );
+        let mut answer = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextDelta { delta, .. } => answer.push_str(&delta),
+                AssistantMessageEvent::Error { error, .. } => panic!("{:?}", error.error_message),
+                _ => {}
+            }
+        }
+        assert_eq!(answer, "ok");
+        assert_eq!(server.requests().len(), 2);
+        let notice = take_reasoning_notice(&model, &mut reported).expect("fallback is explained");
+        let item = sys(notice);
+        let text = crate::tui::format_item_lines(&item, &Theme::dark(), false, false, 120)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(text.contains("Continuing with reasoning off."));
+        assert!(!text.contains("WARN"));
+        assert!(!text.contains("reasoning_effort"));
+        assert!(matches!(item, ChatItem::System { .. }));
+        assert!(
+            take_reasoning_notice(&model, &mut reported).is_none(),
+            "one notice per model"
+        );
     }
 }

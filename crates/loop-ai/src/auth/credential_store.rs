@@ -9,6 +9,10 @@ use super::types::Credential;
 
 /// Persistent (or in-memory) credential store keyed by provider id.
 pub trait CredentialStore: Send + Sync {
+    /// Explicit logout blocks credentials and ambient authentication until login.
+    fn is_logged_out(&self, _provider_id: &str) -> bool {
+        false
+    }
     /// Get credential for a provider.
     fn get(&self, provider_id: &str) -> Option<Credential>;
     /// Set credential for a provider.

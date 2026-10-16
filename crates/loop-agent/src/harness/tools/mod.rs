@@ -1,6 +1,8 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
 mod file_mutation_queue;
+#[cfg(feature = "web")]
+pub mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +16,7 @@ use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_M
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
 
-fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
         "properties": properties,
@@ -23,7 +25,7 @@ fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json
     })
 }
 
-fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+pub(crate) fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())

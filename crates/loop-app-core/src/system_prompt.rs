@@ -45,6 +45,14 @@ pub fn default_tool_snippets() -> Vec<(&'static str, &'static str)> {
         ("bash", "Run shell commands"),
         ("edit", "Apply exact string replacements in a file"),
         ("write", "Create or overwrite a file"),
+        (
+            "web_fetch",
+            "Fetch a URL and return its text content (HTML becomes plain text)",
+        ),
+        (
+            "web_search",
+            "Search the web and return titles, URLs and snippets",
+        ),
     ]
 }
 
@@ -79,6 +87,12 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
             "Be concise and direct. Prefer action over lengthy explanation.".to_string(),
             "Use tools to inspect the codebase before making changes.".to_string(),
         ];
+        if opts.selected_tools.contains(&"web_search") {
+            guidelines.push(
+                "Discover unfamiliar URLs with web_search before using web_fetch; do not guess domains."
+                    .into(),
+            );
+        }
         if opts.selected_tools.contains(&"bash")
             && !opts.selected_tools.contains(&"grep")
             && !opts.selected_tools.contains(&"find")

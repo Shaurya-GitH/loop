@@ -58,6 +58,13 @@ pub enum ProviderLoginRequest {
         /// API key; `None` for keyless local servers.
         api_key: Option<String>,
     },
+    /// A web-search backend (`tavily`, `brave`) for the `web_search` tool.
+    WebSearch {
+        /// Backend id.
+        id: String,
+        /// API key.
+        api_key: String,
+    },
 }
 
 impl std::fmt::Debug for ProviderLoginRequest {
@@ -72,6 +79,10 @@ impl std::fmt::Debug for ProviderLoginRequest {
                 .field("name", name)
                 .field("base_url", base_url)
                 .finish_non_exhaustive(),
+            Self::WebSearch { id, .. } => f
+                .debug_struct("WebSearch")
+                .field("id", id)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -80,7 +91,7 @@ impl ProviderLoginRequest {
     /// Provider id this request configures.
     pub fn provider_id(&self) -> String {
         match self {
-            Self::Preset { id, .. } => id.trim().to_ascii_lowercase(),
+            Self::Preset { id, .. } | Self::WebSearch { id, .. } => id.trim().to_ascii_lowercase(),
             Self::Custom { name, .. } => slugify(name),
         }
     }
@@ -92,6 +103,7 @@ impl ProviderLoginRequest {
                 provider_preset(id).map_or_else(|| id.clone(), |p| p.name.into())
             }
             Self::Custom { name, .. } => name.trim().to_string(),
+            Self::WebSearch { id, .. } => web_search_display_name(id),
         }
     }
 
@@ -100,6 +112,7 @@ impl ProviderLoginRequest {
         let key = match self {
             Self::Preset { api_key, .. } => Some(api_key.as_str()),
             Self::Custom { api_key, .. } => api_key.as_deref(),
+            Self::WebSearch { api_key, .. } => Some(api_key.as_str()),
         };
         key.map(str::trim).filter(|k| !k.is_empty())
     }
@@ -108,7 +121,7 @@ impl ProviderLoginRequest {
     pub fn preset(&self) -> Option<&'static ProviderPreset> {
         match self {
             Self::Preset { id, .. } => provider_preset(id),
-            Self::Custom { .. } => None,
+            Self::Custom { .. } | Self::WebSearch { .. } => None,
         }
     }
 
@@ -120,7 +133,7 @@ impl ProviderLoginRequest {
                 name: self.display_name(),
                 base_url: base_url.trim().trim_end_matches('/').to_string(),
             }),
-            Self::Preset { .. } => None,
+            Self::Preset { .. } | Self::WebSearch { .. } => None,
         }
     }
 
@@ -144,9 +157,30 @@ impl ProviderLoginRequest {
                 }
                 validate_http_url("Base URL", base_url)?;
             }
+            Self::WebSearch { id, .. } => {
+                if !is_web_search_provider(&self.provider_id()) {
+                    anyhow::bail!("unknown web-search provider `{id}`");
+                }
+                if self.api_key().is_none() {
+                    anyhow::bail!("{} needs an API key", self.display_name());
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `id` names a built-in web-search backend (see loop-agent's
+/// `WEB_SEARCH_BACKENDS` registry — the single source of truth).
+pub fn is_web_search_provider(id: &str) -> bool {
+    loop_agent::harness::web_search_backend(id).is_some()
+}
+
+/// Display name for a web-search backend id.
+pub fn web_search_display_name(id: &str) -> String {
+    loop_agent::harness::web_search_backend(id)
+        .map(|info| info.display_name.to_string())
+        .unwrap_or_else(|| id.trim().to_string())
 }
 
 /// `"My Gateway!"` → `"my-gateway"`.
@@ -182,14 +216,20 @@ pub fn connected_providers(
     let mut ids: Vec<String> = PROVIDER_PRESETS
         .iter()
         .filter(|p| {
-            store.get(p.id).is_some()
-                || p.api_key_envs
-                    .iter()
-                    .any(|e| env(e).is_some_and(|v| !v.trim().is_empty()))
+            !store.is_logged_out(p.id)
+                && (store.get(p.id).is_some()
+                    || p.api_key_envs
+                        .iter()
+                        .any(|e| env(e).is_some_and(|v| !v.trim().is_empty())))
         })
         .map(|p| p.id.to_string())
         .collect();
-    ids.extend(custom.iter().map(|c| c.id.clone()));
+    ids.extend(
+        custom
+            .iter()
+            .filter(|c| !store.is_logged_out(&c.id))
+            .map(|c| c.id.clone()),
+    );
     ids
 }
 

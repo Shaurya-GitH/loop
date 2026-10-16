@@ -11,6 +11,7 @@ Stateful agent with tool execution and event streaming, built on [`loop-ai`](../
 | Harness | `harness::AgentHarness` | Sessions, snapshots, sandbox, resources |
 | Sessions | `harness::session` | Memory, JSONL, SQLite (+ FTS), scanning search |
 | Tools | `harness::tools` | `read` / `write` / `edit` / `bash` over `ExecutionEnv` |
+| Web tools | `harness::tools::web` | `web_fetch` / `web_search` with an SSRF-guarded HTTP client (`web` feature, on by default) |
 | Sandbox | `harness::sandbox` | Pluggable env for tool side-effects (`KrunSandbox` / local krun) |
 
 ## Quick start
@@ -36,6 +37,33 @@ let agent = Agent::new(AgentOptions::new(
 agent.prompt("Hello").await.unwrap();
 # }
 ```
+
+## Web tools
+
+`web_fetch` and `web_search` run in the harness process (host network), not
+inside the sandbox environment. Every outbound URL passes the SSRF guard in
+`harness::tools::web::guard`:
+
+- `http`/`https` only, no URL credentials;
+- literal-IP hosts must be public; hostnames are resolved through a validating
+  resolver, so a connection is only ever established to a public address
+  (redirects are followed manually and each hop is re-validated — DNS
+  rebinding included);
+- downloads are capped (2 MB) and truncated to the model's tool-output budget.
+
+The default policy fails closed. `WebFetchConfig { allow_private_addresses: true }`
+opts a deployment into intranet mirrors (and the same field on
+`WebSearchConfig` allows private search-API base URLs).
+
+`web_search` is backend-driven. The registry in `harness::tools::web::search`
+lists `soket` (the default, using the Soket model-provider key), `tavily`,
+`tinyfish` and `brave`.
+
+`web_fetch` takes an optional `SoketWebApi`: with one (and
+`WebFetchProvider::Auto` or `Soket`), pages are fetched by Soket's fetch API
+and returned as markdown; the target URL still passes the strict guard before
+it is sent. Without one, or with `WebFetchProvider::Direct` or
+`allow_private_addresses`, the guarded direct client above is used.
 
 ## Sandbox
 

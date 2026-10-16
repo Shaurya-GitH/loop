@@ -437,6 +437,16 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Replace the base system prompt used for the next turn.
+    pub async fn set_system_prompt(&self, prompt: impl Into<String>) {
+        *self.system_prompt.write().await = prompt.into();
+    }
+
+    /// Current base system prompt, without turn-specific skill instructions.
+    pub async fn system_prompt(&self) -> String {
+        self.system_prompt.read().await.clone()
+    }
+
     /// Get the current set of tools (cloned, async).
     pub async fn get_tools(&self) -> Vec<AgentTool> {
         self.tools.read().clone()

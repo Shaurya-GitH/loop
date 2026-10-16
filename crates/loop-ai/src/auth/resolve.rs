@@ -47,6 +47,12 @@ pub async fn resolve_provider_auth(
     store: &dyn CredentialStore,
     explicit_api_key: Option<&str>,
 ) -> Result<ModelAuth, ModelsError> {
+    if store.is_logged_out(provider_id) {
+        return Err(ModelsError::Auth {
+            code: ModelsErrorCode::NotConfigured,
+            message: format!("{provider_id} is logged out; run /login {provider_id}"),
+        });
+    }
     if let Some(key) = explicit_api_key {
         if auth.api_key.is_some() {
             return Ok(ModelAuth {
@@ -98,6 +104,13 @@ pub async fn check_provider_auth(
     auth: &ProviderAuth,
     store: &dyn CredentialStore,
 ) -> AuthCheck {
+    if store.is_logged_out(provider_id) {
+        return AuthCheck {
+            provider_id: provider_id.to_string(),
+            configured: false,
+            message: Some(format!("logged out; run /login {provider_id}")),
+        };
+    }
     if store.get(provider_id).is_some() {
         return AuthCheck {
             provider_id: provider_id.to_string(),

@@ -43,6 +43,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[provider/model]"),
         },
         SlashCommand {
+            name: "websearch",
+            description: "Loop's web search and fetch: status, on/off, or provider",
+            args_hint: Some("[on|off|soket|tavily|tinyfish|brave]"),
+        },
+        SlashCommand {
             name: "effort",
             description: "Show or set the reasoning effort (shift+tab cycles)",
             args_hint: Some("[level]"),
@@ -320,6 +325,8 @@ pub enum CommandEffect {
     SetTheme(String),
     /// Open model picker (empty = picker, Some = set).
     SelectModel(Option<String>),
+    /// Web tools status (None), `on`/`off`, or a search provider.
+    WebSearch(Option<String>),
     /// Show the reasoning effort levels (None) or set one.
     Effort(Option<String>),
     /// Sandbox mode change.
@@ -532,6 +539,11 @@ pub fn dispatch(
             None
         } else {
             Some(cmd.args.clone())
+        }),
+        "websearch" => CommandEffect::WebSearch(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.trim().to_owned())
         }),
         "effort" => CommandEffect::Effort(if cmd.args.is_empty() {
             None

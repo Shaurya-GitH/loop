@@ -8,9 +8,11 @@ description = "Stateful agent with tool execution and event streaming"
 readme = "README.md"
 
 [features]
-default = ["sqlite", "proxy"]
+default = ["sqlite", "proxy", "web"]
 sqlite = ["dep:rusqlite"]
 proxy = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+# First-class `web_fetch` / `web_search` tools (SSRF-guarded HTTP client).
+web = ["dep:reqwest"]
 mcp = ["dep:loop-mcp", "dep:rmcp"]
 orchestration = ["dep:loop-orchestration"]
 # Langfuse / OTLP observations from the agent loop. Off by default.
@@ -54,6 +56,7 @@ required-features = ["telemetry"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+loop-test-support = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -129,7 +129,10 @@ mod tests {
     fn provider_prompt_delegates_to_login_wizard() {
         let prompt =
             SetupPrompt::Provider(ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap());
-        assert_eq!(prompt.title(), "Connect a model provider or subscription");
+        assert_eq!(
+            prompt.title(),
+            "Connect a model provider, subscription or web search"
+        );
         assert!(prompt.options().is_some());
         assert!(prompt.esc_quits(true));
         assert!(!prompt.esc_quits(false));

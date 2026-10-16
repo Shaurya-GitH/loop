@@ -331,7 +331,7 @@ impl Models {
             let ctx = RefreshModelsContext {
                 api_key,
                 store: Some(Arc::clone(&self.models_store)),
-                allow_network,
+                allow_network: allow_network && !self.credentials.is_logged_out(&provider.id),
                 force: options.force,
             };
 

@@ -25,8 +25,8 @@ pub fn debug_enabled(cli_flag: bool) -> bool {
 
 /// Initialize tracing. In debug mode, writes session logs under `cwd/target/debug/logs`.
 ///
-/// Interactive TUI mode writes **file only** (stderr would corrupt the UI). Non-interactive
-/// mode tees to stderr as well. `export_layer` (the telemetry exporter, when built with
+/// Interactive TUI mode never writes logs to stderr; `--debug` retains them in a file.
+/// Non-interactive mode keeps stderr logging. `export_layer` (the telemetry exporter, when built with
 /// the `telemetry` feature) sees observation spans independently of the log filter.
 pub fn init_tracing(
     debug: bool,
@@ -52,8 +52,13 @@ pub fn init_tracing(
             .boxed();
         (layer, Some(path))
     } else {
+        let writer: Box<dyn Write + Send> = if interactive {
+            Box::new(io::sink())
+        } else {
+            Box::new(io::stderr())
+        };
         let layer = fmt::layer()
-            .with_writer(io::stderr)
+            .with_writer(Mutex::new(writer))
             .with_target(true)
             .boxed();
         (layer, None)

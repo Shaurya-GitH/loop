@@ -41,6 +41,8 @@ pub struct CliRuntime {
     pub signing_in: Option<String>,
     /// Backend instances whose updates are already forwarded to the surface.
     pub forwarded: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Recoverable reasoning warnings already shown in this CLI process.
+    pub(crate) reasoning_notices: std::collections::HashSet<String>,
 }
 
 /// An external agent to start when the surface is ready.
@@ -85,5 +87,6 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         starting_agent: None,
         signing_in: None,
         forwarded: Default::default(),
+        reasoning_notices: Default::default(),
     })
 }

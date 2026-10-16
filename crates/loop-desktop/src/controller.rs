@@ -128,6 +128,7 @@ impl DesktopController {
                 system_prompt: None,
                 append_system_prompt: None,
                 no_context_files: false,
+                no_web: false,
                 interactive: false,
                 session_id: None,
                 agent: None,
