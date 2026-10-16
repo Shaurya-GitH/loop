@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
+    create_bash_tool_with, create_edit_tool, create_read_tool, create_session_repository,
     create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
     AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
     LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
@@ -571,6 +571,11 @@ impl Runtime {
         )
     }
 
+    /// `bash` time limits from settings.
+    pub fn bash_limits(&self) -> loop_agent::harness::BashLimits {
+        self.settings.bash.unwrap_or_default().limits()
+    }
+
     /// The active permission mode.
     pub fn permission_mode(&self) -> crate::permissions::PermissionMode {
         self.tool_gate.mode()
@@ -666,7 +671,7 @@ impl Runtime {
             .tool_env()
             .await
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
-        let tools = build_tools(env, &self.web_tools());
+        let tools = build_tools(env, &self.web_tools(), self.bash_limits());
         self.harness
             .set_tools(tools)
             .await
@@ -939,12 +944,13 @@ pub struct BootstrapOpts {
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     web: &crate::web_tools::WebTools,
+    bash: loop_agent::harness::BashLimits,
 ) -> Vec<AgentTool> {
     let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
-        create_bash_tool(env),
+        create_bash_tool_with(env, None, bash),
     ];
     tools.extend(web.build());
     tools
@@ -1318,7 +1324,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         Some(Arc::clone(&credentials)),
         opts.no_web,
     );
-    let tools = build_tools(Arc::clone(&tool_env), &web);
+    let bash_limits = settings.bash.unwrap_or_default().limits();
+    let tools = build_tools(Arc::clone(&tool_env), &web, bash_limits);
 
     // The prompt lists the tools that were actually built (web_search may be
     // unconfigured), so it can never promise a tool the agent cannot call.
@@ -1350,6 +1357,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     harness
         .set_thinking_level(parse_thinking(&settings.default_thinking_level))
         .await;
+    harness.set_bash_limits(bash_limits);
     harness
         .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;

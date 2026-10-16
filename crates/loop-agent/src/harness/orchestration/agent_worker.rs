@@ -242,6 +242,7 @@ impl Worker for AgentWorker {
 pub struct ShellWorker {
     host_env: Arc<dyn ExecutionEnv>,
     hooks: WorkflowToolHooks,
+    timeout_ms: u64,
 }
 
 impl ShellWorker {
@@ -250,7 +251,14 @@ impl ShellWorker {
         Self {
             host_env,
             hooks: WorkflowToolHooks::default(),
+            timeout_ms: crate::harness::tools::BashLimits::default().default_timeout_ms,
         }
+    }
+
+    /// Stop each command after `timeout_ms`, like the `bash` tool's default.
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
     }
 
     /// Check each command with `hooks.before`, as if it were a `bash` call.
@@ -315,6 +323,7 @@ impl Worker for ShellWorker {
 
         let options = ShellExecOptions {
             cancel: Some(ctx.cancel.clone()),
+            timeout_ms: Some(self.timeout_ms),
             ..Default::default()
         };
 

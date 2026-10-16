@@ -175,6 +175,10 @@ pub struct Settings {
     /// tool is only registered when the backend's API key resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<loop_agent::harness::WebSearchConfig>,
+    /// `bash` time limits (`bash.defaultTimeoutMs`, `bash.maxTimeoutMs`).
+    /// Global only: a project file cannot change them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash: Option<BashSettings>,
     /// Permission mode at startup: `read-only`, `ask` (default),
     /// `accept-edits` or `full-access`. A project file may only choose a
     /// stricter mode.
@@ -267,6 +271,7 @@ impl Default for Settings {
             sandbox: SandboxSettings::default(),
             web_fetch: None,
             web_search: None,
+            bash: None,
             permission_mode: None,
             file_edit_review: default_file_edit_review(),
             diff_editor: None,
@@ -278,6 +283,34 @@ impl Default for Settings {
             tracing: TracingSettings::default(),
             providers: Vec::new(),
             agents: Vec::new(),
+        }
+    }
+}
+
+/// `bash` settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashSettings {
+    /// Timeout when a call names none, in ms (default 120000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_timeout_ms: Option<u64>,
+    /// The most a call may ask for, in ms (default 600000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_timeout_ms: Option<u64>,
+}
+
+impl BashSettings {
+    /// The limits these settings ask for, over the built-in defaults. The
+    /// maximum is never below the default.
+    pub fn limits(&self) -> loop_agent::harness::BashLimits {
+        let base = loop_agent::harness::BashLimits::default();
+        let default_timeout_ms = self.default_timeout_ms.unwrap_or(base.default_timeout_ms);
+        loop_agent::harness::BashLimits {
+            default_timeout_ms,
+            max_timeout_ms: self
+                .max_timeout_ms
+                .unwrap_or(base.max_timeout_ms)
+                .max(default_timeout_ms),
         }
     }
 }
@@ -570,6 +603,25 @@ mod tests {
         let always: Settings = serde_json::from_str(r#"{"fileEditReview": "always"}"#).unwrap();
         global.merge_project(always);
         assert_eq!(global.file_edit_review, "always");
+    }
+
+    #[test]
+    fn bash_limits_are_global_only() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"bash": {"defaultTimeoutMs": 300000}}"#).unwrap();
+        let limits = global.bash.unwrap().limits();
+        assert_eq!(limits.default_timeout_ms, 300_000);
+        assert_eq!(limits.max_timeout_ms, 600_000);
+        let project: Settings =
+            serde_json::from_str(r#"{"bash": {"maxTimeoutMs": 99999999}}"#).unwrap();
+        global.merge_project(project);
+        assert_eq!(global.bash.unwrap().limits().max_timeout_ms, 600_000);
+
+        let low_max = BashSettings {
+            default_timeout_ms: Some(900_000),
+            max_timeout_ms: Some(1_000),
+        };
+        assert_eq!(low_max.limits().max_timeout_ms, 900_000);
     }
 
     #[test]
