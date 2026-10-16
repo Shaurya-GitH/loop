@@ -14,7 +14,7 @@
 //! allowed the call), then `tool_result` hooks, which may add context for
 //! the model.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
@@ -40,8 +40,10 @@ pub struct ToolGate {
     harness: Mutex<Weak<AgentHarness>>,
     mode: Mutex<PermissionMode>,
     workspace: Mutex<Option<PathBuf>>,
-    /// Calls allowed without asking; their after-call review is skipped.
-    allowed: Mutex<HashSet<String>>,
+    /// Calls allowed without asking, counted by [`call_key`]; their
+    /// after-call review is skipped. Keyed by more than the id, which a
+    /// server may leave empty or reuse across parallel workflow tasks.
+    allowed: Mutex<HashMap<String, usize>>,
 }
 
 impl ToolGate {
@@ -72,6 +74,8 @@ impl ToolGate {
     /// Switch the permission mode; applies to the next call.
     pub fn set_mode(&self, mode: PermissionMode) {
         *self.mode.lock() = mode;
+        // A call allowed under the old mode is reviewed under the new one.
+        self.allowed.lock().clear();
     }
 
     /// The directory `accept-edits` may edit (default: the git root of the
@@ -167,6 +171,7 @@ impl ToolGate {
             approver.set_permissions(permissions.clone());
         }
         *self.permissions.lock() = permissions;
+        self.allowed.lock().clear();
     }
 
     fn approver(&self) -> Option<Arc<ToolApprovalBridge>> {
@@ -179,8 +184,25 @@ impl ToolGate {
             .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
     }
 
-    fn mark_allowed(&self, call_id: &str) {
-        self.allowed.lock().insert(call_id.to_owned());
+    fn mark_allowed(&self, call: &ToolCall, args: &serde_json::Value) {
+        *self.allowed.lock().entry(call_key(call, args)).or_default() += 1;
+    }
+
+    /// Whether `call` was allowed without asking; consumes the mark.
+    fn take_allowed(&self, call: &ToolCall, args: &serde_json::Value) -> bool {
+        let mut allowed = self.allowed.lock();
+        let key = call_key(call, args);
+        match allowed.get_mut(&key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                true
+            }
+            Some(_) => {
+                allowed.remove(&key);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The gate's before-call check, for callers outside the harness
@@ -215,14 +237,14 @@ impl ToolGate {
                     match outcome.decision {
                         Some(ToolDecision::Block { reason }) => return block(reason),
                         Some(ToolDecision::Allow) => {
-                            gate.mark_allowed(&ctx.tool_call.id);
+                            gate.mark_allowed(&ctx.tool_call, &ctx.args);
                             return None;
                         }
                         None => {}
                     }
                 }
                 if decision == Decision::Allow {
-                    gate.mark_allowed(&ctx.tool_call.id);
+                    gate.mark_allowed(&ctx.tool_call, &ctx.args);
                     return None;
                 }
                 match gate.approver() {
@@ -245,7 +267,7 @@ impl ToolGate {
         Arc::new(move |ctx, cancel| {
             let gate = Arc::clone(&gate);
             Box::pin(async move {
-                let allowed = gate.allowed.lock().remove(&ctx.tool_call.id);
+                let allowed = gate.take_allowed(&ctx.tool_call, &ctx.args);
                 let patch = match gate.approver() {
                     Some(approver) if !allowed => {
                         approver.review_after_file_tool(ctx.clone(), cancel).await
@@ -277,6 +299,11 @@ impl ToolGate {
             })
         })
     }
+}
+
+/// Identifies a call between the before and after hooks.
+fn call_key(call: &ToolCall, args: &serde_json::Value) -> String {
+    format!("{}\u{0}{}\u{0}{args}", call.id, call.name)
 }
 
 /// The text parts of a tool result, capped at [`HOOK_OUTPUT_CAP`] bytes.
@@ -504,9 +531,8 @@ mod tests {
         assert!(prompts.try_recv().is_err());
 
         let before = call("write");
-        let id = before.tool_call.id.clone();
         assert!(gate.before_hook()(before.clone(), None).await.is_none());
-        assert!(gate.allowed.lock().contains(&id));
+        assert_eq!(gate.allowed.lock().len(), 2, "bash and the write");
         let ctx = loop_agent::AfterToolCallContext {
             assistant_message: before.assistant_message,
             tool_call: before.tool_call,
@@ -520,7 +546,11 @@ mod tests {
             prompts.try_recv().is_err(),
             "no review after an allowed edit"
         );
-        assert!(gate.allowed.lock().is_empty());
+        assert_eq!(
+            gate.allowed.lock().len(),
+            1,
+            "the write's mark was consumed"
+        );
     }
 
     #[tokio::test]
@@ -534,5 +564,34 @@ mod tests {
         gate.set_hooks(registry);
         let result = gate.before_hook()(call("read"), None).await.unwrap();
         assert!(result.reason.unwrap().contains("seen"));
+    }
+
+    #[tokio::test]
+    async fn a_shared_call_id_does_not_skip_another_calls_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gate, _prompts) = gate_with_approver(&[("write", "ask")]);
+        gate.set_mode(PermissionMode::AcceptEdits);
+        gate.set_workspace(dir.path().to_path_buf());
+        let with_path = |path: &str| {
+            let mut ctx = call("write");
+            ctx.tool_call.id = String::new();
+            ctx.args = serde_json::json!({ "path": path, "content": "x" });
+            ctx.tool_call.arguments = ctx.args.clone();
+            ctx
+        };
+        let inside = with_path("notes.txt");
+        let outside = with_path("/etc/elsewhere.txt");
+        assert!(gate.before_hook()(inside.clone(), None).await.is_none());
+        assert!(gate.take_allowed(&inside.tool_call, &inside.args));
+        assert!(gate.before_hook()(inside.clone(), None).await.is_none());
+        assert!(
+            !gate.take_allowed(&outside.tool_call, &outside.args),
+            "the outside write shares the empty id but was not allowed"
+        );
+        gate.set_mode(PermissionMode::Ask);
+        assert!(
+            !gate.take_allowed(&inside.tool_call, &inside.args),
+            "changing mode forgets earlier allows"
+        );
     }
 }
