@@ -54,9 +54,15 @@ pub struct AgentEntry {
     pub home_env: Option<String>,
     /// The agent's sign-in method for the subscription (an ACP auth method
     /// id the agent handles itself, for example by opening a browser).
-    /// `None` means the agent needs no sign-in.
+    /// `None`, with no [`Self::preferred_auth_methods`], means the agent needs
+    /// no sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+    /// Sign-in methods to use instead of [`Self::auth_method`] when the agent
+    /// offers them, best first. Used for methods that show the user a link
+    /// (ACP URL elicitation) instead of only opening a browser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferred_auth_methods: Vec<String>,
 }
 
 impl AgentEntry {
@@ -67,6 +73,11 @@ impl AgentEntry {
         } else {
             &self.name
         }
+    }
+
+    /// Whether the agent needs a sign-in before use.
+    pub fn needs_sign_in(&self) -> bool {
+        self.auth_method.is_some() || !self.preferred_auth_methods.is_empty()
     }
 
     /// The `/login` row label, falling back to the name.
@@ -104,6 +115,9 @@ pub fn builtin_agents() -> Vec<AgentEntry> {
         install_hint: Some("Needs Node.js (npx).".into()),
         home_env: Some("CODEX_HOME".into()),
         auth_method: Some("chat-gpt".into()),
+        // Gives Loop the sign-in link and a one-time code to show, so the
+        // sign-in also works when the browser opens elsewhere.
+        preferred_auth_methods: vec!["chat-gpt-device-code".into()],
     }]
 }
 
@@ -235,17 +249,27 @@ impl AgentManager {
             .entry(id)
             .ok_or_else(|| anyhow!("no subscription named `{id}`"))?;
         let backend = self.backend(id).await?;
-        if let Some(method) = &entry.auth_method {
-            let offered = backend.auth_methods().into_iter().any(|m| match m {
-                AuthMethod::Agent(m) => m.id.0.as_ref() == method.as_str(),
-                _ => false,
-            });
-            if !offered {
+        let wanted: Vec<&String> = entry
+            .preferred_auth_methods
+            .iter()
+            .chain(entry.auth_method.as_ref())
+            .collect();
+        if !wanted.is_empty() {
+            let offered: Vec<String> = backend
+                .auth_methods()
+                .into_iter()
+                .filter_map(|m| match m {
+                    AuthMethod::Agent(m) => Some(m.id.0.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let Some(method) = wanted.iter().find(|m| offered.contains(m)) else {
                 bail!(
-                    "{} no longer offers the `{method}` sign-in; update Loop",
-                    entry.display_name()
+                    "{} no longer offers the `{}` sign-in; update Loop",
+                    entry.display_name(),
+                    wanted.last().map_or("", |m| m.as_str())
                 );
-            }
+            };
             backend.authenticate(method).await?;
             self.mark_signed_in(id)?;
         }

@@ -854,7 +854,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let subscribed = agents
         .entries()
         .iter()
-        .any(|e| e.auth_method.is_some() && agents.is_signed_in(&e.id));
+        .any(|e| e.needs_sign_in() && agents.is_signed_in(&e.id));
     let needs_provider_setup = opts.agent.is_none()
         && !subscribed
         && ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;

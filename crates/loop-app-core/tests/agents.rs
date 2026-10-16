@@ -57,7 +57,8 @@ impl Connector for FakeAgent {
                     "agentCapabilities": {"loadSession": true},
                     "authMethods": [
                         {"id": "api-key", "name": "API Key"},
-                        {"id": "chat-gpt", "name": "ChatGPT"}
+                        {"id": "chat-gpt", "name": "ChatGPT"},
+                        {"id": "chat-gpt-device-code", "name": "ChatGPT (device code)"}
                     ]}),
                     "authenticate" => json!({}),
                     "session/new" => {
@@ -117,15 +118,14 @@ fn subscription() -> AgentEntry {
 }
 
 fn manager(dir: &Path) -> (AgentManager, Seen, Env) {
+    manager_with(dir, vec![subscription()])
+}
+
+fn manager_with(dir: &Path, entries: Vec<AgentEntry>) -> (AgentManager, Seen, Env) {
     let agent = FakeAgent::default();
     let seen = Arc::clone(&agent.seen);
     let env = Arc::clone(&agent.env);
-    let manager = AgentManager::with_connector(
-        vec![subscription()],
-        dir.to_path_buf(),
-        dir,
-        Arc::new(agent),
-    );
+    let manager = AgentManager::with_connector(entries, dir.to_path_buf(), dir, Arc::new(agent));
     (manager, seen, env)
 }
 
@@ -258,4 +258,30 @@ async fn unknown_subscription_is_an_error() {
     let err = agents.backend("nope").await.unwrap_err();
     assert!(err.to_string().contains("no subscription"));
     assert!(!agents.is_signed_in("nope"));
+}
+
+#[tokio::test]
+async fn sign_in_prefers_a_listed_method_the_agent_offers() {
+    let entry = |id: &str, preferred: &str| -> AgentEntry {
+        serde_json::from_value(json!({
+            "id": id, "command": "fake-agent", "authMethod": "chat-gpt",
+            "preferredAuthMethods": [preferred]
+        }))
+        .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (agents, seen, _) = manager_with(
+        dir.path(),
+        vec![
+            entry("offered", "chat-gpt-device-code"),
+            entry("missing", "not-offered"),
+        ],
+    );
+    agents.sign_in("offered").await.unwrap();
+    agents.sign_in("missing").await.unwrap();
+    let methods: Vec<_> = sent(&seen, "authenticate")
+        .iter()
+        .map(|m| m["params"]["methodId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(methods, ["chat-gpt-device-code", "chat-gpt"]);
 }
