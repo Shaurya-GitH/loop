@@ -324,9 +324,7 @@ impl Worker for ShellWorker {
         use crate::harness::types::ShellExecOptions;
 
         if let Some(reason) = self.blocked(&task.id, command, &ctx.cancel).await {
-            return Err(WorkerError::ExecutionFailed(format!(
-                "command blocked: {reason}"
-            )));
+            return Err(WorkerError::Blocked(reason));
         }
         if ctx.cancel.is_cancelled() {
             return Err(WorkerError::Cancelled);
