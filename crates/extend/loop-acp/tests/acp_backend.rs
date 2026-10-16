@@ -281,6 +281,35 @@ async fn prompt(agent: &Agent, world: &World, session: &str, text: &str) -> Resu
             world.cancel.notified().await;
             Ok(json!({"stopReason": "cancelled"}))
         }
+        "ask" => {
+            let form = agent
+                .request(
+                    "elicitation/create",
+                    json!({"sessionId": session, "mode": "form", "message": "Which file?",
+                    "requestedSchema": {"type": "object",
+                        "properties": {"file": {"type": "string", "title": "File"}},
+                        "required": ["file"]}}),
+                )
+                .await;
+            world
+                .answers
+                .lock()
+                .unwrap()
+                .push(("elicitation/form".into(), form["result"].clone()));
+            let url = agent
+                .request(
+                    "elicitation/create",
+                    json!({"sessionId": session, "mode": "url", "message": "Sign in to the MCP server",
+                    "elicitationId": "e1", "url": "https://example.com/auth"}),
+                )
+                .await;
+            world
+                .answers
+                .lock()
+                .unwrap()
+                .push(("elicitation/url".into(), url["result"].clone()));
+            end_turn
+        }
         "burst" => {
             for n in 0..40 {
                 agent.text(session, &format!("{n},"));
@@ -351,12 +380,26 @@ struct FakeHost {
     answer: Option<String>,
     files: Option<Mutex<HashMap<PathBuf, String>>>,
     asked: Mutex<Vec<InteractionRequest>>,
+    /// The answer to forms; `None` declines them.
+    form_answer: Option<Value>,
 }
 
 #[async_trait]
 impl HostServices for FakeHost {
     async fn interact(&self, request: InteractionRequest) -> InteractionOutcome {
+        let form = matches!(request, InteractionRequest::Form { .. });
         self.asked.lock().unwrap().push(request);
+        if form {
+            return match &self.form_answer {
+                Some(value) => InteractionOutcome::Answered {
+                    value: value.clone(),
+                },
+                None => InteractionOutcome::Selected {
+                    native_id: loop_protocol::DECLINE_CHOICE.into(),
+                    note: None,
+                },
+            };
+        }
         match &self.answer {
             Some(id) => InteractionOutcome::Selected {
                 native_id: id.clone(),
@@ -959,4 +1002,75 @@ async fn sessions_of_another_backend_are_refused() {
     );
     // Our own session still works.
     assert!(control.models(&ours).await.is_ok());
+}
+
+#[tokio::test]
+async fn elicitations_reach_the_host_and_answers_reach_the_agent() {
+    let host = FakeHost {
+        answer: Some("open".into()),
+        form_answer: Some(json!({"file": "a.txt"})),
+        ..FakeHost::default()
+    };
+    let fx = fixture(World::default(), host).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    let handle = fx.backend.prompt(&session, say("ask")).await.unwrap();
+    assert_eq!(
+        outcome(handle).await,
+        TurnOutcome::Completed(StopReason::EndTurn)
+    );
+
+    let init = fx
+        .world
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|m| m["method"] == "initialize")
+        .cloned()
+        .unwrap();
+    let elicitation = &init["params"]["clientCapabilities"]["elicitation"];
+    assert!(elicitation["form"].is_object() && elicitation["url"].is_object());
+
+    assert_eq!(
+        fx.world.answer_to("elicitation/form").unwrap(),
+        json!({"action": "accept", "content": {"file": "a.txt"}})
+    );
+    assert_eq!(
+        fx.world.answer_to("elicitation/url").unwrap(),
+        json!({"action": "accept"})
+    );
+    let asked = fx.host.asked.lock().unwrap();
+    assert!(matches!(&asked[0],
+        InteractionRequest::Form { title: Some(t), schema, .. }
+            if t == "Which file?" && schema["properties"]["file"]["type"] == "string"));
+    assert!(matches!(&asked[1],
+        InteractionRequest::Url { url, purpose, .. }
+            if url == "https://example.com/auth" && purpose == "Sign in to the MCP server"));
+}
+
+#[tokio::test]
+async fn a_declined_form_is_declined() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    // The URL step waits for the host's (absent) permission answer, so
+    // only the form's reply is checked.
+    let _handle = fx.backend.prompt(&session, say("ask")).await.unwrap();
+    for _ in 0..50 {
+        if fx.world.answer_to("elicitation/form").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fx.world.answer_to("elicitation/form").unwrap(),
+        json!({"action": "decline"})
+    );
 }

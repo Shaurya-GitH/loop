@@ -830,6 +830,8 @@ async fn run_loop(
                 &mut rx,
                 &mut review_rx,
                 &mut active_approval,
+                &mut pending_setup,
+                &mut input,
                 &mut chat,
                 &mut status,
                 &mut turn_step,
@@ -988,6 +990,8 @@ async fn run_loop(
             &mut rx,
             &mut review_rx,
             &mut active_approval,
+            &mut pending_setup,
+            &mut input,
             &mut chat,
             &mut status,
             &mut turn_step,
@@ -1333,6 +1337,8 @@ async fn drain_ui_events(
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<PendingInteraction>,
     active_approval: &mut Option<ActiveApproval>,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
@@ -1364,6 +1370,14 @@ async fn drain_ui_events(
                     {
                         active_approval.take();
                         push_before_queued(chat, sys("approval withdrawn"));
+                    }
+                    if pending_setup
+                        .as_ref()
+                        .and_then(SetupPrompt::interaction)
+                        .is_some_and(|open| open == id)
+                    {
+                        pending_setup.take();
+                        input.clear();
                     }
                 }
                 let UpdateEnvelope { update, origin, .. } = *envelope;
@@ -1582,6 +1596,32 @@ async fn drain_ui_events(
         }
     }
     while let Ok(prompt) = review_rx.try_recv() {
+        // Questions, forms and links go to the setup box; permission
+        // requests to the approval picker.
+        let prompt = if matches!(prompt.request, InteractionRequest::Permission { .. }) {
+            prompt
+        } else {
+            let PendingInteraction { request, respond } = prompt;
+            match crate::agent_question::AgentQuestion::new(request, respond) {
+                Ok(question) => {
+                    if pending_setup.is_some() {
+                        push_before_queued(
+                            chat,
+                            sys("the agent has a question; that prompt was closed"),
+                        );
+                    }
+                    input.clear();
+                    *status = "the agent has a question · answer below".into();
+                    *pending_setup = Some(SetupPrompt::Question(question));
+                }
+                Err(respond) => {
+                    let _ = respond.send(InteractionOutcome::Rejected {
+                        reason: "this request type is not supported in the terminal yet".into(),
+                    });
+                }
+            }
+            continue;
+        };
         if let Some(prev) = active_approval.take() {
             prev.reply.send(ApprovalDecision::Reject {
                 reason: Some("superseded by another review".into()),
@@ -2566,6 +2606,19 @@ async fn handle_key(
                         status,
                     );
                 }
+                SetupPrompt::Question(step) => {
+                    let done = step_wizard(
+                        step.submit(&value),
+                        SetupPrompt::Question,
+                        &value,
+                        pending_setup,
+                        input,
+                        chat,
+                    );
+                    if done.is_some() {
+                        *status = "answered · back to the agent".into();
+                    }
+                }
             }
             return Ok(());
         }
@@ -3174,6 +3227,11 @@ fn start_mcp_login(
             result,
         });
     });
+}
+
+/// Open `url` in the user's browser.
+pub(crate) fn open_link(url: &str) -> std::io::Result<()> {
+    open_browser(url).map(drop)
 }
 
 fn open_browser(url: &str) -> std::io::Result<std::process::Child> {

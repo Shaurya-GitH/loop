@@ -2,6 +2,7 @@
 
 #![allow(missing_docs)]
 
+pub mod agent_question;
 pub mod app;
 pub mod clipboard;
 pub mod commands;

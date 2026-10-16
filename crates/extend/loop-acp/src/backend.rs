@@ -23,7 +23,7 @@ use loop_protocol::{
     ErrorCategory, ErrorInfo, HostServices, InteractionId, InteractionOutcome, InteractionRequest,
     ModelChoice, ModelChoices, ModelControl, Origin, SessionKey, SessionRef, SessionSpec,
     SessionUpdate, StopReason, TerminalRequest, TurnHandle, TurnId, TurnOutcome, UpdateEnvelope,
-    PROTOCOL_VERSION,
+    DECLINE_CHOICE, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -210,7 +210,13 @@ impl AcpBackend {
                     .fs(acp::FileSystemCapabilities::new()
                         .read_text_file(fs)
                         .write_text_file(fs))
-                    .terminal(self.host.terminals().is_some()),
+                    .terminal(self.host.terminals().is_some())
+                    // Questions, forms and links the agent shows the user.
+                    .elicitation(
+                        acp::ElicitationCapabilities::new()
+                            .form(acp::ElicitationFormCapabilities::new())
+                            .url(acp::ElicitationUrlCapabilities::new()),
+                    ),
             )
             .client_info(acp::Implementation::new("loop", env!("CARGO_PKG_VERSION")));
         let handshake = tokio::time::timeout(
@@ -622,6 +628,10 @@ async fn dispatch(
             Incoming::Notification { method, params } => {
                 if method == "session/update" {
                     on_session_update(&backend, generation, &params);
+                } else if method == "elicitation/complete" {
+                    // The user already answered when they opened the link;
+                    // the agent continues on its own.
+                    tracing::debug!(?params, "agent finished a link the user opened");
                 } else {
                     tracing::debug!(%method, "ignoring notification from agent");
                 }
@@ -697,6 +707,12 @@ async fn on_request(
                 _ => json!({"outcome": "cancelled"}),
             };
             Ok(json!({ "outcome": selected }))
+        }
+        "elicitation/create" => {
+            let interaction = elicitation_request(next_interaction_id(generation), &params)
+                .ok_or_else(|| (codes::INVALID_PARAMS, "unsupported elicitation mode".into()))?;
+            let outcome = ask(backend, generation, &native, interaction).await;
+            Ok(elicitation_response(outcome))
         }
         "fs/read_text_file" => {
             let fs = backend
@@ -813,17 +829,76 @@ async fn ask_permission(
     native: &str,
     request: acp::RequestPermissionRequest,
 ) -> InteractionOutcome {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let id = InteractionId(format!(
-        "acp-{}-{}",
-        generation,
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
     let interaction = InteractionRequest::Permission {
-        id: id.clone(),
+        id: next_interaction_id(generation),
         tool_call: Some(tool_call_update(request.tool_call)),
         options: permission_options(request.options),
     };
+    ask(backend, generation, native, interaction).await
+}
+
+fn next_interaction_id(generation: u64) -> InteractionId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    InteractionId(format!(
+        "acp-{}-{}",
+        generation,
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+/// The interaction for an `elicitation/create` request, or `None` for a mode
+/// Loop cannot present.
+fn elicitation_request(id: InteractionId, params: &Value) -> Option<InteractionRequest> {
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match params.get("mode").and_then(Value::as_str) {
+        Some("form") => Some(InteractionRequest::Form {
+            id,
+            title: Some(message).filter(|m| !m.is_empty()),
+            schema: params
+                .get("requestedSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+        }),
+        Some("url") => Some(InteractionRequest::Url {
+            id,
+            url: params.get("url").and_then(Value::as_str)?.to_owned(),
+            purpose: message,
+        }),
+        _ => None,
+    }
+}
+
+/// The `elicitation/create` response for the user's answer. A form answer
+/// accepts with its content; choosing [`DECLINE_CHOICE`] declines.
+fn elicitation_response(outcome: InteractionOutcome) -> Value {
+    match outcome {
+        InteractionOutcome::Answered { value } if value.is_object() => {
+            json!({"action": "accept", "content": value})
+        }
+        InteractionOutcome::Selected { native_id, .. } if native_id == DECLINE_CHOICE => {
+            json!({"action": "decline"})
+        }
+        InteractionOutcome::Answered { .. } | InteractionOutcome::Selected { .. } => {
+            json!({"action": "accept"})
+        }
+        InteractionOutcome::Rejected { .. } => json!({"action": "decline"}),
+        InteractionOutcome::Cancelled => json!({"action": "cancel"}),
+    }
+}
+
+/// Put `interaction` to the host, cancelled with the session's running turn,
+/// and publish it and its outcome on the session's stream.
+async fn ask(
+    backend: &AcpBackend,
+    generation: u64,
+    native: &str,
+    interaction: InteractionRequest,
+) -> InteractionOutcome {
+    let id = interaction.id().clone();
     let cancel = {
         let state = backend.lock_state();
         state

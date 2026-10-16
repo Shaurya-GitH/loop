@@ -26,6 +26,7 @@ pub use error::{ErrorCategory, ErrorInfo};
 pub use ids::{BackendInstanceId, InteractionId, MessageId, SessionKey, ToolCallId, TurnId};
 pub use interaction::{
     Choice, InteractionOutcome, InteractionRequest, PermissionKind, PermissionOption,
+    DECLINE_CHOICE,
 };
 pub use update::{
     NoticeLevel, Origin, PlanEntry, PlanEntryStatus, Role, SessionUpdate, StopReason, ToolCall,
