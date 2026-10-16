@@ -781,6 +781,7 @@ fn native_efforts(model: Option<&loop_ai::Model>, candidates: &[&str]) -> Vec<St
                 return true; // "off" is always available
             };
             model.reasoning
+                && !loop_ai::reasoning_rejected(model)
                 && model.thinking_level_map.as_ref().is_none_or(|map| {
                     map.get(&loop_ai::ModelThinkingLevel::from(reasoning)) != Some(&None)
                 })
