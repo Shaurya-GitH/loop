@@ -3,6 +3,7 @@
 pub mod agents;
 pub mod config;
 pub mod extensions;
+pub mod hook_command;
 pub mod hooks_load;
 pub mod interaction;
 pub mod model_selection;

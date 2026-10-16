@@ -68,6 +68,24 @@ struct HookAction {
     /// Text added to the tool result the model sees (`tool_result`).
     #[serde(default)]
     append_context: Option<String>,
+    /// Program and arguments to run (not a shell string); see
+    /// [`crate::hook_command`].
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    /// Time limit for `command`, in milliseconds.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// What a failed `command` means: `block` (default for `tool_call`)
+    /// or `ignore` (default otherwise).
+    #[serde(default)]
+    on_error: Option<OnError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OnError {
+    Block,
+    Ignore,
 }
 
 /// Events a hook file can name in `on`.
@@ -96,6 +114,19 @@ impl On {
             "tool_result" | "ToolResult" => Self::ToolResult,
             _ => return None,
         })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BeforeAgentStart => "before_agent_start",
+            Self::SessionBeforeCompact => "session_before_compact",
+            Self::SessionBeforeTree => "session_before_tree",
+            Self::Settled => "settled",
+            Self::QueueUpdate => "queue_update",
+            Self::ShutdownRequested => "shutdown_requested",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+        }
     }
 
     fn is_tool_event(self) -> bool {
@@ -133,7 +164,7 @@ struct Hook {
 }
 
 impl Hook {
-    fn outcome(&self, event: &HarnessHookEvent) -> Option<HookOutcome> {
+    async fn outcome(&self, event: &HarnessHookEvent) -> Option<HookOutcome> {
         if !self.on.matches(event) {
             return None;
         }
@@ -147,29 +178,123 @@ impl Hook {
             append_context: self.action.append_context.clone(),
             ..Default::default()
         };
-        if self.on == On::ToolCall {
-            outcome.decision = if self.action.block {
-                Some(ToolDecision::Block {
-                    reason: self.block_reason(),
-                })
-            } else if self.action.allow {
-                Some(ToolDecision::Allow)
-            } else {
-                None
-            };
-        } else if !self.on.is_tool_event() && self.action.block {
-            outcome.cancel = true;
-            tracing::warn!("hook {} blocked: {}", self.label, self.block_reason());
+        let mut block = self.action.block.then(|| self.block_reason(None));
+        let mut allow = self.action.allow;
+        if let Some(argv) = &self.action.command {
+            match self.run_command(argv, event).await {
+                Ok(answer) => {
+                    match answer.block {
+                        Some(true) => {
+                            block = Some(self.block_reason(answer.reason.as_deref()));
+                        }
+                        Some(false) => allow = true,
+                        None => {}
+                    }
+                    if let Some(extra) = answer.append_context {
+                        outcome.append_context = Some(match outcome.append_context.take() {
+                            Some(existing) => format!("{existing}\n{extra}"),
+                            None => extra,
+                        });
+                    }
+                }
+                Err(error) => {
+                    let message = format!("hook {} failed: {error}", self.label);
+                    if self.on_error() == OnError::Block {
+                        block = Some(message);
+                    } else {
+                        tracing::warn!("{message}");
+                    }
+                }
+            }
+        }
+        match self.on {
+            On::ToolCall => {
+                outcome.decision = match block {
+                    Some(reason) => Some(ToolDecision::Block { reason }),
+                    None if allow => Some(ToolDecision::Allow),
+                    None => None,
+                };
+            }
+            On::ToolResult => {}
+            _ => {
+                if let Some(reason) = block {
+                    outcome.cancel = true;
+                    tracing::warn!("{reason}");
+                }
+            }
         }
         Some(outcome)
     }
 
-    fn block_reason(&self) -> String {
-        match &self.action.reason {
+    fn on_error(&self) -> OnError {
+        self.action.on_error.unwrap_or(if self.on == On::ToolCall {
+            OnError::Block
+        } else {
+            OnError::Ignore
+        })
+    }
+
+    async fn run_command(
+        &self,
+        argv: &[String],
+        event: &HarnessHookEvent,
+    ) -> Result<crate::hook_command::CommandAnswer, String> {
+        let call = tool_call_of(event);
+        let cwd = call
+            .map(|c| c.cwd.clone())
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let env = [
+            ("LOOP_HOOK_EVENT", self.on.name().to_owned()),
+            (
+                "LOOP_SESSION_ID",
+                call.map(|c| c.session_id.clone()).unwrap_or_default(),
+            ),
+            ("LOOP_PROJECT_DIR", cwd.to_string_lossy().into_owned()),
+        ];
+        let timeout = self
+            .action
+            .timeout_ms
+            .unwrap_or(crate::hook_command::DEFAULT_TIMEOUT_MS)
+            .min(crate::hook_command::MAX_TIMEOUT_MS);
+        crate::hook_command::run(
+            argv,
+            &event_json(self.on, event),
+            &cwd,
+            &env,
+            std::time::Duration::from_millis(timeout),
+        )
+        .await
+    }
+
+    /// The reason a block reports: the command's, else the file's.
+    fn block_reason(&self, from_command: Option<&str>) -> String {
+        match from_command.or(self.action.reason.as_deref()) {
             Some(reason) => format!("Blocked by hook {}: {reason}", self.label),
             None => format!("Blocked by hook {}", self.label),
         }
     }
+}
+
+/// The JSON a command hook reads on stdin.
+fn event_json(on: On, event: &HarnessHookEvent) -> serde_json::Value {
+    let mut json = match event {
+        HarnessHookEvent::ToolCall(call) => serde_json::to_value(call).unwrap_or_default(),
+        HarnessHookEvent::ToolResult {
+            call,
+            is_error,
+            output,
+        } => {
+            let mut json = serde_json::to_value(call).unwrap_or_default();
+            json["isError"] = (*is_error).into();
+            json["output"] = output.clone().into();
+            json
+        }
+        _ => serde_json::json!({}),
+    };
+    json["event"] = on.name().into();
+    json
 }
 
 fn tool_call_of(event: &HarnessHookEvent) -> Option<&ToolCallInfo> {
@@ -342,6 +467,24 @@ pub fn load_hooks(paths: &[PathBuf]) -> LoadedHooks {
                 "hook {label}: blocks every tool call (tool_call with block and no `match`)"
             ));
         }
+        if let Some(argv) = &file.action.command {
+            if argv.is_empty() {
+                loaded
+                    .notices
+                    .push(format!("hook {label}: `command` is empty; it will not run"));
+                continue;
+            }
+        }
+        if file
+            .action
+            .timeout_ms
+            .is_some_and(|ms| ms > crate::hook_command::MAX_TIMEOUT_MS)
+        {
+            loaded.notices.push(format!(
+                "hook {label}: timeoutMs is capped at {} ms",
+                crate::hook_command::MAX_TIMEOUT_MS
+            ));
+        }
         if file.action.block && file.action.allow {
             loaded.notices.push(format!(
                 "hook {label}: sets both block and allow; block wins"
@@ -367,8 +510,10 @@ pub fn register_hooks(registry: &HookRegistry, hooks: LoadedHooks) {
         let hooks = Arc::clone(&hooks);
         async move {
             let mut merged = HookOutcome::default();
-            for outcome in hooks.iter().filter_map(|hook| hook.outcome(&event)) {
-                merged.merge(outcome);
+            for hook in hooks.iter() {
+                if let Some(outcome) = hook.outcome(&event).await {
+                    merged.merge(outcome);
+                }
             }
             merged
         }
@@ -578,5 +723,103 @@ mod tests {
             .await;
         assert!(outcome.cancel);
         assert_eq!(outcome.summary.as_deref(), Some("s"));
+    }
+
+    #[cfg(unix)]
+    async fn emit_with(hook: serde_json::Value, event: HarnessHookEvent) -> HookOutcome {
+        let (_dir, paths) = write_hooks(&[("cmd", hook)]);
+        let loaded = load_hooks(&paths);
+        assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+        let registry = HookRegistry::default();
+        register_hooks(&registry, loaded);
+        registry.emit(event).await
+    }
+
+    #[cfg(unix)]
+    fn bash_call(command: &str) -> HarnessHookEvent {
+        HarnessHookEvent::ToolCall(call(
+            "bash",
+            ToolKind::Execute,
+            json!({ "command": command }),
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_hooks_decide_from_exit_code_and_stdin() {
+        let script = r#"grep -q 'rm -rf' && { echo 'destructive' >&2; exit 2; }; exit 0"#;
+        let hook = json!({"on": "tool_call", "action": {"command": ["sh", "-c", script]}});
+        let outcome = emit_with(hook.clone(), bash_call("rm -rf build")).await;
+        assert_eq!(
+            outcome.decision,
+            Some(ToolDecision::Block {
+                reason: "Blocked by hook cmd: destructive".into()
+            })
+        );
+        let outcome = emit_with(hook, bash_call("ls")).await;
+        assert_eq!(outcome.decision, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_tool_call_hooks_block_unless_told_to_ignore() {
+        let failing = json!({"on": "tool_call", "action": {"command": ["sh", "-c", "exit 7"]}});
+        let outcome = emit_with(failing, bash_call("ls")).await;
+        match outcome.decision {
+            Some(ToolDecision::Block { reason }) => {
+                assert!(
+                    reason.contains("hook cmd failed: exited with code 7"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected a block, got {other:?}"),
+        }
+
+        let slow = json!({"on": "tool_call",
+                          "action": {"command": ["sleep", "5"], "timeoutMs": 200}});
+        let outcome = emit_with(slow, bash_call("ls")).await;
+        match outcome.decision {
+            Some(ToolDecision::Block { reason }) => {
+                assert!(reason.contains("timed out"), "{reason}")
+            }
+            other => panic!("expected a block, got {other:?}"),
+        }
+
+        let ignored = json!({"on": "tool_call",
+                             "action": {"command": ["sh", "-c", "exit 7"], "onError": "ignore"}});
+        assert_eq!(emit_with(ignored, bash_call("ls")).await.decision, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_result_command_hooks_add_context_and_fail_open() {
+        let event = HarnessHookEvent::ToolResult {
+            call: call("bash", ToolKind::Execute, json!({"command": "cargo test"})),
+            is_error: true,
+            output: "1 failed".into(),
+        };
+        let script = r#"grep -q '"isError":true' && echo '{"appendContext":"tests failed; fix before continuing"}'"#;
+        let hook = json!({"on": "tool_result", "action": {"command": ["sh", "-c", script]}});
+        let outcome = emit_with(hook, event.clone()).await;
+        assert_eq!(
+            outcome.append_context.as_deref(),
+            Some("tests failed; fix before continuing")
+        );
+
+        let failing = json!({"on": "tool_result", "action": {"command": ["sh", "-c", "exit 1"]}});
+        let outcome = emit_with(failing, event).await;
+        assert_eq!(outcome.decision, None);
+        assert!(!outcome.cancel);
+    }
+
+    #[test]
+    fn empty_commands_are_rejected() {
+        let (_dir, paths) = write_hooks(&[(
+            "empty",
+            json!({"on": "tool_call", "action": {"command": []}}),
+        )]);
+        let loaded = load_hooks(&paths);
+        assert!(loaded.is_empty());
+        assert!(loaded.notices[0].contains("`command` is empty"));
     }
 }
