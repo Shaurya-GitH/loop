@@ -147,7 +147,10 @@ On **new sessions**, `write` / `edit` / `bash` / `web_fetch` / `web_search` paus
 ```
 
 - `fileEditReview`: `newSession` (default) · `always` · `never` — when `ask` tools prompt  
-- `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`  
+- `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`, with
+  patterns such as `bash(git status*)`  
+- `permissionMode` / `--permission-mode` / `/permissions`: `read-only` · `ask` (default) ·
+  `accept-edits` · `full-access`. See [docs/permissions.md](../../docs/permissions.md)
 - Interactive workflows are wired for `write`, `edit`, `bash`, `web_fetch`, and `web_search`
 - `/review [newSession|always|never]` toggles the ask policy
 
@@ -207,7 +210,9 @@ to save detailed logs under `target/debug/logs`; print mode still logs to stderr
 ## Extensions & hooks
 
 - **Rhai**: `register_command`, `notify`, stubs for `register_tool` / `on` / …
-- **JSON hooks**: `on` lifecycle names (`before_agent_start`, `session_before_compact`, …)
+- **JSON hooks**: `tool_call` / `tool_result` with `match` rules, lifecycle names
+  (`before_agent_start`, `session_before_compact`, …), and command hooks that run a program.
+  See [docs/hooks.md](../../docs/hooks.md)
 
 Examples under [`examples/`](examples/).
 
@@ -216,6 +221,7 @@ Examples under [`examples/`](examples/).
 ```
 loop [--provider soket] [--model qwen3-30b] [--theme dark]
      [--resume <id>] [--print "prompt"] [--no-context-files]
+     [--permission-mode read-only|ask|accept-edits|full-access]
 loop config
 ```
 
