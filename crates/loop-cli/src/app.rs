@@ -66,6 +66,8 @@ enum UiEvent {
     Update(Box<UpdateEnvelope>),
     /// The backend refused to start a turn (no update was emitted for it).
     TurnFailed(String),
+    /// The turn's outcome is unknown: the agent was lost mid-turn.
+    TurnUncertain,
     /// A subscription's agent started (or failed to).
     AgentReady {
         id: String,
@@ -546,7 +548,7 @@ async fn run_loop(
 
         let model_line = match runtime.active_model_label() {
             Some(label) if !runtime.is_native() => label,
-            Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
+            Some(spec) => format!("{spec} · {}", runtime.native_effort()),
             None => NO_MODEL_LABEL.to_string(),
         };
 
@@ -830,6 +832,8 @@ async fn run_loop(
                 &mut rx,
                 &mut review_rx,
                 &mut active_approval,
+                &mut pending_setup,
+                &mut input,
                 &mut chat,
                 &mut status,
                 &mut turn_step,
@@ -988,6 +992,8 @@ async fn run_loop(
             &mut rx,
             &mut review_rx,
             &mut active_approval,
+            &mut pending_setup,
+            &mut input,
             &mut chat,
             &mut status,
             &mut turn_step,
@@ -1333,6 +1339,8 @@ async fn drain_ui_events(
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<PendingInteraction>,
     active_approval: &mut Option<ActiveApproval>,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
@@ -1364,6 +1372,14 @@ async fn drain_ui_events(
                     {
                         active_approval.take();
                         push_before_queued(chat, sys("approval withdrawn"));
+                    }
+                    if pending_setup
+                        .as_ref()
+                        .and_then(SetupPrompt::interaction)
+                        .is_some_and(|open| open == id)
+                    {
+                        pending_setup.take();
+                        input.clear();
                     }
                 }
                 let UpdateEnvelope { update, origin, .. } = *envelope;
@@ -1410,6 +1426,7 @@ async fn drain_ui_events(
                 }
             }
             UiEvent::AgentNote(note) => {
+                runtime.signing_in = None;
                 let item = match note {
                     Ok(text) => {
                         *status = "ready · /help for commands".into();
@@ -1421,6 +1438,17 @@ async fn drain_ui_events(
                     }
                 };
                 push_before_queued(chat, item);
+            }
+            // Backends normally end an uncertain turn on the update stream;
+            // speak up only when none did.
+            UiEvent::TurnUncertain if !*working => {}
+            UiEvent::TurnUncertain => {
+                *working = false;
+                turn_step.clear();
+                chat.push(error_item(
+                    "error: lost contact with the agent; the turn may be incomplete",
+                ));
+                *status = "error".into();
             }
             UiEvent::TurnFailed(err) => {
                 *working = false;
@@ -1582,6 +1610,57 @@ async fn drain_ui_events(
         }
     }
     while let Ok(prompt) = review_rx.try_recv() {
+        // Questions, forms and links go to the setup box; permission
+        // requests to the approval picker.
+        let prompt = if matches!(prompt.request, InteractionRequest::Permission { .. }) {
+            prompt
+        } else if let (InteractionRequest::Url { url, purpose, .. }, Some(label)) =
+            (&prompt.request, runtime.signing_in.as_ref())
+        {
+            // The user started this sign-in: open the page, and print the
+            // link (and any code) in case the browser opens elsewhere.
+            let opened = open_link(url);
+            let mut text = format!("{label}: {purpose}\n{url}");
+            if let Err(err) = opened {
+                text.push_str(&format!(
+                    "\nCould not open a browser ({err}). Open the link above."
+                ));
+            } else {
+                text.push_str("\nA browser window opened; if it did not, open the link above.");
+            }
+            push_before_queued(chat, sys(text));
+            *status = "login · finish signing in in the browser".into();
+            let _ = prompt.respond.send(InteractionOutcome::Selected {
+                native_id: crate::agent_question::OPEN_CHOICE.into(),
+                note: None,
+            });
+            continue;
+        } else {
+            let PendingInteraction { request, respond } = prompt;
+            if let InteractionRequest::Url { url, purpose, .. } = &request {
+                // Keep the link in the transcript, where it can be copied.
+                push_before_queued(chat, sys(format!("{purpose}\n{url}")));
+            }
+            match crate::agent_question::AgentQuestion::new(request, respond) {
+                Ok(question) => {
+                    if pending_setup.is_some() {
+                        push_before_queued(
+                            chat,
+                            sys("the agent has a question; that prompt was closed"),
+                        );
+                    }
+                    input.clear();
+                    *status = "the agent has a question · answer below".into();
+                    *pending_setup = Some(SetupPrompt::Question(question));
+                }
+                Err(respond) => {
+                    let _ = respond.send(InteractionOutcome::Rejected {
+                        reason: "this request type is not supported in the terminal yet".into(),
+                    });
+                }
+            }
+            continue;
+        };
         if let Some(prev) = active_approval.take() {
             prev.reply.send(ApprovalDecision::Reject {
                 reason: Some("superseded by another review".into()),
@@ -1702,7 +1781,7 @@ fn login_agents(runtime: &CliRuntime) -> Vec<crate::provider_setup::AgentRow> {
         .agents
         .entries()
         .iter()
-        .filter(|entry| entry.auth_method.is_some())
+        .filter(|entry| entry.needs_sign_in())
         .map(|entry| crate::provider_setup::AgentRow {
             id: entry.id.clone(),
             label: entry.login_label().to_owned(),
@@ -1845,9 +1924,7 @@ fn start_user_turn(
             // The update stream reports the turn, including failures.
             Ok(turn) => {
                 if turn.outcome().await == TurnOutcome::Uncertain {
-                    let _ = tx.send(UiEvent::TurnFailed(
-                        "lost contact with the agent; the turn may be incomplete".into(),
-                    ));
+                    let _ = tx.send(UiEvent::TurnUncertain);
                 }
             }
             Err(e) => {
@@ -2566,6 +2643,19 @@ async fn handle_key(
                         status,
                     );
                 }
+                SetupPrompt::Question(step) => {
+                    let done = step_wizard(
+                        step.submit(&value),
+                        SetupPrompt::Question,
+                        &value,
+                        pending_setup,
+                        input,
+                        chat,
+                    );
+                    if done.is_some() {
+                        *status = "answered · back to the agent".into();
+                    }
+                }
             }
             return Ok(());
         }
@@ -2603,7 +2693,7 @@ async fn handle_key(
                 return Ok(());
             }
             Action::Clear => {
-                if last_clear.elapsed() < Duration::from_secs(1) {
+                if last_clear.elapsed() < Duration::from_secs(2) {
                     *clear_presses += 1;
                 } else {
                     *clear_presses = 1;
@@ -3174,6 +3264,11 @@ fn start_mcp_login(
             result,
         });
     });
+}
+
+/// Open `url` in the user's browser.
+pub(crate) fn open_link(url: &str) -> std::io::Result<()> {
+    open_browser(url).map(drop)
 }
 
 fn open_browser(url: &str) -> std::io::Result<std::process::Child> {
@@ -3981,6 +4076,7 @@ async fn advance_provider_setup(
     let request = match choice {
         LoginChoice::Provider(request) => request,
         LoginChoice::Subscription(agent) => {
+            runtime.signing_in = Some(agent.label.clone());
             *status = format!("login · signing in to {}…", agent.label);
             chat.push(sys(format!(
                 "signing in to {} · finish in the browser that opens (the first start can take a while)",
@@ -4952,10 +5048,7 @@ async fn choose_model(
 fn effort_status(runtime: &CliRuntime) -> String {
     match runtime.active_model_label() {
         Some(label) if !runtime.is_native() => format!("ready · {label}"),
-        Some(spec) => format!(
-            "ready · {spec} · {}",
-            runtime.settings.default_thinking_level
-        ),
+        Some(spec) => format!("ready · {spec} · {}", runtime.native_effort()),
         None => "ready".into(),
     }
 }

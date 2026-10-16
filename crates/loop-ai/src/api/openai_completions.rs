@@ -128,6 +128,79 @@ struct StreamFail {
     aborted: bool,
 }
 
+/// Send one chat completions request, bounded by the time-to-first-byte
+/// limit and the caller's cancellation.
+async fn send_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: HeaderMap,
+    payload: &Value,
+    options: &StreamOptions,
+) -> Result<reqwest::Response, StreamFail> {
+    let req = client.post(url).headers(headers).json(payload);
+    // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
+    // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
+
+    let cancel = options.cancel.clone();
+    let response_fut = req.send();
+    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
+    const DEFAULT_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let ttfb: Option<std::time::Duration> = match options.response_header_timeout_ms {
+        None => Some(DEFAULT_TTFB_TIMEOUT),
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+    };
+
+    match (cancel.as_ref(), ttfb) {
+        (Some(token), Some(bound)) => {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err(StreamFail { message: "aborted".into(), aborted: true });
+                }
+                res = tokio::time::timeout(bound, response_fut) => {
+                    match res {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            return Err(StreamFail {
+                                message: format!(
+                                    "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
+                                    bound.as_secs()
+                                ),
+                                aborted: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        (Some(token), None) => {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err(StreamFail { message: "aborted".into(), aborted: true });
+                }
+                res = response_fut => res,
+            }
+        }
+        (None, Some(bound)) => match tokio::time::timeout(bound, response_fut).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                return Err(StreamFail {
+                    message: format!(
+                        "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
+                        bound.as_secs()
+                    ),
+                    aborted: false,
+                });
+            }
+        },
+        (None, None) => response_fut.await,
+    }
+    .map_err(|e| StreamFail {
+        message: e.to_string(),
+        aborted: false,
+    })
+}
+
 async fn run_stream(
     client: reqwest::Client,
     model: Model,
@@ -190,68 +263,28 @@ async fn run_stream(
         }
     }
 
-    let req = client.post(&url).headers(headers).json(&payload);
-    // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
-    // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
-
     let cancel = options.cancel.clone();
-    let response_fut = req.send();
-    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
-    const DEFAULT_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let ttfb: Option<std::time::Duration> = match options.response_header_timeout_ms {
-        None => Some(DEFAULT_TTFB_TIMEOUT),
-        Some(0) => None,
-        Some(ms) => Some(std::time::Duration::from_millis(ms)),
-    };
-
-    let response = match (cancel.as_ref(), ttfb) {
-        (Some(token), Some(bound)) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = tokio::time::timeout(bound, response_fut) => {
-                    match res {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            return Err(StreamFail {
-                                message: format!(
-                                    "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                                    bound.as_secs()
-                                ),
-                                aborted: false,
-                            });
-                        }
-                    }
-                }
+    let mut response = send_request(&client, &url, headers.clone(), &payload, &options).await?;
+    // Some OpenAI-compatible servers reject reasoning parameters for models
+    // they serve. Retry once without them and remember the model.
+    if reasoning.is_some() && matches!(response.status().as_u16(), 400 | 422) {
+        let body = response.text().await.unwrap_or_default();
+        if !rejects_reasoning(&body) {
+            return Err(StreamFail {
+                message: crate::utils::summarize_http_error(400, &body),
+                aborted: false,
+            });
+        }
+        tracing::warn!(model = %model.id, "the provider rejected reasoning parameters; retrying without them");
+        mark_reasoning_rejected(&model);
+        payload = build_payload(&model, &context, &messages, &options, &compat, None)?;
+        if let Some(cb) = &options.on_payload {
+            if let Some(replaced) = cb(&payload, &model) {
+                payload = replaced;
             }
         }
-        (Some(token), None) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = response_fut => res,
-            }
-        }
-        (None, Some(bound)) => match tokio::time::timeout(bound, response_fut).await {
-            Ok(inner) => inner,
-            Err(_) => {
-                return Err(StreamFail {
-                    message: format!(
-                        "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                        bound.as_secs()
-                    ),
-                    aborted: false,
-                });
-            }
-        },
-        (None, None) => response_fut.await,
+        response = send_request(&client, &url, headers, &payload, &options).await?;
     }
-    .map_err(|e| StreamFail {
-        message: e.to_string(),
-        aborted: false,
-    })?;
 
     let status = response.status();
     let mut resp_headers = HashMap::new();
@@ -848,6 +881,9 @@ fn apply_reasoning(
     if !model.reasoning && !compat.supports_reasoning_effort {
         return;
     }
+    if reasoning_rejected(model) {
+        return;
+    }
     let effort = thinking_level_str(level);
 
     match compat.thinking_format {
@@ -887,6 +923,55 @@ fn apply_reasoning(
             payload["reasoning"] = json!({ "effort": effort });
         }
     }
+}
+
+/// Models whose server rejected reasoning parameters in this process, as
+/// `provider/id`.
+static REASONING_REJECTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn model_key(model: &Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+fn mark_reasoning_rejected(model: &Model) {
+    let mut rejected = REASONING_REJECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let key = model_key(model);
+    if !rejected.contains(&key) {
+        rejected.push(key);
+    }
+}
+
+/// Whether `model`'s server rejected reasoning parameters earlier in this
+/// process. Requests for it are then sent without them.
+pub fn reasoning_rejected(model: &Model) -> bool {
+    REASONING_REJECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&model_key(model))
+}
+
+/// Whether an error body says a reasoning parameter is not supported.
+fn rejects_reasoning(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    let names_reasoning = [
+        "reasoning_effort",
+        "reasoning",
+        "enable_thinking",
+        "thinking",
+    ]
+    .iter()
+    .any(|p| body.contains(p));
+    let unsupported = [
+        "not support",
+        "unsupported",
+        "unrecognized",
+        "unknown parameter",
+        "extra inputs are not permitted",
+        "not allowed",
+    ]
+    .iter()
+    .any(|p| body.contains(p));
+    names_reasoning && unsupported
 }
 
 fn thinking_level_str(level: ThinkingLevel) -> &'static str {
