@@ -286,6 +286,18 @@ impl ToolGate {
                     return None;
                 }
                 match gate.approver() {
+                    // Only some tools have an approval prompt; asking about
+                    // the others would silently run them, so refuse instead.
+                    Some(_)
+                        if !crate::tool_approval::interactive_tools()
+                            .contains(&ctx.tool_call.name.as_str()) =>
+                    {
+                        block(format!(
+                            "`{}` needs approval, but Loop has no approval prompt for it yet. \
+                             Set it to allow or deny in settings.toolPermissions.",
+                            ctx.tool_call.name
+                        ))
+                    }
                     Some(approver) => approver.review_before_tool(ctx, cancel).await,
                     None => block(headless_refusal(&ctx.tool_call.name, gate.mode())),
                 }
@@ -639,5 +651,15 @@ mod tests {
             !gate.take_allowed(&inside.tool_call, &inside.args),
             "changing mode forgets earlier allows"
         );
+    }
+
+    #[tokio::test]
+    async fn ask_for_a_tool_without_a_prompt_is_refused_not_run() {
+        let (gate, mut prompts) = gate_with_approver(&[("mcp__github__*", "ask")]);
+        let mut ctx = call("mcp__github__create_issue");
+        ctx.tool_call.name = "mcp__github__create_issue".into();
+        let result = gate.before_hook()(ctx, None).await.expect("refused");
+        assert!(result.reason.unwrap().contains("no approval prompt"));
+        assert!(prompts.try_recv().is_err());
     }
 }
