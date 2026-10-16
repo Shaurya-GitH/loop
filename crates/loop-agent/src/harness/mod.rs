@@ -29,7 +29,9 @@ pub use compaction::{
     CompactionSettings,
 };
 pub use env::HostExecutionEnv;
-pub use hooks::{HarnessHookEvent, HookOutcome, HookRegistry};
+pub use hooks::{
+    HarnessHookEvent, HookOutcome, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
+};
 pub use sandbox::{
     check_krun_deps, check_local_sandbox_deps, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,

@@ -179,6 +179,16 @@ impl AgentHarness {
         }
     }
 
+    /// The hook registry, for hosts that emit their own events (tool gate).
+    pub fn hooks(&self) -> HookRegistry {
+        self.hooks.clone()
+    }
+
+    /// Working directory of the host environment.
+    pub fn cwd(&self) -> std::path::PathBuf {
+        self.host_env.cwd().to_path_buf()
+    }
+
     /// Current session id (also sent on provider API requests).
     pub async fn session_id(&self) -> String {
         self.session.lock().await.metadata().id.clone()
