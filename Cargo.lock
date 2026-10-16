@@ -4391,6 +4391,7 @@ dependencies = [
  "loop-ai",
  "loop-mcp",
  "loop-orchestration",
+ "loop-protocol",
  "loop-telemetry",
  "mime_guess",
  "opentelemetry_sdk",
@@ -4571,6 +4572,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "loop-protocol"
+version = "0.3.5"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

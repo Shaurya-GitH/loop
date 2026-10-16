@@ -10,6 +10,7 @@ members = [
     "crates/loop-test-support",
     "crates/loop-cli",
     "crates/ops/loop-update",
+    "crates/core/loop-protocol",
     "crates/loop-desktop"
 ]
 
@@ -23,6 +24,7 @@ default-members = [
     "crates/loop-test-support",
     "crates/loop-cli",
     "crates/ops/loop-update",
+    "crates/core/loop-protocol",
 ]
 
 [workspace.package]
@@ -41,6 +43,7 @@ loop-mcp = { path = "crates/loop-mcp" }
 loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }
+loop-protocol = { path = "crates/core/loop-protocol" }
 sha2 = "0.10"
 semver = "1"
 self-replace = "1.5"
