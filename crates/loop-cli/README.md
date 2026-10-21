@@ -127,7 +127,7 @@ If deps for the chosen runtime are missing, Loop prints install instructions and
 
 ## File edit review / tool approval
 
-On **new sessions**, `write` / `edit` / `bash` / `web_fetch` / `web_search` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
+In `ask` mode (the default), `write` / `edit` / `bash` pause for approval, per `toolPermissions`. File edits open Cursor or VS Code with `--diff`. Options:
 
 1. **Accept** — this change only  
 2. **Accept all … for this session** — remembered on the session (survives resume)  
@@ -135,7 +135,7 @@ On **new sessions**, `write` / `edit` / `bash` / `web_fetch` / `web_search` paus
 
 ```json
 {
-  "fileEditReview": "newSession",
+  "permissionMode": "ask",
   "diffEditor": "cursor",
   "toolPermissions": {
     "write": "ask",
@@ -146,13 +146,12 @@ On **new sessions**, `write` / `edit` / `bash` / `web_fetch` / `web_search` paus
 }
 ```
 
-- `fileEditReview`: `newSession` (default) · `always` · `never` — when `ask` tools prompt  
 - `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`, with
   patterns such as `bash(git status*)`  
 - `permissionMode` / `--permission-mode` / `/permissions`: `read-only` · `ask` (default) ·
   `accept-edits` · `full-access`. See [docs/permissions.md](../../docs/permissions.md)
 - Interactive workflows are wired for `write`, `edit`, `bash`, `web_fetch`, and `web_search`
-- `/review [newSession|always|never]` toggles the ask policy
+- `/review` shows the session's approvals and `toolPermissions`
 
 ## Web tools
 

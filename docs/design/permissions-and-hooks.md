@@ -265,6 +265,9 @@ Hooks and deny rules apply in **every** mode, `full-access` included, because th
 
 - **ACP permission requests** go through a `GatedHost` wrapper that `AgentManager` puts around the host, not a new `HostServices::review_permission` method. `loop-acp` didn't need to change for this.
 - **Agent `tool_call` hooks** fire on permission requests only. Finished agent calls fire `tool_result` hooks, as observers. That way a hook doesn't run twice for one agent call.
-- **`ask` mode keeps today's MCP behaviour:** allowed unless `toolPermissions` says otherwise. There is no prompt for MCP tools yet, and MCP `readOnlyHint` annotations aren't passed through, so `read-only` denies every MCP tool.
-- **`fileEditReview: never` is not migrated** to `accept-edits`. It keeps its meaning (no prompts in the TUI).
+- **`ask` mode keeps today's MCP behaviour:** allowed unless `toolPermissions` says otherwise. There is no prompt for MCP tools yet. In `read-only`, the gate reads `readOnlyHint` from the connected server and treats a tool marked read-only as a read.
+- **`fileEditReview` no longer turns prompts off.** With no `permissionMode`, `never` starts in `accept-edits` with a notice each start (no state is kept to show it once). The bridge's per-session `policy_active` switch is gone, so a resumed session asks like a new one.
+- **`read-only` runs read-only bash commands** (a fixed list, checked part by part after `split_command`), instead of refusing all bash.
+- **Web tools default to `allow`** in every mode, as decided. Saved `ask` entries are kept.
+- **Hook processes on Windows** are stopped with `taskkill /T`, as in `loop-acp`, not a job object. A hook that exits and leaves orphans behind isn't covered there.
 - **`full-access` from settings** falls back to `ask` without a terminal. This covers `--print` and `mcp serve`, and also the desktop app, which bootstraps as non-interactive.

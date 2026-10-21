@@ -11,13 +11,16 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 
 | Mode | read, search, web | write / edit | bash | MCP tools |
 |---|---|---|---|---|
-| `read-only` | allow | deny | deny | deny |
-| `ask` (default) | per `toolPermissions` (web asks) | ask | ask | per `toolPermissions` |
+| `read-only` | allow | deny | read-only commands only | allow if the server marks the tool read-only, else deny |
+| `ask` (default) | per `toolPermissions` | ask | ask | per `toolPermissions` |
 | `accept-edits` | allow | allow inside the workspace; ask outside it and for `.git/`, `.loop/`, `.env*` | per `toolPermissions` | per `toolPermissions` |
 | `full-access` | allow | allow | allow | allow |
 
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
+- **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
+- **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
+- **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
 - **Deny rules and hooks apply in every mode,** `full-access` included.
 - **Calls the mode allows** (for example, edits in `accept-edits`) also skip the after-edit review.
 
@@ -82,6 +85,16 @@ The agent's permission requests then pass through hooks and the mode:
 - **Otherwise**, you are asked.
 
 Codex runs some commands without asking: read-only commands in `read-only` mode, and sandboxed commands in `workspace-write`. Loop sees those only as tool-call updates, after they run.
+
+## Upgrading from 0.4
+
+- **`--print` and `mcp serve` refuse tools that need approval.** In `ask` mode that is `write`, `edit` and `bash`. The model is told why. For unattended edits use `--permission-mode accept-edits`. Bash still needs `full-access` or an allow rule such as `"bash(cargo test*)": "allow"`.
+- **Resumed sessions ask too.** Before, `fileEditReview: newSession` (the default) turned prompts off after `--resume`. Now the mode decides; approvals you accepted for the session still apply.
+- **`fileEditReview: never`** turned off every prompt. With no `permissionMode` set, it now starts Loop in `accept-edits`, with a notice at each start; setting `permissionMode` removes the notice. `newSession` and `always` no longer change anything, and `/review` only shows the session's approvals.
+- **`web_fetch` and `web_search` are allowed by default.** A settings file that already says `ask` for them keeps asking. To be asked before each request, set `"web_fetch": "ask"` and `"web_search": "ask"` in `toolPermissions`.
+- **A hook file with a `tool_call` block and no `match`** now blocks every tool call. Loop warns about such files at startup.
+- **ChatGPT (Codex) in `ask` mode** runs in Codex's `read-only` mode, so it asks before each edit. Before, it ran in Codex's own default, which edits without asking.
+- **A project's `.loop/settings.json`** can no longer loosen `toolPermissions` or `fileEditReview`.
 
 ## `bash` time limits
 
