@@ -10,6 +10,18 @@ Global configuration is in `~/.loop/agent/`. Run `loop config` to print the path
 | `sessions.db` | Saved sessions (SQLite) |
 | `skills/`, `prompts/`, `hooks/`, `extensions/`, `themes/` | Skills (`SKILL.md`), prompt templates, [hooks](hooks.md), extensions, themes |
 
+In `models.json`, custom provider `models` can be string ids (listed with metadata from `/models`) or objects that pin details the listing omits. Object entries require `id`; `name`, `contextWindow`, `maxTokens`, and `reasoning` are optional. The context and token fields also accept snake_case names.
+
+```json
+{
+  "providers": [{
+    "id": "local",
+    "baseUrl": "http://localhost:8000/v1",
+    "models": [{ "id": "my-model", "name": "My model", "contextWindow": 131072, "maxTokens": 8192, "reasoning": true }]
+  }]
+}
+```
+
 A project can add `.loop/settings.json` in its root. Project values override global values. Arrays replace, they do not merge.
 
 Common settings in `settings.json`:

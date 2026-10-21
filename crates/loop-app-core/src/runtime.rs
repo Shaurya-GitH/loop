@@ -1001,7 +1001,10 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
     }
     let raw = std::fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
-    // Support { "providers": [ { id, baseUrl, apiKeyEnv, models: ["id"] } ] }
+    // Support { "providers": [ { id, baseUrl, apiKeyEnv, models: ["id" | { id,
+    // name?, contextWindow?, maxTokens?, reasoning? }] } ] }. Model entries as
+    // objects pin metadata that the `/models` listing cannot provide (most
+    // OpenAI-compatible servers return bare ids), e.g. the real context window.
     if let Some(arr) = value.get("providers").and_then(|v| v.as_array()) {
         for p in arr {
             let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("custom");
@@ -1027,11 +1030,10 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                     a.iter()
                         .filter_map(|m| {
                             if let Some(s) = m.as_str() {
-                                Some(CustomModelSpec::new(s))
-                            } else {
-                                let id = m.get("id")?.as_str()?;
-                                Some(CustomModelSpec::new(id))
+                                return Some(CustomModelSpec::new(s));
                             }
+                            let id = m.get("id")?.as_str()?;
+                            Some(parse_model_spec(m, id))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1053,6 +1055,25 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+/// Build a pinned model spec from a `models.json` object entry, accepting
+/// camelCase and snake_case keys (like the provider fields).
+fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
+    let field = |camel: &str, snake: &str| {
+        m.get(camel)
+            .or_else(|| m.get(snake))
+            .and_then(|v| v.as_u64())
+    };
+    CustomModelSpec::new(id)
+        .with_reasoning(
+            m.get("reasoning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .with_name(m.get("name").and_then(|v| v.as_str()))
+        .with_context_window(field("contextWindow", "context_window"))
+        .with_max_tokens(field("maxTokens", "max_tokens"))
 }
 
 /// Resolve project trust (ask interactively when needed).
@@ -1530,6 +1551,57 @@ pub fn mcp_server_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_json_pins_model_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            models_json_path(dir.path()),
+            r#"{
+                "providers": [{
+                    "id": "zai",
+                    "baseUrl": "https://api.z.ai/api/paas/v4",
+                    "models": [
+                        { "id": "glm-5.3-flash", "contextWindow": 1000000, "maxTokens": 65536, "reasoning": true },
+                        { "id": "snake-model", "name": "Snake model", "context_window": 512000, "max_tokens": 32768, "reasoning": true },
+                        { "id": "wrong-types", "name": 7, "contextWindow": "large", "max_tokens": -1, "reasoning": "yes" },
+                        { "contextWindow": 1000000, "reasoning": true },
+                        42,
+                        "plain-model"
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let models = Models::create(CreateModelsOptions {
+            credentials: None,
+            models_store: None,
+        });
+        load_custom_models_json(dir.path(), &models).unwrap();
+
+        let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
+        assert_eq!(pinned.context_window, 1_000_000);
+        assert_eq!(pinned.max_tokens, 65_536);
+        assert!(pinned.reasoning);
+
+        let snake = models.get_model("zai", "snake-model").unwrap();
+        assert_eq!(snake.name, "Snake model");
+        assert_eq!(snake.context_window, 512_000);
+        assert_eq!(snake.max_tokens, 32_768);
+        assert!(snake.reasoning);
+
+        // Invalid optional values are ignored, and entries without a string id are skipped.
+        let wrong_types = models.get_model("zai", "wrong-types").unwrap();
+        assert_eq!(wrong_types.name, "wrong-types");
+        assert_eq!(wrong_types.context_window, 128_000);
+        assert_eq!(wrong_types.max_tokens, 16_384);
+        assert!(!wrong_types.reasoning);
+        assert!(models.get_model("zai", "").is_none());
+
+        // String entries keep the listing defaults.
+        let plain = models.get_model("zai", "plain-model").unwrap();
+        assert_eq!(plain.context_window, 128_000);
+    }
 
     #[test]
     fn native_efforts_follow_the_model() {
