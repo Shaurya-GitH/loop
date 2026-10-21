@@ -408,13 +408,41 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             base.permission_mode = Some(project_mode.as_str().to_owned());
         }
     }
-    base.file_edit_review = project.file_edit_review;
+    // A project may make edit review stricter (`always`), never looser. A
+    // project file without the key parses as the default, which changes
+    // nothing.
+    if project.file_edit_review.eq_ignore_ascii_case("always") {
+        base.file_edit_review = project.file_edit_review;
+    }
     if project.diff_editor.is_some() {
         base.diff_editor = project.diff_editor;
     }
-    if !project.tool_permissions.is_empty() {
-        for (k, v) in project.tool_permissions {
-            base.tool_permissions.insert(k, v);
+    // A project may add `ask` and `deny` rules, never `allow`, and never
+    // loosen a global rule. A project file without the key parses as exactly
+    // the defaults, which changes nothing.
+    let defaults = crate::tool_approval::default_tool_permissions();
+    let project_rules = if project.tool_permissions == defaults {
+        BTreeMap::new()
+    } else {
+        project.tool_permissions
+    };
+    for (key, value) in project_rules {
+        let strictness = |v: &str| match crate::tool_approval::ToolPermission::parse(v) {
+            crate::tool_approval::ToolPermission::Allow => 0,
+            crate::tool_approval::ToolPermission::Ask => 1,
+            crate::tool_approval::ToolPermission::Deny => 2,
+        };
+        let global = base
+            .tool_permissions
+            .get(&key)
+            .or_else(|| defaults.get(&key))
+            .map_or(0, |v| strictness(v));
+        if strictness(&value) > global {
+            base.tool_permissions.insert(key, value);
+        } else if strictness(&value) < global {
+            tracing::warn!(
+                "project settings cannot loosen toolPermissions `{key}` to `{value}`; ignored"
+            );
         }
     }
     if !project.mcp_servers.is_empty() {
@@ -491,6 +519,57 @@ mod tests {
         };
         global.merge_project(project);
         assert_eq!(global.disabled_mcp_servers, ["filesystem", "remote"]);
+    }
+
+    #[test]
+    fn a_project_can_only_tighten_tool_permissions() {
+        let mut global = Settings::default();
+        global
+            .tool_permissions
+            .insert("read".into(), "allow".into());
+        let project: Settings = serde_json::from_str(
+            r#"{"toolPermissions": {"bash": "allow", "write": "deny",
+                "bash(rm *)": "deny", "bash(git *)": "allow", "read": "ask"}}"#,
+        )
+        .unwrap();
+        global.merge_project(project);
+        let p = &global.tool_permissions;
+        assert_eq!(p["bash"], "ask", "cannot loosen bash");
+        assert_eq!(p["write"], "deny");
+        assert_eq!(p["bash(rm *)"], "deny");
+        assert!(!p.contains_key("bash(git *)"), "no new allow rules");
+        assert_eq!(p["read"], "ask");
+
+        let mut global = Settings::default();
+        global
+            .tool_permissions
+            .insert("bash".into(), "allow".into());
+        global.merge_project(Settings::default());
+        assert_eq!(
+            global.tool_permissions["bash"], "allow",
+            "a project file without toolPermissions keeps the global rules"
+        );
+    }
+
+    #[test]
+    fn a_project_can_only_make_edit_review_stricter() {
+        let mut global = Settings {
+            file_edit_review: "always".into(),
+            ..Default::default()
+        };
+        global.merge_project(Settings::default());
+        assert_eq!(global.file_edit_review, "always", "absent key keeps global");
+        let never: Settings = serde_json::from_str(r#"{"fileEditReview": "never"}"#).unwrap();
+        global.merge_project(never);
+        assert_eq!(global.file_edit_review, "always");
+
+        let mut global = Settings {
+            file_edit_review: "never".into(),
+            ..Default::default()
+        };
+        let always: Settings = serde_json::from_str(r#"{"fileEditReview": "always"}"#).unwrap();
+        global.merge_project(always);
+        assert_eq!(global.file_edit_review, "always");
     }
 
     #[test]
