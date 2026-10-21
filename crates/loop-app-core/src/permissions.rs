@@ -82,6 +82,18 @@ impl PermissionMode {
         }
     }
 
+    /// The agent mode to ask an ACP agent for, in the order to try: Codex
+    /// calls them `read-only`, `workspace-write` and `agent-full-access`.
+    /// In `ask`, the agent asks before edits and network use, and Loop asks
+    /// the user.
+    pub fn agent_modes(self) -> &'static [&'static str] {
+        match self {
+            Self::ReadOnly | Self::Ask => &["read-only"],
+            Self::AcceptEdits => &["workspace-write"],
+            Self::FullAccess => &["agent-full-access", "full-access"],
+        }
+    }
+
     /// One line for the `/permissions` picker.
     pub fn description(self) -> &'static str {
         match self {

@@ -5,7 +5,8 @@
 //! - **permission requests**, which [`GatedHost`] passes through the gate's
 //!   `tool_call` hooks before the user is asked. A block picks the agent's
 //!   own "reject once" option and an allow its "allow once" option (never an
-//!   "always" one); with no decision the user is asked as before.
+//!   "always" one). Then the permission mode: `full-access` allows once,
+//!   `read-only` rejects edits and commands; otherwise the user is asked.
 //! - **tool-call updates**, which [`AgentToolObserver`] turns into
 //!   `tool_result` events once a call finishes. These are observe-only: the
 //!   agent already ran the tool.
@@ -22,6 +23,7 @@ use loop_protocol::{
     ToolCallUpdate, ToolContent, ToolKind,
 };
 
+use crate::permissions::PermissionMode;
 use crate::tool_gate::ToolGate;
 
 /// A host that runs the gate's hooks on an agent's permission requests
@@ -70,27 +72,53 @@ impl HostServices for GatedHost {
             ..
         } = &request
         {
-            match self.gate.review_agent_call(self.info(call)).await {
-                Some(ToolDecision::Block { reason }) => {
-                    let reject = pick(options, &[PermissionKind::RejectOnce])
-                        .or_else(|| pick(options, &[PermissionKind::RejectAlways]));
-                    return match reject {
-                        Some(native_id) => InteractionOutcome::Selected {
-                            native_id,
-                            note: Some(reason),
-                        },
-                        None => InteractionOutcome::Rejected { reason },
-                    };
+            let reject = |reason: String| {
+                let option = pick(options, &[PermissionKind::RejectOnce])
+                    .or_else(|| pick(options, &[PermissionKind::RejectAlways]));
+                match option {
+                    Some(native_id) => InteractionOutcome::Selected {
+                        native_id,
+                        note: Some(reason),
+                    },
+                    None => InteractionOutcome::Rejected { reason },
                 }
+            };
+            let allow_once = || {
+                pick(options, &[PermissionKind::AllowOnce]).map(|native_id| {
+                    InteractionOutcome::Selected {
+                        native_id,
+                        note: None,
+                    }
+                })
+            };
+            match self.gate.review_agent_call(self.info(call)).await {
+                Some(ToolDecision::Block { reason }) => return reject(reason),
                 Some(ToolDecision::Allow) => {
-                    if let Some(native_id) = pick(options, &[PermissionKind::AllowOnce]) {
-                        return InteractionOutcome::Selected {
-                            native_id,
-                            note: None,
-                        };
+                    if let Some(outcome) = allow_once() {
+                        return outcome;
                     }
                 }
                 None => {}
+            }
+            match self.gate.mode() {
+                PermissionMode::FullAccess => {
+                    if let Some(outcome) = allow_once() {
+                        return outcome;
+                    }
+                }
+                PermissionMode::ReadOnly
+                    if matches!(
+                        call.kind,
+                        Some(
+                            ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Execute
+                        ) | None
+                    ) =>
+                {
+                    return reject(
+                        "Loop is in read-only mode; the user can switch with /permissions".into(),
+                    );
+                }
+                _ => {}
             }
         }
         self.inner.interact(request).await
@@ -405,5 +433,31 @@ mod tests {
                 id: "chatgpt".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn the_permission_mode_answers_agent_requests() {
+        let gate = ToolGate::new(Default::default());
+        gate.set_mode(PermissionMode::FullAccess);
+        let (outcome, asked) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(!asked);
+        assert_eq!(
+            outcome,
+            InteractionOutcome::Selected {
+                native_id: "once".into(),
+                note: None
+            }
+        );
+
+        gate.set_mode(PermissionMode::ReadOnly);
+        let (outcome, asked) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(!asked);
+        assert!(
+            matches!(outcome, InteractionOutcome::Selected { native_id, .. } if native_id == "no")
+        );
+
+        gate.set_mode(PermissionMode::AcceptEdits);
+        let (_, asked) = ask(gate, exec_request("ls")).await;
+        assert!(asked, "accept-edits asks the user about commands");
     }
 }

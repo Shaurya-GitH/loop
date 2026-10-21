@@ -193,6 +193,7 @@ async fn handle(agent: &Agent, world: &World, method: &str, params: Value) -> Re
             let value = params["value"].as_str().unwrap_or_default();
             let options = match params["configId"].as_str() {
                 Some("effort") => config_options("gpt-a", value),
+                Some("mode") => config_options_with("gpt-a", "low", value),
                 _ => config_options(value, "low"),
             };
             Ok(json!({"configOptions": options}))
@@ -220,13 +221,22 @@ async fn handle(agent: &Agent, world: &World, method: &str, params: Value) -> Re
 }
 
 fn config_options(model: &str, effort: &str) -> Value {
+    config_options_with(model, effort, "read-only")
+}
+
+fn config_options_with(model: &str, effort: &str, mode: &str) -> Value {
     json!([
         {"id": "model", "name": "Model", "category": "model", "type": "select",
         "currentValue": model,
         "options": [{"value": "gpt-a", "name": "GPT A"}, {"value": "gpt-b", "name": "GPT B", "description": "faster"}]},
         {"id": "effort", "name": "Reasoning", "category": "thought_level", "type": "select",
         "currentValue": effort,
-        "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
+        "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]},
+        {"id": "mode", "name": "Mode", "category": "mode", "type": "select",
+        "currentValue": mode,
+        "options": [{"value": "read-only", "name": "Read-only"},
+                    {"value": "workspace-write", "name": "Workspace access"},
+                    {"value": "agent-full-access", "name": "Full access"}]}
     ])
 }
 
@@ -953,6 +963,36 @@ async fn reasoning_effort_comes_from_the_session_config_and_can_be_switched() {
     assert_eq!(sent["params"]["value"], "high");
 
     assert!(control.set_effort(&session, "ultra").await.is_err());
+}
+
+#[tokio::test]
+async fn the_agent_mode_comes_from_the_session_config_and_can_be_switched() {
+    let fx = fixture(World::default(), FakeHost::default()).await;
+    let session = fx
+        .backend
+        .new_session(SessionSpec::default())
+        .await
+        .unwrap();
+    let control = fx.backend.model_control().unwrap();
+    let modes = control.modes(&session).await.unwrap();
+    assert_eq!(modes.current.as_deref(), Some("read-only"));
+
+    control.set_mode(&session, "workspace-write").await.unwrap();
+    assert_eq!(
+        control.modes(&session).await.unwrap().current.as_deref(),
+        Some("workspace-write")
+    );
+    let sent = fx
+        .world
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|m| m["method"] == "session/set_config_option")
+        .cloned()
+        .unwrap();
+    assert_eq!(sent["params"]["configId"], "mode");
+    assert!(control.set_mode(&session, "yolo").await.is_err());
 }
 
 #[tokio::test]

@@ -107,6 +107,13 @@ pub async fn run_mcp_server(
             bearer_auth(expected, req, next)
         }));
 
+    if !auth_enabled
+        && runtime.permission_mode() == loop_app_core::permissions::PermissionMode::FullAccess
+    {
+        eprintln!(
+            "warning: full access with no --token: any local process can run tools without approval"
+        );
+    }
     if auth_enabled {
         eprintln!("Loop MCP server listening on http://{addr}/mcp (auth: Bearer token)");
     } else {

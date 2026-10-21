@@ -43,6 +43,9 @@ pub struct CliRuntime {
     pub forwarded: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Recoverable reasoning warnings already shown in this CLI process.
     pub(crate) reasoning_notices: std::collections::HashSet<String>,
+    /// `/permissions full-access` was asked for once and needs repeating to
+    /// confirm.
+    pub confirm_full_access: bool,
 }
 
 /// An external agent to start when the surface is ready.
@@ -88,5 +91,6 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         signing_in: None,
         forwarded: Default::default(),
         reasoning_notices: Default::default(),
+        confirm_full_access: false,
     })
 }
