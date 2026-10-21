@@ -114,6 +114,26 @@ impl Worker for FailOnceWorker {
     }
 }
 
+struct BlockedWorker {
+    attempts: AtomicU32,
+}
+
+#[async_trait]
+impl Worker for BlockedWorker {
+    fn supported_task_kinds(&self) -> &[&str] {
+        &["agent_turn"]
+    }
+
+    async fn execute(
+        &self,
+        _task: &TaskNode,
+        _ctx: WorkerContext,
+    ) -> Result<TaskResult, WorkerError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(WorkerError::Blocked("user rejected the command".into()))
+    }
+}
+
 struct AlwaysFailWorker;
 
 #[async_trait]
@@ -312,6 +332,38 @@ async fn retry_exhaustion_fails_task() {
     .unwrap();
 
     assert!(!result.success);
+}
+
+/// A refused task fails at once: retrying would ask the user again.
+#[tokio::test]
+async fn blocked_task_is_not_retried() {
+    let mut p = ManualPlanner::new();
+    p.add_agent_turn_with_config(
+        "blocked",
+        "rm -rf build",
+        None,
+        None,
+        TaskConfig {
+            max_retries: 3,
+            timeout_ms: 0,
+            priority: 0,
+        },
+    );
+    let graph = p.build().unwrap();
+    let worker = Arc::new(BlockedWorker {
+        attempts: AtomicU32::new(0),
+    });
+
+    let result = run_workflow(
+        graph,
+        vec![Arc::clone(&worker) as Arc<dyn Worker>],
+        SchedulerConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(!result.success);
+    assert_eq!(worker.attempts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

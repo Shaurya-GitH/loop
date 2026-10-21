@@ -180,12 +180,7 @@ impl DesktopController {
         // Review file edits in the desktop diff panel; do not spawn Cursor/VS Code on each write.
         bridge.set_open_external_diff(false);
         let bridge = Arc::new(bridge);
-        runtime
-            .harness
-            .set_before_tool_call(Some(bridge.before_tool_hook()));
-        runtime
-            .harness
-            .set_after_tool_call(Some(bridge.after_tool_hook()));
+        runtime.tool_gate.set_approver(Some(Arc::clone(&bridge)));
 
         let thinking_levels = vec![
             AgentThinkingLevel::Off,

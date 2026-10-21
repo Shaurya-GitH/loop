@@ -90,6 +90,8 @@ pub struct Runtime {
     pub model_note: Option<String>,
     /// Interactive tool approval bridge (set by the TUI).
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
+    /// The check every tool call passes; surfaces attach their approver to it.
+    pub tool_gate: std::sync::Arc<crate::tool_gate::ToolGate>,
     /// MCP client manager for external tool servers.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
@@ -1256,6 +1258,10 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
 
+    let tool_gate = crate::tool_gate::ToolGate::new(
+        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
+    );
+    tool_gate.install(&harness);
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
@@ -1323,6 +1329,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         selected_model: model,
         model_note,
         tool_approval: None,
+        tool_gate,
         mcp_client,
         active_skills: Vec::new(),
         web_disabled_for_run: opts.no_web,

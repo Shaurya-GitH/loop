@@ -379,25 +379,9 @@ impl ToolApprovalBridge {
         self.permission_for(tool) == ToolPermission::Deny
     }
 
-    /// Hook for [`AgentHarness::set_after_tool_call`] (file edits).
-    pub fn after_tool_hook(self: &Arc<Self>) -> loop_agent::AfterToolCallFn {
-        let bridge = Arc::clone(self);
-        Arc::new(move |ctx, cancel| {
-            let bridge = Arc::clone(&bridge);
-            Box::pin(async move { bridge.review_after_file_tool(ctx, cancel).await })
-        })
-    }
-
-    /// Hook for [`AgentHarness::set_before_tool_call`] (bash + deny).
-    pub fn before_tool_hook(self: &Arc<Self>) -> loop_agent::BeforeToolCallFn {
-        let bridge = Arc::clone(self);
-        Arc::new(move |ctx, cancel| {
-            let bridge = Arc::clone(&bridge);
-            Box::pin(async move { bridge.review_before_tool(ctx, cancel).await })
-        })
-    }
-
-    async fn review_before_tool(
+    /// The prompt step of [`crate::tool_gate::ToolGate`] before a call
+    /// (bash, web, deny).
+    pub(crate) async fn review_before_tool(
         &self,
         ctx: BeforeToolCallContext,
         cancel: Option<CancellationToken>,
@@ -512,7 +496,8 @@ impl ToolApprovalBridge {
         }
     }
 
-    async fn review_after_file_tool(
+    /// The review step of [`crate::tool_gate::ToolGate`] after a file edit.
+    pub(crate) async fn review_after_file_tool(
         &self,
         ctx: AfterToolCallContext,
         cancel: Option<CancellationToken>,
