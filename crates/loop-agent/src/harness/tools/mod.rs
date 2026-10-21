@@ -362,10 +362,49 @@ pub type BashPrepare = Arc<
         + Sync,
 >;
 
+/// How long a bash command may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BashLimits {
+    /// Used when the call names no `timeoutMs`.
+    pub default_timeout_ms: u64,
+    /// The most a call may ask for.
+    pub max_timeout_ms: u64,
+}
+
+impl Default for BashLimits {
+    fn default() -> Self {
+        Self {
+            default_timeout_ms: 120_000,
+            max_timeout_ms: 600_000,
+        }
+    }
+}
+
+impl BashLimits {
+    /// The timeout for a call that asked for `requested` ms: the default
+    /// when it asked for none, never more than the maximum.
+    pub fn timeout_for(self, requested: Option<u64>) -> u64 {
+        let max = self.max_timeout_ms.max(1);
+        requested
+            .filter(|ms| *ms > 0)
+            .unwrap_or(self.default_timeout_ms)
+            .clamp(1, max)
+    }
+}
+
 /// Create bash tool with optional prepare hook returning (command, cwd).
 pub fn create_bash_tool_with_prepare(
     env: Arc<dyn ExecutionEnv>,
     prepare: Option<BashPrepare>,
+) -> AgentTool {
+    create_bash_tool_with(env, prepare, BashLimits::default())
+}
+
+/// Create bash tool with a prepare hook and timeout `limits`.
+pub fn create_bash_tool_with(
+    env: Arc<dyn ExecutionEnv>,
+    prepare: Option<BashPrepare>,
+    limits: BashLimits,
 ) -> AgentTool {
     AgentTool::simple(
         "bash",
@@ -374,7 +413,16 @@ pub fn create_bash_tool_with_prepare(
         schema_object(
             json!({
                 "command": {"type": "string"},
-                "cwd": {"type": "string"}
+                "cwd": {"type": "string"},
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": format!(
+                        "Milliseconds before the command is stopped (default {}, at most {}). \
+                         Raise it for long builds and test runs.",
+                        limits.default_timeout_ms, limits.max_timeout_ms
+                    )
+                }
             }),
             &["command"],
         ),
@@ -394,11 +442,11 @@ pub fn create_bash_tool_with_prepare(
                         cwd = d;
                     }
                 }
-                const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+                let timeout_ms = limits.timeout_for(args.get("timeoutMs").and_then(|v| v.as_u64()));
                 let mut options = ShellExecOptions {
                     cwd,
                     cancel,
-                    timeout_ms: Some(DEFAULT_BASH_TIMEOUT_MS),
+                    timeout_ms: Some(timeout_ms),
                     ..Default::default()
                 };
                 // Ensure relative cwd resolves against env.cwd
@@ -421,7 +469,20 @@ pub fn create_bash_tool_with_prepare(
                         });
                     }));
                 }
-                let captured = execute_shell_with_capture(env, &command, options, None).await?;
+                let captured = execute_shell_with_capture(env, &command, options, None)
+                    .await
+                    .map_err(|e| {
+                        if e.contains("timed out") {
+                            format!(
+                                "command timed out after {}s; pass timeoutMs (at most {}) to \
+                                 give it longer",
+                                timeout_ms / 1000,
+                                limits.max_timeout_ms
+                            )
+                        } else {
+                            e
+                        }
+                    })?;
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
                         text: captured.text.clone(),
@@ -439,4 +500,48 @@ pub fn create_bash_tool_with_prepare(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod bash_limit_tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_default_and_cap() {
+        let limits = BashLimits {
+            default_timeout_ms: 120_000,
+            max_timeout_ms: 600_000,
+        };
+        assert_eq!(limits.timeout_for(None), 120_000);
+        assert_eq!(limits.timeout_for(Some(0)), 120_000);
+        assert_eq!(limits.timeout_for(Some(300_000)), 300_000);
+        assert_eq!(limits.timeout_for(Some(9_000_000)), 600_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_can_ask_for_less_time_and_learns_how_to_ask_for_more() {
+        let env: Arc<dyn ExecutionEnv> =
+            Arc::new(crate::harness::HostExecutionEnv::new(std::env::temp_dir()));
+        let tool = create_bash_tool_with(
+            env,
+            None,
+            BashLimits {
+                default_timeout_ms: 60_000,
+                max_timeout_ms: 120_000,
+            },
+        );
+        let started = std::time::Instant::now();
+        let err = (tool.execute)(
+            "c1".into(),
+            json!({"command": "sleep 5", "timeoutMs": 200}),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert!(err.contains("pass timeoutMs (at most 120000)"), "{err}");
+        assert!(tool.parameters["properties"]["timeoutMs"].is_object());
+    }
 }
