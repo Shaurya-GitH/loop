@@ -318,13 +318,15 @@ fn read_only_part(words: &[String]) -> bool {
             "-fls",
         ]),
         // `-o FILE` writes FILE, also inside a cluster such as `-uo`.
+        // `--compress-program` runs a program when sort spills to disk.
         "sort" => !args.iter().any(|a| {
             a.starts_with("--output")
+                || a.starts_with("--compress-program")
                 || (a.starts_with('-') && !a.starts_with("--") && a.contains('o'))
         }),
         // `file -C` compiles a magic file.
         "file" => !has(&["-C", "--compile"]),
-        "rg" => !has(&["--pre"]),
+        "rg" => !has(&["--pre", "--hostname-bin"]),
         "tree" => !has(&["-o"]),
         // `uniq IN OUT` writes OUT.
         "uniq" => positional() <= 1,
@@ -581,6 +583,8 @@ mod tests {
             "sort -uo out.txt in.txt",
             "file -C -m magic",
             "rg --pre ./script x",
+            "rg --hostname-bin=./script x",
+            "sort -S 1 --compress-program=./script big.txt",
             "tree -o out.txt",
             "uniq in.txt out.txt",
             "ls $(pwd)",
