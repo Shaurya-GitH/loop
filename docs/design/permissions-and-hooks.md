@@ -1,6 +1,6 @@
 # P0-3 + P0-4 · Tool gate, hooks and permission modes: design draft
 
-Status: accepted; PR 1 (the gate) implemented. Based on `origin/main` at cb4a0c1 (v0.4.0).
+Status: implemented in the feat/tool-gate … docs/hooks-permissions stack. User docs: [hooks](../hooks.md), [permissions](../permissions.md). Differences from this draft are listed at the end.
 
 Goal: every tool call goes through one gate, in every mode. Loop's own tools,
 MCP tools and an external agent's permission requests all pass the same chain:
@@ -260,3 +260,14 @@ Hooks and deny rules apply in **every** mode, `full-access` included, because th
 - Decided: web tools run freely in `read-only`.
 - Decided: a `tool_call` hook that errors or times out blocks the call (`onError: "block"` default).
 - Open: workflow `ShellCommand` tasks (from `/workflow`, `agent_worker.rs:243`) run `host_env.exec` directly, skipping the gate, `check_command_policy` and the 120 s bash timeout. Proposal: route them through the gate as `bash` calls in PR 1.
+
+## 6. As built
+
+- **ACP permission requests** go through a `GatedHost` wrapper that `AgentManager` puts around the host, not a new `HostServices::review_permission` method. `loop-acp` didn't need to change for this.
+- **Agent `tool_call` hooks** fire on permission requests only. Finished agent calls fire `tool_result` hooks, as observers. That way a hook doesn't run twice for one agent call.
+- **`ask` mode keeps today's MCP behaviour:** allowed unless `toolPermissions` says otherwise. There is no prompt for MCP tools yet. In `read-only`, the gate reads `readOnlyHint` from the connected server and treats a tool marked read-only as a read.
+- **`fileEditReview` no longer turns prompts off.** With no `permissionMode`, `never` starts in `accept-edits` with a notice each start (no state is kept to show it once). The bridge's per-session `policy_active` switch is gone, so a resumed session asks like a new one.
+- **`read-only` runs read-only bash commands** (a fixed list, checked part by part after `split_command`), instead of refusing all bash.
+- **Web tools default to `allow`** in every mode, as decided. Saved `ask` entries are kept.
+- **Hook processes on Windows** are stopped with `taskkill /T`, as in `loop-acp`, not a job object. A hook that exits and leaves orphans behind isn't covered there.
+- **`full-access` from settings** falls back to `ask` without a terminal. This covers `--print` and `mcp serve`, and also the desktop app, which bootstraps as non-interactive.

@@ -1078,7 +1078,11 @@ pub fn resolve_trust(
             if !interactive {
                 return Ok(false);
             }
-            eprintln!("Trust project config from {}? [y/N]", cwd.display());
+            eprintln!(
+                "Trust project config from {}? Its settings, skills and hooks will load, and its \
+                 hooks can run commands. [y/N]",
+                cwd.display()
+            );
             let mut answer = String::new();
             std::io::Write::write_all(&mut std::io::stderr(), b"> ").ok();
             std::io::stdin().read_line(&mut answer)?;
