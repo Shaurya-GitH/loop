@@ -62,6 +62,10 @@ pub struct ToolCallInfo {
     pub session_id: String,
     /// Working directory of the session.
     pub cwd: PathBuf,
+    /// The host's permission mode (`read-only`, `ask`, `accept-edits`,
+    /// `full-access`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// A hook's decision about a tool call.

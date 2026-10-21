@@ -8,6 +8,7 @@ pub mod hook_command;
 pub mod hooks_load;
 pub mod interaction;
 pub mod model_selection;
+pub mod permissions;
 pub mod resources;
 pub mod runtime;
 pub mod system_prompt;

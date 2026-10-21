@@ -148,7 +148,7 @@ pub async fn run_print(
     prompt: String,
     trace: &TraceArgs,
 ) -> anyhow::Result<()> {
-    for notice in std::mem::take(&mut runtime.hook_notices) {
+    for notice in std::mem::take(&mut runtime.startup_notices) {
         eprintln!("loop: {notice}");
     }
     // No one can approve anything here: external agents get the default

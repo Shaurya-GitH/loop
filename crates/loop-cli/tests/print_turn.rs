@@ -188,3 +188,33 @@ async fn hooks_block_matching_calls_in_print_mode() {
         );
     }
 }
+
+/// Nobody can approve in `--print`: in `ask` mode a tool that needs approval
+/// is refused, and `full-access` runs it.
+#[tokio::test]
+async fn print_mode_refuses_what_needs_approval_unless_full_access() {
+    use loop_app_core::permissions::PermissionMode;
+    for (mode, should_run) in [
+        (PermissionMode::Ask, false),
+        (PermissionMode::ReadOnly, false),
+        (PermissionMode::AcceptEdits, false),
+        (PermissionMode::FullAccess, true),
+    ] {
+        let (bash, ran) = recording_bash();
+        let (backend, harness) = backend_with(bash_call("ls"), true, vec![bash]).await;
+        let gate = loop_app_core::tool_gate::ToolGate::new(
+            loop_app_core::tool_approval::permissions_from_settings(&Default::default()),
+        );
+        gate.set_mode(mode);
+        gate.install(&harness);
+        let session = backend.current_session().await;
+        print_turn(backend.as_ref(), &session, "go".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            should_run,
+            "{mode:?}"
+        );
+    }
+}

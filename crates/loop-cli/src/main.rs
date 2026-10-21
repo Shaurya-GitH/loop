@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long, global = true)]
     no_web: bool,
 
+    /// Permission mode: read-only, ask (default), accept-edits or full-access.
+    #[arg(long, global = true, value_name = "MODE")]
+    permission_mode: Option<String>,
+
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
     print: Option<String>,
@@ -267,6 +271,7 @@ async fn real_main() -> anyhow::Result<()> {
         append_system_prompt: cli.append_system_prompt,
         no_context_files: cli.no_context_files,
         no_web: cli.no_web,
+        permission_mode: cli.permission_mode,
         interactive,
         session_id: if agent_resume.is_some() {
             None

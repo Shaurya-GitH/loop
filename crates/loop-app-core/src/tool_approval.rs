@@ -29,14 +29,16 @@ pub const GROUP_BASH: &str = "bash";
 /// Web tool group (`web_fetch` + `web_search`).
 pub const GROUP_WEB: &str = "web";
 
-/// Policy for when `ask`-mode tools prompt.
+/// The old `fileEditReview` setting. The permission mode now decides when
+/// to ask; only `never` still matters, as the starting mode
+/// ([`crate::runtime::startup_permission_mode`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
-    /// Prompt only on brand-new sessions (not `--resume`).
+    /// `newSession` (the default).
     NewSession,
-    /// Always prompt (unless session auto-approve).
+    /// `always`.
     Always,
-    /// Never prompt.
+    /// `never`: start in `accept-edits` when no `permissionMode` is set.
     Never,
 }
 
@@ -56,15 +58,6 @@ impl ApprovalPolicy {
             Self::NewSession => "newSession",
             Self::Always => "always",
             Self::Never => "never",
-        }
-    }
-
-    /// Whether asking is active for this session (before auto-approve).
-    pub fn asks_for_session(self, is_new_session: bool) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Never => false,
-            Self::NewSession => is_new_session,
         }
     }
 }
@@ -107,8 +100,8 @@ pub fn default_tool_permissions() -> BTreeMap<String, String> {
         ("edit".into(), "ask".into()),
         ("bash".into(), "ask".into()),
         ("read".into(), "allow".into()),
-        ("web_fetch".into(), "ask".into()),
-        ("web_search".into(), "ask".into()),
+        ("web_fetch".into(), "allow".into()),
+        ("web_search".into(), "allow".into()),
     ])
 }
 
@@ -203,8 +196,6 @@ pub struct ApprovalPrompt {
 /// Shared bridge between agent hooks and the TUI.
 #[derive(Clone)]
 pub struct ToolApprovalBridge {
-    /// Whether the approval policy is active for this session.
-    policy_active: Arc<std::sync::atomic::AtomicBool>,
     /// Per-tool permission overrides from settings.
     permissions: Arc<SyncMutex<BTreeMap<String, ToolPermission>>>,
     /// Session auto-approve groups (`file`, `bash`, …).
@@ -239,7 +230,6 @@ impl ToolApprovalBridge {
     pub fn new(
         env: Arc<dyn ExecutionEnv>,
         diff_editor: Option<String>,
-        policy_active: bool,
         permissions: BTreeMap<String, ToolPermission>,
         session_auto_approve: HashSet<String>,
     ) -> (Self, mpsc::UnboundedReceiver<ApprovalPrompt>) {
@@ -248,7 +238,6 @@ impl ToolApprovalBridge {
             Self::with_sink(
                 env,
                 diff_editor,
-                policy_active,
                 permissions,
                 session_auto_approve,
                 PromptSink::Prompts(prompt_tx),
@@ -263,7 +252,6 @@ impl ToolApprovalBridge {
     pub fn with_host(
         env: Arc<dyn ExecutionEnv>,
         diff_editor: Option<String>,
-        policy_active: bool,
         permissions: BTreeMap<String, ToolPermission>,
         session_auto_approve: HashSet<String>,
         host: Arc<dyn HostServices>,
@@ -271,7 +259,6 @@ impl ToolApprovalBridge {
         Self::with_sink(
             env,
             diff_editor,
-            policy_active,
             permissions,
             session_auto_approve,
             PromptSink::Host(host),
@@ -281,13 +268,11 @@ impl ToolApprovalBridge {
     fn with_sink(
         env: Arc<dyn ExecutionEnv>,
         diff_editor: Option<String>,
-        policy_active: bool,
         permissions: BTreeMap<String, ToolPermission>,
         session_auto_approve: HashSet<String>,
         prompts: PromptSink,
     ) -> Self {
         Self {
-            policy_active: Arc::new(std::sync::atomic::AtomicBool::new(policy_active)),
             permissions: Arc::new(SyncMutex::new(permissions)),
             auto_approve: Arc::new(SyncMutex::new(session_auto_approve)),
             prompts,
@@ -308,17 +293,6 @@ impl ToolApprovalBridge {
     /// Install a persistence callback for Accept-all labels.
     pub fn set_persist(&self, persist: PersistAutoApprove) {
         *self.persist.lock() = Some(persist);
-    }
-
-    /// Enable/disable ask policy for this session.
-    pub fn set_policy_active(&self, active: bool) {
-        self.policy_active
-            .store(active, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Whether ask policy is active.
-    pub fn policy_active(&self) -> bool {
-        self.policy_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Replace per-tool permissions from settings.
@@ -355,7 +329,8 @@ impl ToolApprovalBridge {
             .unwrap_or(ToolPermission::Allow)
     }
 
-    /// Whether we should interactively ask for this tool right now.
+    /// Whether to prompt for this tool now: not when settings allow it, or
+    /// the session already accepted its group.
     pub fn should_ask(&self, tool: &str) -> bool {
         if !interactive_tools().contains(&tool) {
             return false;
@@ -364,12 +339,7 @@ impl ToolApprovalBridge {
             ToolPermission::Allow => false,
             ToolPermission::Deny => false, // handled as hard block separately
             ToolPermission::Ask => {
-                if let Some(group) = approval_group(tool) {
-                    if self.auto_approve.lock().contains(group) {
-                        return false;
-                    }
-                }
-                self.policy_active()
+                approval_group(tool).is_none_or(|group| !self.auto_approve.lock().contains(group))
             }
         }
     }
@@ -850,8 +820,8 @@ mod tests {
 
     #[test]
     fn policy_and_permissions() {
-        assert!(ApprovalPolicy::NewSession.asks_for_session(true));
-        assert!(!ApprovalPolicy::NewSession.asks_for_session(false));
+        assert_eq!(ApprovalPolicy::parse("off"), ApprovalPolicy::Never);
+        assert_eq!(ApprovalPolicy::parse("x"), ApprovalPolicy::NewSession);
         assert_eq!(ToolPermission::parse("ASK"), ToolPermission::Ask);
         assert_eq!(approval_group("write"), Some(GROUP_FILE));
         assert_eq!(approval_group("bash"), Some(GROUP_BASH));
@@ -862,8 +832,11 @@ mod tests {
         let permissions =
             permissions_from_settings(&BTreeMap::from([("bash".into(), "allow".into())]));
         assert_eq!(permissions.get("bash"), Some(&ToolPermission::Allow));
-        assert_eq!(permissions.get("web_fetch"), Some(&ToolPermission::Ask));
-        assert_eq!(permissions.get("web_search"), Some(&ToolPermission::Ask));
+        assert_eq!(permissions.get("web_fetch"), Some(&ToolPermission::Allow));
+        assert_eq!(permissions.get("web_search"), Some(&ToolPermission::Allow));
+        let chosen =
+            permissions_from_settings(&BTreeMap::from([("web_fetch".into(), "ask".into())]));
+        assert_eq!(chosen.get("web_fetch"), Some(&ToolPermission::Ask));
     }
 
     #[test]
