@@ -30,6 +30,28 @@ use loop_protocol::ToolKind;
 use crate::permissions::{Decision, PermissionMode};
 use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
 
+/// Why a call that needs approval is refused when nobody can approve it,
+/// naming a mode that would allow it.
+fn headless_refusal(tool: &str, mode: PermissionMode) -> String {
+    let fix = if matches!(tool, "write" | "edit") && mode != PermissionMode::AcceptEdits {
+        "Rerun with --permission-mode accept-edits (edits inside the workspace) or full-access"
+            .to_owned()
+    } else if tool == "bash" {
+        "Rerun with --permission-mode full-access, or allow the command in \
+         settings.toolPermissions, for example \"bash(cargo test*)\": \"allow\""
+            .to_owned()
+    } else {
+        format!(
+            "Rerun with --permission-mode full-access, or allow `{tool}` in \
+             settings.toolPermissions"
+        )
+    };
+    format!(
+        "`{tool}` needs approval in {} mode, and nobody can approve it in this run. {fix}.",
+        mode.as_str()
+    )
+}
+
 /// Largest tool output passed to `tool_result` hooks.
 const HOOK_OUTPUT_CAP: usize = 64 * 1024;
 
@@ -272,13 +294,7 @@ impl ToolGate {
                 }
                 match gate.approver() {
                     Some(approver) => approver.review_before_tool(ctx, cancel).await,
-                    None => block(format!(
-                        "`{}` needs approval in {} mode, and nobody can approve it in this \
-                         run. Rerun with --permission-mode accept-edits or full-access, or \
-                         allow the tool in settings.toolPermissions.",
-                        ctx.tool_call.name,
-                        gate.mode().as_str()
-                    )),
+                    None => block(headless_refusal(&ctx.tool_call.name, gate.mode())),
                 }
             })
         })
@@ -531,6 +547,21 @@ mod tests {
             text_signature: None,
         })]);
         assert!(text.len() <= HOOK_OUTPUT_CAP);
+    }
+
+    #[tokio::test]
+    async fn the_headless_refusal_names_a_mode_that_would_allow_the_call() {
+        let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
+            &Default::default(),
+        ));
+        gate.set_mode(PermissionMode::AcceptEdits);
+        let bash = gate.before_hook()(call("bash"), None).await.unwrap();
+        let reason = bash.reason.unwrap();
+        assert!(reason.contains("full-access"), "{reason}");
+        assert!(!reason.contains("accept-edits ("), "{reason}");
+        gate.set_mode(PermissionMode::Ask);
+        let write = gate.before_hook()(call("write"), None).await.unwrap();
+        assert!(write.reason.unwrap().contains("accept-edits"));
     }
 
     #[tokio::test]
