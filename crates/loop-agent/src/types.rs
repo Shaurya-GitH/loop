@@ -111,6 +111,32 @@ pub struct BeforeToolCallContext {
     pub context: AgentContext,
 }
 
+impl BeforeToolCallContext {
+    /// Context for a call that did not come from a model turn (an MCP
+    /// client, a workflow shell task): a placeholder assistant message that
+    /// holds just this call.
+    pub fn standalone(tool_call: ToolCall, args: Value) -> Self {
+        Self {
+            assistant_message: AssistantMessage {
+                content: vec![loop_ai::AssistantContent::ToolCall(tool_call.clone())],
+                api: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                response_model: None,
+                response_id: None,
+                usage: Default::default(),
+                stop_reason: loop_ai::StopReason::ToolUse,
+                error_message: None,
+                raw_stop_reason: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            },
+            tool_call,
+            args,
+            context: AgentContext::default(),
+        }
+    }
+}
+
 /// Context passed to `after_tool_call`.
 #[derive(Clone)]
 pub struct AfterToolCallContext {

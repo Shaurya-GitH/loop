@@ -80,12 +80,17 @@ pub async fn run_mcp_server(
 ) -> anyhow::Result<()> {
     let listen = resolve_mcp_listen(host, port, token)?;
     let harness = Arc::clone(&runtime.harness);
+    let gate = Arc::clone(&runtime.tool_gate);
     let ct = CancellationToken::new();
 
     let service = StreamableHttpService::new(
         move || {
             let tools = harness.tools_snapshot();
-            let provider = Arc::new(LoopToolProvider::new(tools));
+            // Calls from MCP clients pass the same checks as the agent's.
+            let provider = Arc::new(
+                LoopToolProvider::new(tools)
+                    .with_tool_hooks(Some(gate.before_hook()), Some(gate.after_hook())),
+            );
             Ok(McpServer::new(provider))
         },
         LocalSessionManager::default().into(),
@@ -102,6 +107,13 @@ pub async fn run_mcp_server(
             bearer_auth(expected, req, next)
         }));
 
+    if !auth_enabled
+        && runtime.permission_mode() == loop_app_core::permissions::PermissionMode::FullAccess
+    {
+        eprintln!(
+            "warning: full access with no --token: any local process can run tools without approval"
+        );
+    }
     if auth_enabled {
         eprintln!("Loop MCP server listening on http://{addr}/mcp (auth: Bearer token)");
     } else {

@@ -29,7 +29,9 @@ pub use compaction::{
     CompactionSettings,
 };
 pub use env::HostExecutionEnv;
-pub use hooks::{HarnessHookEvent, HookOutcome, HookRegistry};
+pub use hooks::{
+    HarnessHookEvent, HookOutcome, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
+};
 pub use sandbox::{
     check_krun_deps, check_local_sandbox_deps, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
@@ -48,7 +50,10 @@ pub use tools::web::{
     SoketWebApi, WebFetchConfig, WebFetchProvider, WebSearchBackendInfo, WebSearchConfig,
     DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_BACKENDS,
 };
-pub use tools::{create_bash_tool, create_edit_tool, create_read_tool, create_write_tool};
+pub use tools::{
+    create_bash_tool, create_bash_tool_with, create_edit_tool, create_read_tool, create_write_tool,
+    BashLimits,
+};
 pub use types::{
     AgentHarnessError, AgentHarnessPhase, AgentHarnessResources, CompactResult, ExecutionEnv,
     ExecutionToolContext, FileSystem, NavigateTreeResult, PromptTemplate, Shell, Skill,

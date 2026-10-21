@@ -232,6 +232,9 @@ pub struct ToolCallUpdate {
     /// The tool's raw output, as the backend reported it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<Value>,
+    /// The tool's input, when the backend reports or changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<Value>,
 }
 
 impl ToolCallUpdate {
@@ -246,6 +249,7 @@ impl ToolCallUpdate {
             content: None,
             locations: None,
             raw_output: None,
+            raw_input: None,
         }
     }
 }

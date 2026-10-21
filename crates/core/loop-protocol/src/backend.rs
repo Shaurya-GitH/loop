@@ -222,6 +222,15 @@ pub trait ModelControl: Send + Sync {
             "choosing a reasoning effort".into(),
         ))
     }
+    /// The approval and sandbox modes the session offers, as choices.
+    async fn modes(&self, _session: &SessionRef) -> BackendResult<ModelChoices> {
+        Err(BackendError::Unsupported("choosing a mode".into()))
+    }
+    /// Switch the session to mode `mode` (a [`ModelChoice::id`] from
+    /// [`Self::modes`]).
+    async fn set_mode(&self, _session: &SessionRef, _mode: &str) -> BackendResult<()> {
+        Err(BackendError::Unsupported("choosing a mode".into()))
+    }
 }
 
 /// What Loop provides to every backend. Implemented once by the host

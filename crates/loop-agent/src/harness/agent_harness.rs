@@ -129,6 +129,7 @@ pub struct AgentHarness {
     tool_execution: Mutex<ToolExecutionMode>,
     before_tool_call: Mutex<Option<BeforeToolHook>>,
     after_tool_call: Mutex<Option<AfterToolHook>>,
+    bash_limits: Mutex<crate::harness::tools::BashLimits>,
     #[allow(dead_code)]
     steering_mode: Mutex<QueueMode>,
     #[allow(dead_code)]
@@ -172,11 +173,28 @@ impl AgentHarness {
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
             before_tool_call: Mutex::new(None),
             after_tool_call: Mutex::new(None),
+            bash_limits: Mutex::new(Default::default()),
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
             #[cfg(feature = "mcp")]
             mcp_client: Arc::new(loop_mcp::McpClientManager::new()),
         }
+    }
+
+    /// Time limits for shell commands run outside the `bash` tool
+    /// (workflow shell tasks).
+    pub fn set_bash_limits(&self, limits: crate::harness::tools::BashLimits) {
+        *self.bash_limits.lock() = limits;
+    }
+
+    /// The hook registry, for hosts that emit their own events (tool gate).
+    pub fn hooks(&self) -> HookRegistry {
+        self.hooks.clone()
+    }
+
+    /// Working directory of the host environment.
+    pub fn cwd(&self) -> std::path::PathBuf {
+        self.host_env.cwd().to_path_buf()
     }
 
     /// Current session id (also sent on provider API requests).
@@ -1323,7 +1341,7 @@ impl AgentHarness {
         >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use crate::harness::orchestration::{
-            agent_worker::{AgentWorker, ShellWorker},
+            agent_worker::{AgentWorker, ShellWorker, WorkflowToolHooks},
             WorkflowProgressEvent,
         };
         use loop_orchestration::memory::bus::create_memory_bus;
@@ -1361,20 +1379,32 @@ impl AgentHarness {
         let system_prompt = self.system_prompt.read().await.clone();
         let tools = self.tools.read().clone();
         let host_env = Arc::clone(&self.host_env);
+        // Workflow tasks get the same tool checks as the chat.
+        let hooks = WorkflowToolHooks {
+            before: self.before_tool_call.lock().clone(),
+            after: self.after_tool_call.lock().clone(),
+        };
         let thinking_level = *self.thinking_level.read().await;
         let mut stream_options = self.stream_options.read().await.clone();
         stream_options.reasoning = thinking_level.to_reasoning();
 
-        let agent_worker = Arc::new(AgentWorker::new(
-            Arc::clone(&self.stream_fn),
-            Arc::clone(&host_env),
-            tools,
-            model,
-            system_prompt,
-            stream_options,
-        ));
+        let agent_worker = Arc::new(
+            AgentWorker::new(
+                Arc::clone(&self.stream_fn),
+                Arc::clone(&host_env),
+                tools,
+                model,
+                system_prompt,
+                stream_options,
+            )
+            .with_tool_hooks(hooks.clone()),
+        );
 
-        let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&host_env)));
+        let shell_worker = Arc::new(
+            ShellWorker::new(Arc::clone(&host_env))
+                .with_tool_hooks(hooks)
+                .with_timeout_ms(self.bash_limits.lock().default_timeout_ms),
+        );
 
         let mut pool = WorkerPool::new(scheduler_config.max_concurrency);
         pool.register(agent_worker);

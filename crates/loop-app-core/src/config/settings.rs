@@ -175,6 +175,15 @@ pub struct Settings {
     /// tool is only registered when the backend's API key resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<loop_agent::harness::WebSearchConfig>,
+    /// `bash` time limits (`bash.defaultTimeoutMs`, `bash.maxTimeoutMs`).
+    /// Global only: a project file cannot change them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash: Option<BashSettings>,
+    /// Permission mode at startup: `read-only`, `ask` (default),
+    /// `accept-edits` or `full-access`. A project file may only choose a
+    /// stricter mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// When to prompt for `ask`-mode tools: `newSession`, `always`, or `never`.
     #[serde(default = "default_file_edit_review")]
     pub file_edit_review: String,
@@ -262,6 +271,8 @@ impl Default for Settings {
             sandbox: SandboxSettings::default(),
             web_fetch: None,
             web_search: None,
+            bash: None,
+            permission_mode: None,
             file_edit_review: default_file_edit_review(),
             diff_editor: None,
             tool_permissions: default_tool_permissions_settings(),
@@ -272,6 +283,34 @@ impl Default for Settings {
             tracing: TracingSettings::default(),
             providers: Vec::new(),
             agents: Vec::new(),
+        }
+    }
+}
+
+/// `bash` settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashSettings {
+    /// Timeout when a call names none, in ms (default 120000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_timeout_ms: Option<u64>,
+    /// The most a call may ask for, in ms (default 600000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_timeout_ms: Option<u64>,
+}
+
+impl BashSettings {
+    /// The limits these settings ask for, over the built-in defaults. The
+    /// maximum is never below the default.
+    pub fn limits(&self) -> loop_agent::harness::BashLimits {
+        let base = loop_agent::harness::BashLimits::default();
+        let default_timeout_ms = self.default_timeout_ms.unwrap_or(base.default_timeout_ms);
+        loop_agent::harness::BashLimits {
+            default_timeout_ms,
+            max_timeout_ms: self
+                .max_timeout_ms
+                .unwrap_or(base.max_timeout_ms)
+                .max(default_timeout_ms),
         }
     }
 }
@@ -387,13 +426,56 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             ..global
         });
     }
-    base.file_edit_review = project.file_edit_review;
+    // A project may tighten the permission mode, never loosen it.
+    if let Some(project_mode) = project
+        .permission_mode
+        .as_deref()
+        .and_then(crate::permissions::PermissionMode::parse)
+    {
+        let global = base
+            .permission_mode
+            .as_deref()
+            .and_then(crate::permissions::PermissionMode::parse)
+            .unwrap_or_default();
+        if project_mode < global {
+            base.permission_mode = Some(project_mode.as_str().to_owned());
+        }
+    }
+    // A project may make edit review stricter (`always`), never looser. A
+    // project file without the key parses as the default, which changes
+    // nothing.
+    if project.file_edit_review.eq_ignore_ascii_case("always") {
+        base.file_edit_review = project.file_edit_review;
+    }
     if project.diff_editor.is_some() {
         base.diff_editor = project.diff_editor;
     }
-    if !project.tool_permissions.is_empty() {
-        for (k, v) in project.tool_permissions {
-            base.tool_permissions.insert(k, v);
+    // A project may add `ask` and `deny` rules, never `allow`, and never
+    // loosen a global rule. A project file without the key parses as exactly
+    // the defaults, which changes nothing.
+    let defaults = crate::tool_approval::default_tool_permissions();
+    let project_rules = if project.tool_permissions == defaults {
+        BTreeMap::new()
+    } else {
+        project.tool_permissions
+    };
+    for (key, value) in project_rules {
+        let strictness = |v: &str| match crate::tool_approval::ToolPermission::parse(v) {
+            crate::tool_approval::ToolPermission::Allow => 0,
+            crate::tool_approval::ToolPermission::Ask => 1,
+            crate::tool_approval::ToolPermission::Deny => 2,
+        };
+        let global = base
+            .tool_permissions
+            .get(&key)
+            .or_else(|| defaults.get(&key))
+            .map_or(0, |v| strictness(v));
+        if strictness(&value) > global {
+            base.tool_permissions.insert(key, value);
+        } else if strictness(&value) < global {
+            tracing::warn!(
+                "project settings cannot loosen toolPermissions `{key}` to `{value}`; ignored"
+            );
         }
     }
     if !project.mcp_servers.is_empty() {
@@ -470,6 +552,95 @@ mod tests {
         };
         global.merge_project(project);
         assert_eq!(global.disabled_mcp_servers, ["filesystem", "remote"]);
+    }
+
+    #[test]
+    fn a_project_can_only_tighten_tool_permissions() {
+        let mut global = Settings::default();
+        global
+            .tool_permissions
+            .insert("read".into(), "allow".into());
+        let project: Settings = serde_json::from_str(
+            r#"{"toolPermissions": {"bash": "allow", "write": "deny",
+                "bash(rm *)": "deny", "bash(git *)": "allow", "read": "ask"}}"#,
+        )
+        .unwrap();
+        global.merge_project(project);
+        let p = &global.tool_permissions;
+        assert_eq!(p["bash"], "ask", "cannot loosen bash");
+        assert_eq!(p["write"], "deny");
+        assert_eq!(p["bash(rm *)"], "deny");
+        assert!(!p.contains_key("bash(git *)"), "no new allow rules");
+        assert_eq!(p["read"], "ask");
+
+        let mut global = Settings::default();
+        global
+            .tool_permissions
+            .insert("bash".into(), "allow".into());
+        global.merge_project(Settings::default());
+        assert_eq!(
+            global.tool_permissions["bash"], "allow",
+            "a project file without toolPermissions keeps the global rules"
+        );
+    }
+
+    #[test]
+    fn a_project_can_only_make_edit_review_stricter() {
+        let mut global = Settings {
+            file_edit_review: "always".into(),
+            ..Default::default()
+        };
+        global.merge_project(Settings::default());
+        assert_eq!(global.file_edit_review, "always", "absent key keeps global");
+        let never: Settings = serde_json::from_str(r#"{"fileEditReview": "never"}"#).unwrap();
+        global.merge_project(never);
+        assert_eq!(global.file_edit_review, "always");
+
+        let mut global = Settings {
+            file_edit_review: "never".into(),
+            ..Default::default()
+        };
+        let always: Settings = serde_json::from_str(r#"{"fileEditReview": "always"}"#).unwrap();
+        global.merge_project(always);
+        assert_eq!(global.file_edit_review, "always");
+    }
+
+    #[test]
+    fn bash_limits_are_global_only() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"bash": {"defaultTimeoutMs": 300000}}"#).unwrap();
+        let limits = global.bash.unwrap().limits();
+        assert_eq!(limits.default_timeout_ms, 300_000);
+        assert_eq!(limits.max_timeout_ms, 600_000);
+        let project: Settings =
+            serde_json::from_str(r#"{"bash": {"maxTimeoutMs": 99999999}}"#).unwrap();
+        global.merge_project(project);
+        assert_eq!(global.bash.unwrap().limits().max_timeout_ms, 600_000);
+
+        let low_max = BashSettings {
+            default_timeout_ms: Some(900_000),
+            max_timeout_ms: Some(1_000),
+        };
+        assert_eq!(low_max.limits().max_timeout_ms, 900_000);
+    }
+
+    #[test]
+    fn a_project_can_only_tighten_the_permission_mode() {
+        let with_mode = |mode: &str| Settings {
+            permission_mode: Some(mode.into()),
+            ..Default::default()
+        };
+        let mut global = with_mode("accept-edits");
+        global.merge_project(with_mode("full-access"));
+        assert_eq!(global.permission_mode.as_deref(), Some("accept-edits"));
+        global.merge_project(with_mode("read-only"));
+        assert_eq!(global.permission_mode.as_deref(), Some("read-only"));
+
+        let mut default = Settings::default();
+        default.merge_project(with_mode("accept-edits"));
+        assert_eq!(default.permission_mode, None, "looser than the default ask");
+        default.merge_project(Settings::default());
+        assert_eq!(default.permission_mode, None);
     }
 
     #[test]
@@ -559,14 +730,14 @@ mod tests {
         );
         assert_eq!(
             loaded.tool_permissions.get("web_fetch").map(String::as_str),
-            Some("ask")
+            Some("allow")
         );
         assert_eq!(
             loaded
                 .tool_permissions
                 .get("web_search")
                 .map(String::as_str),
-            Some("ask")
+            Some("allow")
         );
     }
 

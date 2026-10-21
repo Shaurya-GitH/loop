@@ -1147,6 +1147,7 @@ impl AgentBackend for AcpBackend {
 enum Setting {
     Model,
     Effort,
+    Mode,
 }
 
 impl Setting {
@@ -1154,6 +1155,7 @@ impl Setting {
         match self {
             Self::Model => acp::SessionConfigOptionCategory::Model,
             Self::Effort => acp::SessionConfigOptionCategory::ThoughtLevel,
+            Self::Mode => acp::SessionConfigOptionCategory::Mode,
         }
     }
 
@@ -1161,6 +1163,7 @@ impl Setting {
         BackendError::Unsupported(match self {
             Self::Model => "choosing a model".into(),
             Self::Effort => "choosing a reasoning effort".into(),
+            Self::Mode => "choosing a mode".into(),
         })
     }
 }
@@ -1274,5 +1277,13 @@ impl ModelControl for AcpBackend {
 
     async fn set_effort(&self, session: &SessionRef, effort: &str) -> BackendResult<()> {
         self.choose(session, Setting::Effort, effort).await
+    }
+
+    async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.choices(session, Setting::Mode)
+    }
+
+    async fn set_mode(&self, session: &SessionRef, mode: &str) -> BackendResult<()> {
+        self.choose(session, Setting::Mode, mode).await
     }
 }
