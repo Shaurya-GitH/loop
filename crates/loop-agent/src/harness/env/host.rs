@@ -187,9 +187,14 @@ impl Shell for HostExecutionEnv {
             c
         };
         cmd.current_dir(&cwd)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own process group, so a timeout or cancel can stop everything
+        // the command started, not just the shell.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         if !options.inherit_env {
             cmd.env_clear();
@@ -203,6 +208,8 @@ impl Shell for HostExecutionEnv {
         let mut child = cmd
             .spawn()
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
+        // Kills the tree if this future is dropped before the command ends.
+        let mut tree = TreeKiller(child.id());
 
         let stdout = child
             .stdout
@@ -246,6 +253,7 @@ impl Shell for HostExecutionEnv {
             (Some(cancel), Some(ms)) => {
                 tokio::select! {
                     _ = cancel.cancelled() => {
+                        tree.kill();
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         let _ = tokio::join!(stdout_task, stderr_task);
@@ -255,6 +263,7 @@ impl Shell for HostExecutionEnv {
                         ));
                     }
                     _ = tokio::time::sleep(Duration::from_millis(ms)) => {
+                        tree.kill();
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         let _ = tokio::join!(stdout_task, stderr_task);
@@ -271,6 +280,7 @@ impl Shell for HostExecutionEnv {
             (Some(cancel), None) => {
                 tokio::select! {
                     _ = cancel.cancelled() => {
+                        tree.kill();
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         let _ = tokio::join!(stdout_task, stderr_task);
@@ -290,6 +300,7 @@ impl Shell for HostExecutionEnv {
                         res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
                     }
                     Err(_) => {
+                        tree.kill();
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         let _ = tokio::join!(stdout_task, stderr_task);
@@ -306,6 +317,8 @@ impl Shell for HostExecutionEnv {
                 .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?,
         };
 
+        // A command that ended normally keeps what it left running.
+        tree.0 = None;
         let _ = tokio::join!(stdout_task, stderr_task);
 
         let stdout_text = stdout_acc.lock().await.clone();
@@ -321,6 +334,35 @@ impl Shell for HostExecutionEnv {
             stderr: stderr_text,
             exit_code: status.code().unwrap_or(-1),
         })
+    }
+}
+
+/// Kills a process and everything in its process group (Unix) or tree
+/// (Windows), unless disarmed. Without it, a grandchild such as the `sleep`
+/// in `sh -c "sleep 60; echo"` keeps the output pipes open after a timeout.
+struct TreeKiller(Option<u32>);
+
+impl TreeKiller {
+    fn kill(&mut self) {
+        let Some(pid) = self.0.take() else { return };
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+impl Drop for TreeKiller {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -363,5 +405,68 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
             }
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    async fn run(
+        command: &str,
+        timeout_ms: Option<u64>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ShellOutput, ExecutionError> {
+        HostExecutionEnv::new(std::env::temp_dir())
+            .exec(
+                command,
+                ShellExecOptions {
+                    timeout_ms,
+                    cancel,
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_timeout_stops_what_the_command_started() {
+        let started = Instant::now();
+        let err = run("sleep 5; echo done", Some(200), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ExecutionErrorCode::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_what_the_command_started() {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let err = run("sleep 5; echo done", Some(60_000), Some(cancel))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ExecutionErrorCode::Aborted);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn commands_do_not_read_loops_stdin() {
+        let out = run("cat; echo end", Some(5_000), None).await.unwrap();
+        assert_eq!(out.stdout.trim(), "end");
     }
 }
