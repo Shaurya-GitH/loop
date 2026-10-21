@@ -101,11 +101,13 @@ fn is_file_write(tool: &str) -> bool {
     matches!(tool, "write" | "edit")
 }
 
-/// Whether a call can change files or run commands.
+/// Whether a call can change files or run commands. An MCP tool counts
+/// unless its server marks it read-only (the gate then passes
+/// [`ToolKind::Read`]).
 fn changes_things(tool: &str, kind: ToolKind) -> bool {
     is_file_write(tool)
         || tool == "bash"
-        || tool.starts_with("mcp__")
+        || (tool.starts_with("mcp__") && kind != ToolKind::Read)
         || matches!(
             kind,
             ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Execute
@@ -239,7 +241,7 @@ mod tests {
             (ReadOnly, "bash", &cmd, "deny"),
             (ReadOnly, "mcp__github__create_issue", &cmd, "deny"),
             (Ask, "read", &inside, "allow"),
-            (Ask, "web_fetch", &url, "ask"),
+            (Ask, "web_fetch", &url, "allow"),
             (Ask, "write", &inside, "ask"),
             (Ask, "bash", &cmd, "ask"),
             (Ask, "mcp__github__create_issue", &cmd, "allow"),
@@ -306,6 +308,23 @@ mod tests {
         std::os::unix::fs::symlink(&outside, ws.join("link")).unwrap();
         assert!(!inside_workspace("link/file.txt", &ws));
         assert!(inside_workspace("file.txt", &ws));
+    }
+
+    #[test]
+    fn read_only_allows_mcp_tools_marked_read_only() {
+        let ws = std::env::temp_dir();
+        let mcp = |kind| {
+            decide(
+                ReadOnly,
+                ToolPermission::Allow,
+                "mcp__github__list_issues",
+                kind,
+                &json!({}),
+                &ws,
+            )
+        };
+        assert_eq!(mcp(ToolKind::Read), Decision::Allow);
+        assert!(matches!(mcp(ToolKind::Other), Decision::Deny(_)));
     }
 
     #[test]

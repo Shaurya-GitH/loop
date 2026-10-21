@@ -824,12 +824,16 @@ pub struct ConnectedProvider {
 /// The mode to start in, from `--permission-mode` (`flag`) or the
 /// `permissionMode` setting, and a notice when a setting was ignored.
 ///
+/// With neither, the old `fileEditReview: never` (no prompts) starts in
+/// `accept-edits`, the nearest mode that still asks before bash.
+///
 /// Without a terminal (`--print`, `mcp serve`) nobody sees a warning, so
 /// `full-access` must be asked for with the flag; from settings alone it
 /// falls back to `ask`.
 pub fn startup_permission_mode(
     flag: Option<&str>,
     setting: Option<&str>,
+    file_edit_review: &str,
     interactive: bool,
 ) -> anyhow::Result<(crate::permissions::PermissionMode, Option<String>)> {
     use crate::permissions::PermissionMode;
@@ -842,6 +846,18 @@ pub fn startup_permission_mode(
         return Ok((mode, None));
     }
     let Some(value) = setting else {
+        if crate::tool_approval::ApprovalPolicy::parse(file_edit_review)
+            == crate::tool_approval::ApprovalPolicy::Never
+        {
+            return Ok((
+                PermissionMode::AcceptEdits,
+                Some(
+                    "fileEditReview: never now means permissionMode accept-edits; \
+                     set permissionMode to choose"
+                        .into(),
+                ),
+            ));
+        }
         return Ok((PermissionMode::default(), None));
     };
     match PermissionMode::parse(value) {
@@ -1324,6 +1340,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let (mode, mode_notice) = startup_permission_mode(
         opts.permission_mode.as_deref(),
         settings.permission_mode.as_deref(),
+        &settings.file_edit_review,
         opts.interactive,
     )?;
     tool_gate.set_mode(mode);
@@ -1344,6 +1361,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
         agent_dir.join("mcp-auth"),
     ));
+    tool_gate.set_mcp(Arc::clone(&mcp_client));
     let entries = enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
     if !entries.is_empty() {
         let results = mcp_client.connect_all(&entries).await;
@@ -1492,31 +1510,59 @@ mod permission_mode_tests {
 
     #[test]
     fn the_flag_wins_and_headless_full_access_needs_it() {
-        assert_eq!(startup_permission_mode(None, None, true).unwrap().0, Ask);
         assert_eq!(
-            startup_permission_mode(Some("read-only"), Some("full-access"), false)
+            startup_permission_mode(None, None, "newSession", true)
+                .unwrap()
+                .0,
+            Ask
+        );
+        assert_eq!(
+            startup_permission_mode(Some("read-only"), Some("full-access"), "newSession", false)
                 .unwrap()
                 .0,
             ReadOnly
         );
-        let (mode, notice) = startup_permission_mode(None, Some("full-access"), false).unwrap();
+        let (mode, notice) =
+            startup_permission_mode(None, Some("full-access"), "newSession", false).unwrap();
         assert_eq!(mode, Ask);
         assert!(notice.unwrap().contains("--permission-mode full-access"));
         assert_eq!(
-            startup_permission_mode(Some("full-access"), None, false)
+            startup_permission_mode(Some("full-access"), None, "newSession", false)
                 .unwrap()
                 .0,
             FullAccess
         );
         assert_eq!(
-            startup_permission_mode(None, Some("full-access"), true)
+            startup_permission_mode(None, Some("full-access"), "newSession", true)
                 .unwrap()
                 .0,
             FullAccess
         );
-        let (mode, notice) = startup_permission_mode(None, Some("yolo"), true).unwrap();
+        let (mode, notice) =
+            startup_permission_mode(None, Some("yolo"), "newSession", true).unwrap();
         assert_eq!(mode, Ask);
         assert!(notice.unwrap().contains("unknown permissionMode"));
-        assert!(startup_permission_mode(Some("yolo"), None, true).is_err());
+        assert!(startup_permission_mode(Some("yolo"), None, "newSession", true).is_err());
+    }
+
+    #[test]
+    fn file_edit_review_never_starts_in_accept_edits() {
+        let (mode, notice) = startup_permission_mode(None, None, "never", true).unwrap();
+        assert_eq!(mode, AcceptEdits);
+        assert!(notice.unwrap().contains("accept-edits"));
+        let (mode, notice) = startup_permission_mode(None, Some("ask"), "never", true).unwrap();
+        assert_eq!((mode, notice), (Ask, None));
+        assert_eq!(
+            startup_permission_mode(Some("read-only"), None, "never", false)
+                .unwrap()
+                .0,
+            ReadOnly
+        );
+        assert_eq!(
+            startup_permission_mode(None, None, "always", true)
+                .unwrap()
+                .0,
+            Ask
+        );
     }
 }

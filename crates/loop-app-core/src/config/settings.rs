@@ -599,14 +599,14 @@ mod tests {
         );
         assert_eq!(
             loaded.tool_permissions.get("web_fetch").map(String::as_str),
-            Some("ask")
+            Some("allow")
         );
         assert_eq!(
             loaded
                 .tool_permissions
                 .get("web_search")
                 .map(String::as_str),
-            Some("ask")
+            Some("allow")
         );
     }
 

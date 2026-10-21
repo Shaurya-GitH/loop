@@ -25,6 +25,8 @@ use loop_agent::{AfterToolCallFn, BeforeToolCallFn, BeforeToolCallResult, ToolCa
 use loop_ai::{TextContent, ToolResultContent};
 use parking_lot::Mutex;
 
+use loop_protocol::ToolKind;
+
 use crate::permissions::{Decision, PermissionMode};
 use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
 
@@ -44,6 +46,8 @@ pub struct ToolGate {
     /// after-call review is skipped. Keyed by more than the id, which a
     /// server may leave empty or reuse across parallel workflow tasks.
     allowed: Mutex<HashMap<String, usize>>,
+    /// MCP servers, for the tools they mark read-only.
+    mcp: Mutex<Option<Arc<loop_mcp::McpClientManager>>>,
 }
 
 impl ToolGate {
@@ -78,6 +82,25 @@ impl ToolGate {
         self.allowed.lock().clear();
     }
 
+    /// Look up MCP tools' `readOnlyHint` in `mcp`'s servers.
+    pub fn set_mcp(&self, mcp: Arc<loop_mcp::McpClientManager>) {
+        *self.mcp.lock() = Some(mcp);
+    }
+
+    /// The tool's kind; an MCP tool its server marks read-only is a read.
+    async fn kind(&self, tool: &str) -> ToolKind {
+        let mcp = self.mcp.lock().clone();
+        match (
+            mcp,
+            loop_agent::harness::mcp::bridge::parse_mcp_tool_name(tool),
+        ) {
+            (Some(mcp), Some((server, name))) if mcp.read_only_hint(server, name).await => {
+                ToolKind::Read
+            }
+            _ => loop_agent::protocol_events::tool_kind(tool),
+        }
+    }
+
     /// The directory `accept-edits` may edit (default: the git root of the
     /// harness's cwd).
     pub fn set_workspace(&self, workspace: PathBuf) {
@@ -102,12 +125,12 @@ impl ToolGate {
     }
 
     /// What the mode says about a call, before hooks and the approver.
-    pub fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
+    pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
         crate::permissions::decide(
             self.mode(),
             self.permission_for(tool),
             tool,
-            loop_agent::protocol_events::tool_kind(tool),
+            self.kind(tool).await,
             args,
             &self.workspace(),
         )
@@ -148,7 +171,7 @@ impl ToolGate {
         ToolCallInfo {
             source: ToolSource::of_native_tool(&tool_call.name),
             tool: tool_call.name.clone(),
-            kind: loop_agent::protocol_events::tool_kind(&tool_call.name),
+            kind: self.kind(&tool_call.name).await,
             args: args.clone(),
             call_id: tool_call.id.clone(),
             session_id,
@@ -218,7 +241,7 @@ impl ToolGate {
                         reason: Some(reason),
                     })
                 };
-                let decision = gate.decide(&ctx.tool_call.name, &ctx.args);
+                let decision = gate.decide(&ctx.tool_call.name, &ctx.args).await;
                 if let Decision::Deny(reason) = decision {
                     return block(reason);
                 }
@@ -425,8 +448,7 @@ mod tests {
         let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
             loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
         );
-        let (bridge, prompts) =
-            ToolApprovalBridge::new(env, None, true, permissions, Default::default());
+        let (bridge, prompts) = ToolApprovalBridge::new(env, None, permissions, Default::default());
         gate.set_approver(Some(Arc::new(bridge)));
         (gate, prompts)
     }

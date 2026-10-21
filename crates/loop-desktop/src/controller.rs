@@ -168,13 +168,9 @@ impl DesktopController {
         }));
 
         let tool_env = runtime.harness.tool_env().await?;
-        let policy_active =
-            loop_app_core::tool_approval::ApprovalPolicy::parse(&runtime.settings.file_edit_review)
-                .asks_for_session(!runtime.resumed);
         let (bridge, approval_rx) = ToolApprovalBridge::new(
             tool_env,
             runtime.settings.diff_editor.clone(),
-            policy_active,
             permissions_from_settings(&runtime.settings.tool_permissions),
             Default::default(),
         );
