@@ -148,6 +148,9 @@ pub async fn run_print(
     prompt: String,
     trace: &TraceArgs,
 ) -> anyhow::Result<()> {
+    for notice in std::mem::take(&mut runtime.hook_notices) {
+        eprintln!("loop: {notice}");
+    }
     // No one can approve anything here: external agents get the default
     // host, which rejects every request, so they decline the action.
     match runtime.pending_agent.take() {

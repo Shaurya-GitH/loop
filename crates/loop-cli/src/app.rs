@@ -415,6 +415,9 @@ async fn run_loop(
             Vec::new()
         }
     };
+    for notice in std::mem::take(&mut runtime.hook_notices) {
+        chat.push(sys(notice));
+    }
     // An agent that needs a sign-in opens /login instead of failing.
     let mut sign_in_first: Option<String> = None;
     if let Some(pending) = runtime.pending_agent.take() {

@@ -92,6 +92,8 @@ pub struct Runtime {
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
     /// The check every tool call passes; surfaces attach their approver to it.
     pub tool_gate: std::sync::Arc<crate::tool_gate::ToolGate>,
+    /// Problems found while loading hooks, shown once at startup.
+    pub hook_notices: Vec<String>,
     /// MCP client manager for external tool servers.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
@@ -1262,7 +1264,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
     );
     tool_gate.install(&harness);
-    crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
+    let hook_notices = crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
         tracing::info!("extension: {n}");
@@ -1330,6 +1332,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         model_note,
         tool_approval: None,
         tool_gate,
+        hook_notices,
         mcp_client,
         active_skills: Vec::new(),
         web_disabled_for_run: opts.no_web,
