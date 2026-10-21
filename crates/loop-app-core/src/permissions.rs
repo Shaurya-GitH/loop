@@ -31,7 +31,7 @@ use crate::tool_approval::ToolPermission;
 pub enum PermissionMode {
     /// Reading, searching and the web only.
     ReadOnly,
-    /// Ask before edits, commands and web requests (`toolPermissions`).
+    /// Ask before edits and commands (`toolPermissions`).
     #[default]
     Ask,
     /// Edit files in the workspace without asking; ask for commands.
@@ -98,7 +98,7 @@ impl PermissionMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::ReadOnly => "read, search and the web only; no edits or commands",
-            Self::Ask => "ask before edits, commands and web requests",
+            Self::Ask => "ask before edits and commands",
             Self::AcceptEdits => "edit files in this workspace without asking; ask for commands",
             Self::FullAccess => "run every tool call without asking",
         }
