@@ -577,7 +577,7 @@ mod tests {
             {"on": "tool_call", "action": {"allow": true}}
         )]);
         gate.set_hooks(registry);
-        let result = gate.before_hook()(call("bash"), None).await.unwrap();
+        let result = gate.before_hook()(call("write"), None).await.unwrap();
         assert!(result.reason.unwrap().contains("read-only"));
     }
 

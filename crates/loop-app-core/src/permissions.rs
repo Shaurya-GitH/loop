@@ -206,6 +206,132 @@ pub fn split_command(command: &str) -> Option<Vec<String>> {
     (!parts.is_empty()).then_some(parts)
 }
 
+/// Commands `read-only` runs: they print what they read and change nothing
+/// (with the options [`read_only_part`] refuses).
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "ls", "pwd", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "file", "stat", "du",
+    "which", "echo", "sort", "uniq", "diff",
+];
+
+/// `git` subcommands `read-only` runs.
+const READ_ONLY_GIT: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "blame",
+    "ls-files",
+    "rev-parse",
+];
+
+/// Whether every part of `command` only reads: a command from
+/// [`READ_ONLY_COMMANDS`] or a read-only `git` subcommand, with no output
+/// redirect, command substitution or variable assignment.
+pub fn read_only_command(command: &str) -> bool {
+    split_command(command).is_some_and(|parts| {
+        parts
+            .iter()
+            .all(|part| words(part).is_some_and(|w| read_only_part(&w)))
+    })
+}
+
+/// The words of one command part, with quotes removed. `None` when it
+/// redirects output (an unquoted `>`).
+fn words(part: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let (mut single, mut double, mut started) = (false, false, false);
+    let mut chars = part.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                started = true;
+            }
+            '"' if !single => {
+                double = !double;
+                started = true;
+            }
+            '\\' if !single => current.extend(chars.next()),
+            '>' if !single && !double => return None,
+            c if c.is_whitespace() && !single && !double => {
+                if started || !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                started = false;
+            }
+            c => current.push(c),
+        }
+    }
+    if started || !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn read_only_part(words: &[String]) -> bool {
+    let Some((program, args)) = words.split_first() else {
+        return false;
+    };
+    let has = |options: &[&str]| {
+        args.iter().any(|a| {
+            options
+                .iter()
+                .any(|o| a == o || (o.starts_with("--") && a.starts_with(&format!("{o}="))))
+        })
+    };
+    let positional = || args.iter().filter(|a| !a.starts_with('-')).count();
+    match program.as_str() {
+        "git" => {
+            let Some((sub, rest)) = args.split_first() else {
+                return false;
+            };
+            if !READ_ONLY_GIT.contains(&sub.as_str()) || has(&["--output"]) {
+                return false;
+            }
+            // `git branch NAME` creates a branch; only listing is a read.
+            sub != "branch"
+                || rest.iter().all(|a| {
+                    a.starts_with('-')
+                        && !matches!(
+                            a.as_str(),
+                            "-d" | "-D"
+                                | "-m"
+                                | "-M"
+                                | "-c"
+                                | "-C"
+                                | "-f"
+                                | "-u"
+                                | "--delete"
+                                | "--move"
+                                | "--copy"
+                                | "--force"
+                                | "--edit-description"
+                                | "--unset-upstream"
+                        )
+                        && !a.starts_with("--set-upstream-to")
+                })
+        }
+        "find" => !has(&[
+            "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+            "-fls",
+        ]),
+        // `-o FILE` writes FILE, also inside a cluster such as `-uo`.
+        "sort" => !args.iter().any(|a| {
+            a.starts_with("--output")
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('o'))
+        }),
+        // `file -C` compiles a magic file.
+        "file" => !has(&["-C", "--compile"]),
+        "rg" => !has(&["--pre"]),
+        "tree" => !has(&["-o"]),
+        // `uniq IN OUT` writes OUT.
+        "uniq" => positional() <= 1,
+        program => READ_ONLY_COMMANDS.contains(&program),
+    }
+}
+
 /// Whether a path pattern matches `path` as written, with `~` expanded, or
 /// as an absolute path under `workspace`.
 fn path_matches(pattern: &str, path: &str, workspace: &Path) -> bool {
@@ -312,6 +438,21 @@ pub fn decide(
         _ => Decision::Ask,
     };
     match mode {
+        PermissionMode::ReadOnly
+            if tool == "bash"
+                && args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(read_only_command) =>
+        {
+            Decision::Allow
+        }
+        PermissionMode::ReadOnly if tool == "bash" => Decision::Deny(
+            "read-only mode runs only commands that read (ls, cat, grep, rg, find, git \
+             status/log/diff/show, …), without output redirects; the user can switch with \
+             /permissions"
+                .into(),
+        ),
         PermissionMode::ReadOnly if changes_things(tool, kind) => Decision::Deny(format!(
             "`{tool}` is not allowed in read-only mode; the user can switch with /permissions"
         )),
@@ -404,6 +545,70 @@ mod tests {
             &args,
             ws,
         )
+    }
+
+    #[test]
+    fn read_only_runs_only_read_only_commands() {
+        let allowed = [
+            "ls -la",
+            "ls | grep x",
+            "cat a.txt",
+            "grep -rn 'a > b' src",
+            "rg --files | wc -l",
+            "find . -name '*.rs'",
+            "git status && git log --oneline -5",
+            "git diff HEAD~1 -- src",
+            "git branch -a",
+            "head -20 README.md; tail -n 5 log.txt",
+            "sort -u names.txt",
+            "uniq names.txt",
+        ];
+        for command in allowed {
+            assert!(read_only_command(command), "{command}");
+        }
+        let refused = [
+            "cat a > b",
+            "echo hi >> notes",
+            "find . -delete",
+            "find . -name x -exec rm {} ;",
+            "git log && rm x",
+            "git push",
+            "git branch new-branch",
+            "git branch -D old",
+            "git -c core.pager=evil log",
+            "git log --output=out.txt",
+            "sort -o out.txt in.txt",
+            "sort -uo out.txt in.txt",
+            "file -C -m magic",
+            "rg --pre ./script x",
+            "tree -o out.txt",
+            "uniq in.txt out.txt",
+            "ls $(pwd)",
+            "cat `which ls`",
+            "FOO=1 ls",
+            "/bin/ls",
+            "cargo test",
+            "tee out.txt",
+            "",
+        ];
+        for command in refused {
+            assert!(!read_only_command(command), "{command}");
+        }
+        let ws = std::env::temp_dir();
+        let bash = |command: &str| decide_in(ReadOnly, "bash", json!({ "command": command }), &ws);
+        assert_eq!(bash("git log"), Decision::Allow);
+        assert!(matches!(bash("rm -rf x"), Decision::Deny(_)));
+        assert!(matches!(
+            decide(
+                ReadOnly,
+                Rule::plain(ToolPermission::Deny),
+                "bash",
+                ToolKind::Execute,
+                &json!({"command": "ls"}),
+                &ws
+            ),
+            Decision::Deny(_)
+        ));
     }
 
     #[test]
