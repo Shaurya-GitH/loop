@@ -115,7 +115,22 @@ impl ToolGate {
                 }
                 if let Some(hooks) = gate.hooks() {
                     let info = gate.call_info(&ctx.tool_call, &ctx.args).await;
-                    match hooks.emit(HarnessHookEvent::ToolCall(info)).await.decision {
+                    let emit = hooks.emit(HarnessHookEvent::ToolCall(info));
+                    // Cancelling the turn drops the emit, which kills any
+                    // command hook still running.
+                    let outcome = match &cancel {
+                        Some(cancel) => tokio::select! {
+                            outcome = emit => outcome,
+                            () = cancel.cancelled() => {
+                                return Some(BeforeToolCallResult {
+                                    block: true,
+                                    reason: Some("Operation aborted".into()),
+                                });
+                            }
+                        },
+                        None => emit.await,
+                    };
+                    match outcome.decision {
                         Some(ToolDecision::Block { reason }) => {
                             return Some(BeforeToolCallResult {
                                 block: true,
