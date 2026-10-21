@@ -1264,6 +1264,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
     );
     tool_gate.install(&harness);
+    agents.set_gate(Arc::clone(&tool_gate));
     let hook_notices = crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
