@@ -1408,6 +1408,9 @@ async fn drain_ui_events(
                         let resumed = runtime.session_id == session.native_id;
                         runtime.adopt_agent(&id, backend, session, model.clone());
                         runtime.sync_agent_effort().await;
+                        // Without this the agent keeps its own default mode
+                        // (Codex: auto review, which edits without asking).
+                        runtime.sync_agent_mode().await;
                         if let Some(model) = &model {
                             if let Err(err) = runtime.remember_model(&id, model) {
                                 tracing::warn!("save model selection: {err:#}");

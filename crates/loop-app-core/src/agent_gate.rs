@@ -52,14 +52,17 @@ impl GatedHost {
     }
 
     fn info(&self, call: &ToolCallUpdate) -> ToolCallInfo {
-        agent_call_info(
+        let mut info = agent_call_info(
             &self.agent,
             &self.cwd,
             call.id.0.clone(),
             call.name.as_deref().or(call.title.as_deref()),
             call.kind,
             call.raw_input.clone(),
-        )
+        );
+        // So `match.mode` and `LOOP_PERMISSION_MODE` work for agent calls.
+        info.mode = Some(self.gate.mode().as_str().to_owned());
+        info
     }
 }
 
@@ -269,7 +272,12 @@ pub fn observe_agent_tools(
                     if envelope.origin != loop_protocol::Origin::Live {
                         continue;
                     }
-                    if let Some(event) = observer.on_update(&envelope.session.0, &envelope.update) {
+                    if let Some(mut event) =
+                        observer.on_update(&envelope.session.0, &envelope.update)
+                    {
+                        if let HarnessHookEvent::ToolResult { call, .. } = &mut event {
+                            call.mode = Some(gate.mode().as_str().to_owned());
+                        }
                         gate.observe(event).await;
                     }
                 }
@@ -359,6 +367,19 @@ mod tests {
         );
         let (_, asked) = ask(gate, exec_request("ls")).await;
         assert!(asked, "unmatched requests still reach the user");
+    }
+
+    #[tokio::test]
+    async fn agent_calls_carry_the_permission_mode() {
+        let (_dir, gate) = gate_with(json!({
+            "on": "tool_call", "match": {"source": "agent", "mode": "accept-edits"},
+            "action": {"block": true}
+        }));
+        let (_, asked) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(asked, "the hook is for accept-edits only");
+        gate.set_mode(PermissionMode::AcceptEdits);
+        let (_, asked) = ask(gate, exec_request("ls")).await;
+        assert!(!asked, "a mode-matched hook blocks the agent's call");
     }
 
     #[tokio::test]
