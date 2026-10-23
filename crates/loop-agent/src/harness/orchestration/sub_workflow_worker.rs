@@ -12,7 +12,7 @@ use loop_orchestration::workflow::event_log::{EventLog, MemoryEventLog};
 use loop_orchestration::workflow::signals::SignalRouter;
 use loop_orchestration::workflow::types::TaskResult;
 
-use super::agent_worker::{AgentWorker, ShellWorker};
+use super::agent_worker::{AgentWorker, ShellWorker, WorkflowToolHooks};
 use crate::harness::types::ExecutionEnv;
 use crate::stream_fn::StreamFn;
 use crate::types::AgentTool;
@@ -24,6 +24,7 @@ pub struct SubWorkflowWorker {
     base_tools: Vec<AgentTool>,
     default_model: Model,
     system_prompt: String,
+    hooks: WorkflowToolHooks,
 }
 
 impl SubWorkflowWorker {
@@ -41,7 +42,14 @@ impl SubWorkflowWorker {
             base_tools,
             default_model,
             system_prompt,
+            hooks: WorkflowToolHooks::default(),
         }
+    }
+
+    /// Run `hooks` around every tool call in the nested workflow.
+    pub fn with_tool_hooks(mut self, hooks: WorkflowToolHooks) -> Self {
+        self.hooks = hooks;
+        self
     }
 }
 
@@ -68,15 +76,20 @@ impl Worker for SubWorkflowWorker {
             WorkflowEngine::new(event_log as Arc<dyn EventLog>).with_signal_router(signal_router),
         );
 
-        let agent_worker = Arc::new(AgentWorker::new(
-            Arc::clone(&self.stream_fn),
-            Arc::clone(&self.host_env),
-            self.base_tools.clone(),
-            self.default_model.clone(),
-            self.system_prompt.clone(),
-            loop_ai::SimpleStreamOptions::default(),
-        ));
-        let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&self.host_env)));
+        let agent_worker = Arc::new(
+            AgentWorker::new(
+                Arc::clone(&self.stream_fn),
+                Arc::clone(&self.host_env),
+                self.base_tools.clone(),
+                self.default_model.clone(),
+                self.system_prompt.clone(),
+                loop_ai::SimpleStreamOptions::default(),
+            )
+            .with_tool_hooks(self.hooks.clone()),
+        );
+        let shell_worker = Arc::new(
+            ShellWorker::new(Arc::clone(&self.host_env)).with_tool_hooks(self.hooks.clone()),
+        );
 
         let mut pool = WorkerPool::new(4);
         pool.register(agent_worker);

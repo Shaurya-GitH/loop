@@ -43,6 +43,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[provider/model]"),
         },
         SlashCommand {
+            name: "permissions",
+            description: "Show or set what tools may do without asking",
+            args_hint: Some("[read-only|ask|accept-edits|full-access]"),
+        },
+        SlashCommand {
             name: "websearch",
             description: "Loop's web search and fetch: status, on/off, or provider",
             args_hint: Some("[on|off|soket|tavily|tinyfish|brave]"),
@@ -129,8 +134,8 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "review",
-            description: "Tool approval policy (files + bash)",
-            args_hint: Some("[newSession|always|never]"),
+            description: "Show session approvals and tool permissions",
+            args_hint: None,
         },
         SlashCommand {
             name: "ttfb",
@@ -327,6 +332,8 @@ pub enum CommandEffect {
     SelectModel(Option<String>),
     /// Web tools status (None), `on`/`off`, or a search provider.
     WebSearch(Option<String>),
+    /// `/permissions [mode]`: show or switch the permission mode.
+    Permissions(Option<String>),
     /// Show the reasoning effort levels (None) or set one.
     Effort(Option<String>),
     /// Sandbox mode change.
@@ -539,6 +546,11 @@ pub fn dispatch(
             None
         } else {
             Some(cmd.args.clone())
+        }),
+        "permissions" => CommandEffect::Permissions(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.trim().to_owned())
         }),
         "websearch" => CommandEffect::WebSearch(if cmd.args.is_empty() {
             None

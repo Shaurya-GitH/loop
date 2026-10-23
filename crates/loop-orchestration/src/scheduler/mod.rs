@@ -321,7 +321,8 @@ impl Scheduler {
                     return;
                 }
                 Err(e) => {
-                    if attempt < max_retries && !cancel.is_cancelled() {
+                    let retryable = !matches!(e, WorkerError::Blocked(_));
+                    if retryable && attempt < max_retries && !cancel.is_cancelled() {
                         attempt += 1;
                         tracing::warn!(
                             task_id = %task_id,

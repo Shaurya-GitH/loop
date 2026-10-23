@@ -46,7 +46,7 @@ use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
     auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
-    ApprovalPolicy, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
+    ToolApprovalBridge, GROUP_BASH, GROUP_FILE, GROUP_WEB,
 };
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
@@ -60,6 +60,7 @@ use crate::tui::{
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
 use crate::{build_tools, CliRuntime, PendingAgent};
+use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
     UpdateAvailable(String),
@@ -372,8 +373,6 @@ async fn run_loop(
     }
     ensure_forwarding(runtime, runtime.backend.as_ref(), &tx);
 
-    let review_policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
-    let policy_active = review_policy.asks_for_session(!runtime.resumed);
     let tool_env = runtime.harness.tool_env().await?;
     let session_grants = match runtime.harness.read_session_entries().await {
         Ok(entries) => auto_approve_from_entries(&entries),
@@ -389,7 +388,6 @@ async fn run_loop(
     let bridge = Arc::new(ToolApprovalBridge::with_host(
         tool_env,
         runtime.settings.diff_editor.clone(),
-        policy_active,
         permissions_from_settings(&runtime.settings.tool_permissions),
         session_grants,
         Arc::new(host),
@@ -405,12 +403,7 @@ async fn run_loop(
             })
         }));
     }
-    runtime
-        .harness
-        .set_before_tool_call(Some(bridge.before_tool_hook()));
-    runtime
-        .harness
-        .set_after_tool_call(Some(bridge.after_tool_hook()));
+    runtime.tool_gate.set_approver(Some(Arc::clone(&bridge)));
     runtime.tool_approval = Some(Arc::clone(&bridge));
 
     let mut chat: Vec<ChatItem> = match runtime.backend.transcript(&runtime.session_ref()).await {
@@ -420,6 +413,9 @@ async fn run_loop(
             Vec::new()
         }
     };
+    for notice in std::mem::take(&mut runtime.startup_notices) {
+        chat.push(sys(notice));
+    }
     // An agent that needs a sign-in opens /login instead of failing.
     let mut sign_in_first: Option<String> = None;
     if let Some(pending) = runtime.pending_agent.take() {
@@ -452,12 +448,7 @@ async fn run_loop(
             format!("resumed · {} messages · /help for commands", chat.len())
         }
     } else {
-        let review_hint = if policy_active {
-            " · tool approval on (files + bash)"
-        } else {
-            ""
-        };
-        format!("ready · /help for commands{review_hint}")
+        "ready · /help for commands".into()
     };
     let mut clear_presses = 0u8;
     let mut last_clear = Instant::now();
@@ -552,6 +543,7 @@ async fn run_loop(
             Some(spec) => format!("{spec} · {}", runtime.native_effort()),
             None => NO_MODEL_LABEL.to_string(),
         };
+        let model_line = format!("{} · {model_line}", runtime.permission_mode().label());
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
@@ -821,6 +813,8 @@ async fn run_loop(
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
+                    warning: (runtime.permission_mode() == PermissionMode::FullAccess)
+                        .then_some(FULL_ACCESS_BANNER),
                 },
             );
         })?;
@@ -1414,6 +1408,9 @@ async fn drain_ui_events(
                         let resumed = runtime.session_id == session.native_id;
                         runtime.adopt_agent(&id, backend, session, model.clone());
                         runtime.sync_agent_effort().await;
+                        // Without this the agent keeps its own default mode
+                        // (Codex: auto review, which edits without asking).
+                        runtime.sync_agent_mode().await;
                         if let Some(model) = &model {
                             if let Err(err) = runtime.remember_model(&id, model) {
                                 tracing::warn!("save model selection: {err:#}");
@@ -4332,6 +4329,48 @@ async fn apply_effect(
                 Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
+        CommandEffect::Permissions(None) => {
+            runtime.confirm_full_access = false;
+            let current = runtime.permission_mode();
+            let mut lines = vec![format!(
+                "permission mode: {} — /permissions <mode> to switch",
+                current.as_str()
+            )];
+            for mode in PermissionMode::ALL {
+                let mark = if mode == current { "●" } else { " " };
+                lines.push(format!(
+                    "  {mark} {:<13} {}",
+                    mode.as_str(),
+                    mode.description()
+                ));
+            }
+            chat.push(sys(lines.join("\n")));
+        }
+        CommandEffect::Permissions(Some(arg)) => match PermissionMode::parse(&arg) {
+            Some(PermissionMode::FullAccess)
+                if runtime.permission_mode() != PermissionMode::FullAccess
+                    && !std::mem::take(&mut runtime.confirm_full_access) =>
+            {
+                runtime.confirm_full_access = true;
+                chat.push(error_item(
+                    "Full access: every tool call runs without asking, including shell \
+                     commands and file deletion. Deny rules and hooks still apply. Run \
+                     /permissions full-access again to confirm.",
+                ));
+            }
+            Some(mode) => {
+                runtime.confirm_full_access = false;
+                runtime.set_permission_mode(mode).await;
+                chat.push(sys(format!(
+                    "permission mode → {} ({}) for this session",
+                    mode.as_str(),
+                    mode.description()
+                )));
+            }
+            None => chat.push(error_item(format!(
+                "unknown mode `{arg}`: use read-only, ask, accept-edits or full-access"
+            ))),
+        },
         CommandEffect::WebSearch(arg) => {
             let result = match arg.as_deref() {
                 None => Ok(runtime.web_status()),
@@ -4380,6 +4419,7 @@ async fn apply_effect(
                 ["off"] | ["disabled"] => {
                     let harness = Arc::clone(&runtime.harness);
                     let web = runtime.web_tools();
+                    let bash = runtime.bash_limits();
                     let tx = tx.clone();
                     *working = true;
                     *status = "disabling sandbox…".into();
@@ -4393,7 +4433,7 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(build_tools(env, &web))
+                                .set_tools(build_tools(env, &web, bash))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -4414,6 +4454,7 @@ async fn apply_effect(
                     let harness = Arc::clone(&runtime.harness);
                     let cwd = runtime.cwd.clone();
                     let web = runtime.web_tools();
+                    let bash = runtime.bash_limits();
                     let tx = tx.clone();
                     let iso_s = isolation.as_str().to_string();
                     let rt_s = oci_runtime.as_str().to_string();
@@ -4430,8 +4471,9 @@ async fn apply_effect(
                             ));
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
-                            if let Err(e) =
-                                harness.set_tools(build_tools(Arc::clone(&env), &web)).await
+                            if let Err(e) = harness
+                                .set_tools(build_tools(Arc::clone(&env), &web, bash))
+                                .await
                             {
                                 let _ = sb.destroy().await;
                                 return Err(format!("sandbox: {e}"));
@@ -4501,17 +4543,10 @@ async fn apply_effect(
                     runtime.resumed = false;
                     runtime.active_skills.clear();
                     chat.clear();
-                    let policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
-                    let enabled = policy.asks_for_session(true);
                     if let Some(bridge) = &runtime.tool_approval {
                         bridge.clear_session_grants();
-                        bridge.set_policy_active(enabled);
                     }
-                    *status = if enabled {
-                        "ready · new session · tool approval on (files + bash)".into()
-                    } else {
-                        "ready · new session".into()
-                    };
+                    *status = "ready · new session".into();
                     // Clear screen + scrollback and reprint welcome with the new id.
                     *redraw_request = true;
                     *purge_ui_events = true;
@@ -4525,11 +4560,6 @@ async fn apply_effect(
         }
         CommandEffect::SetFileReview(arg) => match arg {
             None => {
-                let active = runtime
-                    .tool_approval
-                    .as_ref()
-                    .map(|b| b.policy_active())
-                    .unwrap_or(false);
                 let grants = runtime
                     .tool_approval
                     .as_ref()
@@ -4541,6 +4571,9 @@ async fn apply_effect(
                         }
                         if g.contains(GROUP_BASH) {
                             parts.push("bash");
+                        }
+                        if g.contains(GROUP_WEB) {
+                            parts.push("web");
                         }
                         if parts.is_empty() {
                             "(none)".into()
@@ -4554,8 +4587,8 @@ async fn apply_effect(
                     perms.push_str(&format!("\n    {k}: {v}"));
                 }
                 chat.push(sys(format!(
-                        "tool approval policy: {} (session asking: {active})\n  session auto-approve: {grants}\n  /review newSession|always|never\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
-                        runtime.settings.file_edit_review,
+                        "permission mode: {} (change it with /permissions)\n  session auto-approve: {grants}\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
+                        runtime.permission_mode().as_str(),
                         runtime
                             .settings
                             .diff_editor
@@ -4563,22 +4596,11 @@ async fn apply_effect(
                             .unwrap_or("(auto: cursor|code)"),
                     )));
             }
-            Some(raw) => {
-                let policy = ApprovalPolicy::parse(&raw);
-                runtime.settings.file_edit_review = policy.as_str().into();
-                let enabled = policy.asks_for_session(!runtime.resumed);
-                if let Some(bridge) = &runtime.tool_approval {
-                    bridge.set_policy_active(enabled);
-                    bridge.set_permissions(permissions_from_settings(
-                        &runtime.settings.tool_permissions,
-                    ));
-                }
-                let _ = runtime.save_settings();
-                chat.push(sys(format!(
-                    "tool approval → {} (this session: {})",
-                    policy.as_str(),
-                    if enabled { "on" } else { "off" }
-                )));
+            Some(_) => {
+                chat.push(sys(
+                    "/review no longer turns prompts on or off; the permission mode decides. \
+                     Use /permissions read-only|ask|accept-edits|full-access.",
+                ));
             }
         },
         CommandEffect::SetResponseHeaderTimeout(arg) => match arg {
@@ -4697,13 +4719,13 @@ async fn apply_effect(
                 perms.push_str(&format!("\n    {k}: {v}"));
             }
             chat.push(sys(format!(
-                "settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
+                "settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
                 crate::config::paths::settings_path(&runtime.agent_dir).display(),
                 runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                 runtime.settings.theme,
                 runtime.settings.default_thinking_level,
                 runtime.settings.sandbox.display(),
-                runtime.settings.file_edit_review,
+                runtime.permission_mode().as_str(),
                 runtime
                     .settings
                     .diff_editor
@@ -5131,6 +5153,9 @@ async fn choose_model(
 }
 
 /// Status line after the reasoning effort changes.
+/// Footer banner while every tool call runs without asking.
+const FULL_ACCESS_BANNER: &str = "⚠ full access · tools run without approval";
+
 fn effort_status(runtime: &CliRuntime) -> String {
     match runtime.active_model_label() {
         Some(label) if !runtime.is_native() => format!("ready · {label}"),

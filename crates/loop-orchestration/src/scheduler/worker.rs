@@ -35,6 +35,9 @@ pub enum WorkerError {
     /// Task was cancelled.
     #[error("task cancelled")]
     Cancelled,
+    /// A permission check refused the task; retrying would ask again.
+    #[error("task blocked: {0}")]
+    Blocked(String),
     /// Task exceeded its timeout.
     #[error("task timed out")]
     TimedOut,

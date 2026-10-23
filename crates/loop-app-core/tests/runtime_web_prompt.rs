@@ -25,6 +25,7 @@ async fn websearch_toggle_refreshes_the_system_prompt() {
         interactive: false,
         session_id: None,
         no_web: false,
+        permission_mode: None,
         agent: None,
     })
     .await

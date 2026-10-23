@@ -256,6 +256,20 @@ impl McpClientManager {
         listed
     }
 
+    /// Whether `server` marks its tool `tool` read-only (`readOnlyHint`).
+    pub async fn read_only_hint(&self, server: &str, tool: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(server)
+            .is_some_and(|conn| {
+                conn.tools.iter().any(|t| {
+                    t.name == tool
+                        && t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
+                })
+            })
+    }
+
     /// Get a read lock on connections (for bridge tool generation).
     pub fn connections(&self) -> &Arc<RwLock<HashMap<String, McpConnection>>> {
         &self.connections

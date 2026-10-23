@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
+    create_bash_tool_with, create_edit_tool, create_read_tool, create_session_repository,
     create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
     AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
     LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
@@ -90,6 +90,10 @@ pub struct Runtime {
     pub model_note: Option<String>,
     /// Interactive tool approval bridge (set by the TUI).
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
+    /// The check every tool call passes; surfaces attach their approver to it.
+    pub tool_gate: std::sync::Arc<crate::tool_gate::ToolGate>,
+    /// Problems found at startup (hooks, permission mode), shown once.
+    pub startup_notices: Vec<String>,
     /// MCP client manager for external tool servers.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
@@ -231,6 +235,7 @@ impl Runtime {
         let (backend, session) = self.agents.new_session(id, model).await?;
         self.adopt_agent(id, backend, session, model.map(str::to_owned));
         self.sync_agent_effort().await;
+        self.sync_agent_mode().await;
         Ok(())
     }
 
@@ -268,6 +273,7 @@ impl Runtime {
             Ok((backend, session)) => {
                 self.adopt_agent(&record.agent, backend, session, None);
                 self.sync_agent_effort().await;
+                self.sync_agent_mode().await;
                 Ok(())
             }
             Err(e) => {
@@ -565,6 +571,46 @@ impl Runtime {
         )
     }
 
+    /// `bash` time limits from settings.
+    pub fn bash_limits(&self) -> loop_agent::harness::BashLimits {
+        self.settings.bash.unwrap_or_default().limits()
+    }
+
+    /// The active permission mode.
+    pub fn permission_mode(&self) -> crate::permissions::PermissionMode {
+        self.tool_gate.mode()
+    }
+
+    /// Switch the permission mode for the rest of this run, including the
+    /// active subscription agent's own mode.
+    pub async fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
+        self.tool_gate.set_mode(mode);
+        self.sync_agent_mode().await;
+    }
+
+    /// Set the active external agent's own mode from Loop's permission mode,
+    /// when the agent offers one. Returns the agent mode now in effect.
+    pub async fn sync_agent_mode(&mut self) -> Option<String> {
+        if self.is_native() {
+            return None;
+        }
+        let session = self.session_ref();
+        let control = self.backend.model_control()?;
+        let offered = control.modes(&session).await.ok()?;
+        let wanted = self
+            .permission_mode()
+            .agent_modes()
+            .iter()
+            .find(|m| offered.models.iter().any(|o| o.id == **m))?;
+        if offered.current.as_deref() != Some(*wanted) {
+            if let Err(e) = control.set_mode(&session, wanted).await {
+                tracing::warn!("could not set the agent's mode to {wanted}: {e}");
+                return offered.current;
+            }
+        }
+        Some((*wanted).to_owned())
+    }
+
     /// Status of Loop's web tools, distinct from external agents' own tools.
     pub fn web_status(&self) -> String {
         let mut status = format!("Loop's {}", self.web_tools().status());
@@ -625,7 +671,7 @@ impl Runtime {
             .tool_env()
             .await
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
-        let tools = build_tools(env, &self.web_tools());
+        let tools = build_tools(env, &self.web_tools(), self.bash_limits());
         self.harness
             .set_tools(tools)
             .await
@@ -807,6 +853,64 @@ pub struct ConnectedProvider {
     pub model_count: usize,
 }
 
+/// The mode to start in, from `--permission-mode` (`flag`) or the
+/// `permissionMode` setting, and a notice when a setting was ignored.
+///
+/// With neither, the old `fileEditReview: never` (no prompts) starts in
+/// `accept-edits`, the nearest mode that still asks before bash.
+///
+/// Without a terminal (`--print`, `mcp serve`) nobody sees a warning, so
+/// `full-access` must be asked for with the flag; from settings alone it
+/// falls back to `ask`.
+pub fn startup_permission_mode(
+    flag: Option<&str>,
+    setting: Option<&str>,
+    file_edit_review: &str,
+    interactive: bool,
+) -> anyhow::Result<(crate::permissions::PermissionMode, Option<String>)> {
+    use crate::permissions::PermissionMode;
+    if let Some(value) = flag {
+        let mode = PermissionMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown --permission-mode `{value}`: use read-only, ask, accept-edits or full-access"
+            )
+        })?;
+        return Ok((mode, None));
+    }
+    let Some(value) = setting else {
+        if crate::tool_approval::ApprovalPolicy::parse(file_edit_review)
+            == crate::tool_approval::ApprovalPolicy::Never
+        {
+            return Ok((
+                PermissionMode::AcceptEdits,
+                Some(
+                    "fileEditReview: never now means permissionMode accept-edits; \
+                     set permissionMode to choose"
+                        .into(),
+                ),
+            ));
+        }
+        return Ok((PermissionMode::default(), None));
+    };
+    match PermissionMode::parse(value) {
+        Some(PermissionMode::FullAccess) if !interactive => Ok((
+            PermissionMode::Ask,
+            Some(
+                "permissionMode full-access from settings is ignored without a terminal; \
+                 pass --permission-mode full-access to run unattended"
+                    .into(),
+            ),
+        )),
+        Some(mode) => Ok((mode, None)),
+        None => Ok((
+            PermissionMode::default(),
+            Some(format!(
+                "unknown permissionMode `{value}` in settings; using ask"
+            )),
+        )),
+    }
+}
+
 /// CLI bootstrap flags affecting runtime.
 pub struct BootstrapOpts {
     /// Working directory.
@@ -829,6 +933,8 @@ pub struct BootstrapOpts {
     pub session_id: Option<String>,
     /// `--no-web`: register no web tools this run.
     pub no_web: bool,
+    /// `--permission-mode`; overrides `permissionMode` in settings.
+    pub permission_mode: Option<String>,
     /// Start with this external agent. Loop's own provider is then optional.
     pub agent: Option<String>,
 }
@@ -838,12 +944,13 @@ pub struct BootstrapOpts {
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     web: &crate::web_tools::WebTools,
+    bash: loop_agent::harness::BashLimits,
 ) -> Vec<AgentTool> {
     let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
-        create_bash_tool(env),
+        create_bash_tool_with(env, None, bash),
     ];
     tools.extend(web.build());
     tools
@@ -894,7 +1001,10 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
     }
     let raw = std::fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
-    // Support { "providers": [ { id, baseUrl, apiKeyEnv, models: ["id"] } ] }
+    // Support { "providers": [ { id, baseUrl, apiKeyEnv, models: ["id" | { id,
+    // name?, contextWindow?, maxTokens?, reasoning? }] } ] }. Model entries as
+    // objects pin metadata that the `/models` listing cannot provide (most
+    // OpenAI-compatible servers return bare ids), e.g. the real context window.
     if let Some(arr) = value.get("providers").and_then(|v| v.as_array()) {
         for p in arr {
             let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("custom");
@@ -920,11 +1030,10 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                     a.iter()
                         .filter_map(|m| {
                             if let Some(s) = m.as_str() {
-                                Some(CustomModelSpec::new(s))
-                            } else {
-                                let id = m.get("id")?.as_str()?;
-                                Some(CustomModelSpec::new(id))
+                                return Some(CustomModelSpec::new(s));
                             }
+                            let id = m.get("id")?.as_str()?;
+                            Some(parse_model_spec(m, id))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -946,6 +1055,25 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+/// Build a pinned model spec from a `models.json` object entry, accepting
+/// camelCase and snake_case keys (like the provider fields).
+fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
+    let field = |camel: &str, snake: &str| {
+        m.get(camel)
+            .or_else(|| m.get(snake))
+            .and_then(|v| v.as_u64())
+    };
+    CustomModelSpec::new(id)
+        .with_reasoning(
+            m.get("reasoning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .with_name(m.get("name").and_then(|v| v.as_str()))
+        .with_context_window(field("contextWindow", "context_window"))
+        .with_max_tokens(field("maxTokens", "max_tokens"))
 }
 
 /// Resolve project trust (ask interactively when needed).
@@ -971,7 +1099,11 @@ pub fn resolve_trust(
             if !interactive {
                 return Ok(false);
             }
-            eprintln!("Trust project config from {}? [y/N]", cwd.display());
+            eprintln!(
+                "Trust project config from {}? Its settings, skills and hooks will load, and its \
+                 hooks can run commands. [y/N]",
+                cwd.display()
+            );
             let mut answer = String::new();
             std::io::Write::write_all(&mut std::io::stderr(), b"> ").ok();
             std::io::stdin().read_line(&mut answer)?;
@@ -1217,7 +1349,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         Some(Arc::clone(&credentials)),
         opts.no_web,
     );
-    let tools = build_tools(Arc::clone(&tool_env), &web);
+    let bash_limits = settings.bash.unwrap_or_default().limits();
+    let tools = build_tools(Arc::clone(&tool_env), &web, bash_limits);
 
     // The prompt lists the tools that were actually built (web_search may be
     // unconfigured), so it can never promise a tool the agent cannot call.
@@ -1249,6 +1382,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     harness
         .set_thinking_level(parse_thinking(&settings.default_thinking_level))
         .await;
+    harness.set_bash_limits(bash_limits);
     harness
         .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;
@@ -1256,7 +1390,28 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
 
-    crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
+    let tool_gate = crate::tool_gate::ToolGate::new(
+        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
+    );
+    tool_gate.install(&harness);
+    agents.set_gate(Arc::clone(&tool_gate));
+    let mut startup_notices =
+        crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
+    let (mode, mode_notice) = startup_permission_mode(
+        opts.permission_mode.as_deref(),
+        settings.permission_mode.as_deref(),
+        &settings.file_edit_review,
+        opts.interactive,
+    )?;
+    tool_gate.set_mode(mode);
+    startup_notices.extend(mode_notice);
+    if mode == crate::permissions::PermissionMode::FullAccess {
+        startup_notices.push(
+            "⚠ full access: every tool call runs without asking, including shell commands \
+             and file deletion (deny rules and hooks still apply)"
+                .into(),
+        );
+    }
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
         tracing::info!("extension: {n}");
@@ -1273,6 +1428,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
         agent_dir.join("mcp-auth"),
     ));
+    tool_gate.set_mcp(Arc::clone(&mcp_client));
     let entries = enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
     if !entries.is_empty() {
         let results = mcp_client.connect_all(&entries).await;
@@ -1323,6 +1479,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         selected_model: model,
         model_note,
         tool_approval: None,
+        tool_gate,
+        startup_notices,
         mcp_client,
         active_skills: Vec::new(),
         web_disabled_for_run: opts.no_web,
@@ -1395,6 +1553,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn models_json_pins_model_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            models_json_path(dir.path()),
+            r#"{
+                "providers": [{
+                    "id": "zai",
+                    "baseUrl": "https://api.z.ai/api/paas/v4",
+                    "models": [
+                        { "id": "glm-5.3-flash", "contextWindow": 1000000, "maxTokens": 65536, "reasoning": true },
+                        { "id": "snake-model", "name": "Snake model", "context_window": 512000, "max_tokens": 32768, "reasoning": true },
+                        { "id": "wrong-types", "name": 7, "contextWindow": "large", "max_tokens": -1, "reasoning": "yes" },
+                        { "contextWindow": 1000000, "reasoning": true },
+                        42,
+                        "plain-model"
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let models = Models::create(CreateModelsOptions {
+            credentials: None,
+            models_store: None,
+        });
+        load_custom_models_json(dir.path(), &models).unwrap();
+
+        let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
+        assert_eq!(pinned.context_window, 1_000_000);
+        assert_eq!(pinned.max_tokens, 65_536);
+        assert!(pinned.reasoning);
+
+        let snake = models.get_model("zai", "snake-model").unwrap();
+        assert_eq!(snake.name, "Snake model");
+        assert_eq!(snake.context_window, 512_000);
+        assert_eq!(snake.max_tokens, 32_768);
+        assert!(snake.reasoning);
+
+        // Invalid optional values are ignored, and entries without a string id are skipped.
+        let wrong_types = models.get_model("zai", "wrong-types").unwrap();
+        assert_eq!(wrong_types.name, "wrong-types");
+        assert_eq!(wrong_types.context_window, 128_000);
+        assert_eq!(wrong_types.max_tokens, 16_384);
+        assert!(!wrong_types.reasoning);
+        assert!(models.get_model("zai", "").is_none());
+
+        // String entries keep the listing defaults.
+        let plain = models.get_model("zai", "plain-model").unwrap();
+        assert_eq!(plain.context_window, 128_000);
+    }
+
+    #[test]
     fn native_efforts_follow_the_model() {
         let all = ["off", "low", "high"];
         let mut model = loop_ai::providers::soket_seed_models().remove(0);
@@ -1409,5 +1618,69 @@ mod tests {
         model.reasoning = false;
         assert_eq!(native_efforts(Some(&model), &all), ["off"]);
         assert_eq!(native_efforts(None, &all), ["off", "low", "high"]);
+    }
+}
+
+#[cfg(test)]
+mod permission_mode_tests {
+    use super::startup_permission_mode;
+    use crate::permissions::PermissionMode::*;
+
+    #[test]
+    fn the_flag_wins_and_headless_full_access_needs_it() {
+        assert_eq!(
+            startup_permission_mode(None, None, "newSession", true)
+                .unwrap()
+                .0,
+            Ask
+        );
+        assert_eq!(
+            startup_permission_mode(Some("read-only"), Some("full-access"), "newSession", false)
+                .unwrap()
+                .0,
+            ReadOnly
+        );
+        let (mode, notice) =
+            startup_permission_mode(None, Some("full-access"), "newSession", false).unwrap();
+        assert_eq!(mode, Ask);
+        assert!(notice.unwrap().contains("--permission-mode full-access"));
+        assert_eq!(
+            startup_permission_mode(Some("full-access"), None, "newSession", false)
+                .unwrap()
+                .0,
+            FullAccess
+        );
+        assert_eq!(
+            startup_permission_mode(None, Some("full-access"), "newSession", true)
+                .unwrap()
+                .0,
+            FullAccess
+        );
+        let (mode, notice) =
+            startup_permission_mode(None, Some("yolo"), "newSession", true).unwrap();
+        assert_eq!(mode, Ask);
+        assert!(notice.unwrap().contains("unknown permissionMode"));
+        assert!(startup_permission_mode(Some("yolo"), None, "newSession", true).is_err());
+    }
+
+    #[test]
+    fn file_edit_review_never_starts_in_accept_edits() {
+        let (mode, notice) = startup_permission_mode(None, None, "never", true).unwrap();
+        assert_eq!(mode, AcceptEdits);
+        assert!(notice.unwrap().contains("accept-edits"));
+        let (mode, notice) = startup_permission_mode(None, Some("ask"), "never", true).unwrap();
+        assert_eq!((mode, notice), (Ask, None));
+        assert_eq!(
+            startup_permission_mode(Some("read-only"), None, "never", false)
+                .unwrap()
+                .0,
+            ReadOnly
+        );
+        assert_eq!(
+            startup_permission_mode(None, None, "always", true)
+                .unwrap()
+                .0,
+            Ask
+        );
     }
 }

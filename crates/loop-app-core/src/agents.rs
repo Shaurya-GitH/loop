@@ -179,6 +179,7 @@ pub struct AgentManager {
     state_dir: PathBuf,
     connector: Arc<dyn Connector>,
     host: Mutex<Arc<dyn HostServices>>,
+    gate: Mutex<Option<Arc<crate::tool_gate::ToolGate>>>,
     started: tokio::sync::Mutex<HashMap<String, Arc<AcpBackend>>>,
 }
 
@@ -204,6 +205,7 @@ impl AgentManager {
             state_dir: agent_dir.join("agents"),
             connector,
             host: Mutex::new(Arc::new(HeadlessHost)),
+            gate: Mutex::new(None),
             started: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -211,6 +213,12 @@ impl AgentManager {
     /// Where agents ask the user. Applies to agents started afterwards.
     pub fn set_host(&self, host: Arc<dyn HostServices>) {
         *self.host.lock().unwrap_or_else(|p| p.into_inner()) = host;
+    }
+
+    /// Run agents' permission requests and finished tool calls through
+    /// `gate`'s hooks. Applies to agents started afterwards.
+    pub fn set_gate(&self, gate: Arc<crate::tool_gate::ToolGate>) {
+        *self.gate.lock().unwrap_or_else(|p| p.into_inner()) = Some(gate);
     }
 
     /// Every subscription Loop knows.
@@ -305,7 +313,16 @@ impl AgentManager {
         if let Some(backend) = started.get(id) {
             return Ok(Arc::clone(backend));
         }
-        let host = Arc::clone(&self.host.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut host = Arc::clone(&self.host.lock().unwrap_or_else(|p| p.into_inner()));
+        let gate = self.gate.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(gate) = &gate {
+            host = Arc::new(crate::agent_gate::GatedHost::new(
+                host,
+                Arc::clone(gate),
+                entry.id.clone(),
+                self.cwd.clone(),
+            ));
+        }
         let mut config = entry.config();
         if let Some(var) = &entry.home_env {
             let home = self.state_dir.join(&entry.id).join("home");
@@ -321,6 +338,14 @@ impl AgentManager {
                     Some(hint) => anyhow!("{e}. {hint}"),
                     None => anyhow!("{e}"),
                 })?;
+        if let Some(gate) = gate {
+            crate::agent_gate::observe_agent_tools(
+                backend.as_ref(),
+                gate,
+                entry.id.clone(),
+                self.cwd.clone(),
+            );
+        }
         started.insert(id.to_owned(), Arc::clone(&backend));
         Ok(backend)
     }

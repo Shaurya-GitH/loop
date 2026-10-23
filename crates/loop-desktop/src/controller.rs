@@ -129,6 +129,7 @@ impl DesktopController {
                 append_system_prompt: None,
                 no_context_files: false,
                 no_web: false,
+                permission_mode: None,
                 interactive: false,
                 session_id: None,
                 agent: None,
@@ -167,25 +168,16 @@ impl DesktopController {
         }));
 
         let tool_env = runtime.harness.tool_env().await?;
-        let policy_active =
-            loop_app_core::tool_approval::ApprovalPolicy::parse(&runtime.settings.file_edit_review)
-                .asks_for_session(!runtime.resumed);
         let (bridge, approval_rx) = ToolApprovalBridge::new(
             tool_env,
             runtime.settings.diff_editor.clone(),
-            policy_active,
             permissions_from_settings(&runtime.settings.tool_permissions),
             Default::default(),
         );
         // Review file edits in the desktop diff panel; do not spawn Cursor/VS Code on each write.
         bridge.set_open_external_diff(false);
         let bridge = Arc::new(bridge);
-        runtime
-            .harness
-            .set_before_tool_call(Some(bridge.before_tool_hook()));
-        runtime
-            .harness
-            .set_after_tool_call(Some(bridge.after_tool_hook()));
+        runtime.tool_gate.set_approver(Some(Arc::clone(&bridge)));
 
         let thinking_levels = vec![
             AgentThinkingLevel::Off,

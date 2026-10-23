@@ -182,7 +182,7 @@ async fn hook_cancels_compact() {
         if matches!(event, HarnessHookEvent::SessionBeforeCompact { .. }) {
             HookOutcome {
                 cancel: true,
-                summary: None,
+                ..Default::default()
             }
         } else {
             HookOutcome::default()
